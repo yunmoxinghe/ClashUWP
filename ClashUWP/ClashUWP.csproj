@@ -23,4 +23,16 @@
   <ItemGroup>
     <PackageReference Include="Reactor.Uwp" Version="0.1.0-alpha.9" />
   </ItemGroup>
+
+  <!--
+    ★ ClashUWP.Vpn 这个引用不能省，哪怕前台代码一行都没用到 VpnBackgroundTask。
+      它的作用是把 CsWinRT 组件的五件套（ClashUWP.Vpn.winmd、WinRT.Host.dll、
+      WinRT.Host.Shim.dll、WinRT.Host.runtimeconfig.json、ClashUWP.Vpn.dll）
+      带进本工程的输出/包布局 —— 清单里 inProcessServer 的 Path 指的就是
+      WinRT.Host.dll，它不在包里部署必然失败。不要手工拷贝这些文件。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\ClashUWP.Core\ClashUWP.Core.csproj" />
+    <ProjectReference Include="..\ClashUWP.Vpn\ClashUWP.Vpn.csproj" />
+  </ItemGroup>
 </Project>

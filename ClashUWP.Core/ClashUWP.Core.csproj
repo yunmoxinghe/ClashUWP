@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ClashUWP.Core —— 纯托管工具层，刻意不做 WinRT 组件。
+
+    为什么单独拆出来：
+      CsWinRT 组件工程（ClashUWP.Vpn）里所有 public 类型都会被投影进 winmd，
+      于是必须全部"可 WinRT 投影"（不能有 Span<T>、不能有静态类里的 Task、
+      不能有非 WinRT 可见的公开成员）—— 见 skill:
+      winrt-component-cswinrt-authoring 的 Rule 2。
+      而 VpnPluginConfig 是个普通 POCO + 静态 Parse（前台 VpnProfileSetup 要用、
+      插件 ClashVpnPlugin 也要用），IpPacket 是纯位运算工具，
+      两者跟 WinRT 投影毫无关系。
+      → 放进一个普通类库，两头都直接引用，绕开投影约束。
+
+    本工程不需要 UseUwp：里面没有任何 WinRT 类型依赖，
+    只有 XElement / 位运算 / 字符串。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+
+    <!-- 类型仍在 ClashUWP.Vpn 命名空间下，这样搬过来时调用点一行都不用改。
+         非组件工程的 AssemblyName 不受"必须等于命名空间"那条规则约束。 -->
+    <RootNamespace>ClashUWP.Vpn</RootNamespace>
+    <AssemblyName>ClashUWP.Core</AssemblyName>
+
+    <Nullable>enable</Nullable>
+    <Platforms>x64;arm64</Platforms>
+  </PropertyGroup>
+
+</Project>

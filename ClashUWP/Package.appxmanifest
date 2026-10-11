@@ -4,26 +4,30 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap mp uap10 rescap">
+  IgnorableNamespaces="uap mp rescap">
 
   <!--
-    ⚠️ 改这个文件之前先读这段：本清单与 .NET Native 时代的 UWP 有关键差异。
+    ⚠️ 改这个文件之前先读这段。这里有两条曾经判断错、后来被部署实测纠正过的事实。
 
-    老 UWP（.NET Native / C#）的后台任务必须配 CLR 宿主：
-        <Extension Category="windows.activatableClass.inProcessServer">
-          <InProcessServer>
-            <Path>CLRHost.dll</Path>
-            <ActivatableClass ActivatableClassId="..." ThreadingModel="both" />
-          </InProcessServer>
-        </Extension>
-    官方 sample（microsoft/UwpVpnPluginSample · CSharp）正是这么写的。
+    【事实 1】<Application> 的 Executable + EntryPoint 直接激活托管类型 —— 这条成立。
+      本项目是 net10-windows10.0.26100 + UseUwp（CoreCLR，不是 .NET Native）：
+      SDK 生成的清单里就是 <Application Executable="ClashUWP.exe" EntryPoint="ClashUWP.App">，
+      输出目录里确实没有 CLRHost.dll。
+      但这条结论<b>只适用于前台 Application</b>，不能外推到后台任务。
 
-    但本项目是 net10-windows10.0.26100 + UseUwp（CoreCLR，不是 .NET Native）：
-    SDK 生成的清单里 <Application Executable="ClashUWP.exe" EntryPoint="ClashUWP.App">
-    直接激活托管类型，输出目录里根本没有 CLRHost.dll。
-    → 这里按现代形态写：Executable + EntryPoint 指向托管类，不加 activatableClass。
+    【事实 2】后台任务<b>仍然需要</b> activatableClass.inProcessServer 声明 —— 早期判断错了。
+      平台侧是纯清单驱动的：读 ActivatableClassId + Path，LoadLibrary(Path)，
+      再 GetProcAddress("DllGetActivationFactory")。它不查 winmd，也不认识托管 exe。
+      实测把 VpnBackgroundTask 留在应用 exe 工程里，部署直接报：
+          0x80080204 「如果不是音频后台任务，则不允许在
+          windows.activatableClass.inProcessServer 中没有 ActivatableClassId 的情况下，
+          令 EntryPoint="ClashUWP.Vpn.VpnBackgroundTask"」
+      根因：exe 工程不产出 winmd，平台找不到可激活类。
+
+      → 正确形态见文件末尾 <Extensions>（Package 级）：
+        后台任务类必须放在 CsWinRTComponent 工程（ClashUWP.Vpn）里，
+        Path 填 WinRT.Host.dll（CoreCLR 时代的宿主；老 .NET Native 才填 CLRHost.dll）。
   -->
 
   <Identity
@@ -69,17 +73,30 @@
       is closed, it won't terminate the other"
       → 关掉前台 UI 不会把隧道一起带走。
 
-      uap10:AppListEntry="none"：不出现在开始菜单 / 应用列表（它只是宿主，没有 UI）。
+      AppListEntry="none"：不出现在开始菜单 / 应用列表（它只是宿主，没有 UI）。
+      ★ 位置很关键：它是 <uap:VisualElements> 的属性，不是 <Application> 的属性。
+      挂在 <Application> 上部署会直接失败：
+        0xC00CE015 未在 DTD/架构中定义元素 '{...}Application' 的属性 '{...uap...}AppListEntry'
+      （实测踩过一次，见 AppXDeploymentServer/Operational 事件 404）
+
+      注意 Application 本身不写 Executable / EntryPoint —— 官方 sample 两个版本
+      （CSharp / CppWinRT）的 Plugin Application 都没有，激活信息由 <Extension> 提供。
 
       <uap:Task Type="vpnClient" />：声明本包提供 VPN 客户端插件。
       【官方 sample 注释】："When your application is installed this background task will
       automatically be registered by the VPN platform."
       → 装包即注册，<b>不需要</b>自己 BackgroundTaskBuilder.Register。
     -->
-    <Application Id="Plugin"
-      Executable="$targetnametoken$.exe"
-      EntryPoint="ClashUWP.Vpn.VpnBackgroundTask"
-      uap10:AppListEntry="none">
+    <Application Id="Plugin">
+      <uap:VisualElements
+        DisplayName="ClashUWP"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        Description="ClashUWP VPN Plugin"
+        BackgroundColor="transparent"
+        AppListEntry="none">
+        <uap:DefaultTile/>
+      </uap:VisualElements>
       <Extensions>
         <Extension Category="windows.backgroundTasks"
           Executable="$targetnametoken$.exe"
@@ -108,4 +125,28 @@
     -->
     <rescap:Capability Name="networkingVpnProvider" />
   </Capabilities>
+
+  <!--
+    ★ Package 级的 <Extensions> —— 与 <Applications> / <Capabilities> 平级，
+      <b>不是</b> <Application> 下的那个 <Extensions>。放错位置平台一样找不到。
+
+    这是后台任务能被 WinRT 激活的注册点：
+      · ActivatableClassId 必须与上面 <uap:Task Type="vpnClient"/> 那条
+        Extension 的 EntryPoint <b>逐字相同</b>；
+      · Path 是宿主 DLL。本项目 CoreCLR → WinRT.Host.dll
+        （官方 CSharp sample 用的是 CLRHost.dll，那是 .NET Native 时代的产物，
+         本项目输出里没有那个文件，填它必然部署失败）。
+      · ThreadingModel="both"：VpnChannel.ProcessEventAsync 的回调线程不保证。
+
+    WinRT.Host.dll 由 ClashUWP.Vpn 工程（CsWinRTComponent=true）产出，
+    经 ProjectReference 自动进包 —— 不要手工拷贝。
+  -->
+  <Extensions>
+    <Extension Category="windows.activatableClass.inProcessServer">
+      <InProcessServer>
+        <Path>WinRT.Host.dll</Path>
+        <ActivatableClass ActivatableClassId="ClashUWP.Vpn.VpnBackgroundTask" ThreadingModel="both" />
+      </InProcessServer>
+    </Extension>
+  </Extensions>
 </Package>

@@ -28,8 +28,15 @@ namespace ClashUWP.Vpn
     ///   ClashUWP 的数据面<b>不走 outer transport</b> —— 真内核在进程内，
     ///   拿到包就地处理，回包用 <c>AppendVpnReceivePacketBuffer</c> 主动注入。
     ///   所以 Decapsulate 在正常运行时不会被调用（这里只留接口要求的空实现）。
+    ///
+    /// ★ 为什么是 <c>internal</c> 而不是 public：
+    ///   本工程是 CsWinRT 组件工程，<b>所有 public 类型都会被投影进 winmd</b>，
+    ///   因此必须全部可 WinRT 投影。ClashVpnPlugin 只是被 VpnBackgroundTask 内部
+    ///   new 出来、再原样交给 VpnChannel.ProcessEventAsync 的 —— 平台不需要激活它，
+    ///   设成 internal 就不会被投影，也就不受投影规则约束。
+    ///   整个工程里唯一需要 public 的只有 VpnBackgroundTask。
     /// </summary>
-    public sealed partial class ClashVpnPlugin : IVpnPlugIn
+    internal sealed partial class ClashVpnPlugin : IVpnPlugIn
     {
         /// <summary>日志节流：Encapsulate 是按包回调的，逐包写日志会淹掉系统日志。</summary>
         private const uint LogEveryNPackets = 200;

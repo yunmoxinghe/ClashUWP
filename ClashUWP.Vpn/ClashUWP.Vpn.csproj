@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ClashUWP.Vpn —— CsWinRT 组件工程（后台任务的 WinRT 激活宿主）。
+
+    ★ 为什么必须有这个工程：
+      Package.appxmanifest 里 <uap:Task Type="vpnClient" /> 的 EntryPoint
+      必须能在清单里对上一个可激活的 WinRT 类。平台侧是纯清单驱动的：
+      它读 ActivatableClassId + Path，然后 LoadLibrary(Path) 再
+      GetProcAddress("DllGetActivationFactory") —— 不查 winmd，也不认识托管 exe。
+
+      直接把 VpnBackgroundTask 放在应用 exe 工程里，实测部署报：
+        0x80080204 / 错误 0x80080204: 「如果不是音频后台任务，则不允许在
+        windows.activatableClass.inProcessServer 中没有 ActivatableClassId 的情况下，
+        令 EntryPoint="ClashUWP.Vpn.VpnBackgroundTask"」
+      根因是 exe 工程不产出 winmd，平台找不到可激活类。
+
+      CsWinRTComponent=true 让这个普通类库产出激活所需的五件套：
+        ClashUWP.Vpn.dll / ClashUWP.Vpn.winmd
+        WinRT.Host.dll / WinRT.Host.Shim.dll / WinRT.Host.runtimeconfig.json
+      → 清单里 inProcessServer 的 Path 填 WinRT.Host.dll。
+      （老 UWP / .NET Native 时代填的是 CLRHost.dll，本项目是 CoreCLR，不用那个。）
+
+    两条静默规则（违反不会报错，只会产出空壳 winmd 或编译失败）：
+      1. AssemblyName 必须等于或覆盖 RootNamespace —— 见下方注释。
+      2. public 类型必须全部可 WinRT 投影 —— 所以 ClashVpnPlugin 是 internal，
+         只有 VpnBackgroundTask 一个 public 类型。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+
+    <!-- ★ 规则 1：类型在 namespace ClashUWP.Vpn，AssemblyName 必须等于它。
+         若 AssemblyName 取成 ClashUWP 之外的名字（比如 ClashUWP.VpnTask），
+         生成的 winmd 会是个 5120 字节的空壳，后续报
+         CS0234: 命名空间"ABI"中不存在类型"ClashUWP.Vpn" —— 看起来像工具链坏了，
+         其实是这条规则没满足。 -->
+    <RootNamespace>ClashUWP.Vpn</RootNamespace>
+    <AssemblyName>ClashUWP.Vpn</AssemblyName>
+
+    <CsWinRTComponent>true</CsWinRTComponent>
+    <UseUwp>true</UseUwp>
+    <Nullable>enable</Nullable>
+    <!-- 缺这个会报 APPX1901：回退语言被设成 VS 的界面语言，不同机器上构建结果不一致。 -->
+    <DefaultLanguage>zh-CN</DefaultLanguage>
+    <Platforms>x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+
+    <!-- 同主工程：泛型 WinRT 接口（IVector<HostName>）跨 ABI 需要生成的 unsafe 代码。 -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.3.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ClashUWP.Core\ClashUWP.Core.csproj" />
+  </ItemGroup>
+
+</Project>

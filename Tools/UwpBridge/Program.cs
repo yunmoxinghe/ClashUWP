@@ -54,6 +54,7 @@ internal static class Program
     static string VsSolution = "";
     static bool VsStop;
     static bool VsContinue;   // 中断时自动 Debug.Continue (区分"异常断住"与"真崩溃")
+    static int VsWaitSeconds = 20;  // VS 忙(如弹模态对话框)时的等待预算, 秒
 
     static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -117,6 +118,8 @@ internal static class Program
                     VsSolution = args[++i]; break;
                 case "-stop":
                     VsStop = true; break;
+                case "-waitvs":
+                    VsWaitSeconds = int.Parse(args[++i]); break;
                 case "-continue":
                     VsContinue = true; break;
                 case "-h": case "-help": case "--help":
@@ -214,7 +217,9 @@ VS 官方调试(推荐给托管 C#/VB 项目 —— EnvDTE, 等价 VS 里按 F5)
   -Solution <路径>     可选: 先让 VS 打开该解决方案
   -Stop                结束前执行 Debug.StopDebugging
   -Seconds N           调试运行多少秒后抓取(默认 10)
+  -WaitVS N            VS 忙/弹对话框时最多等 N 秒(默认 20); 超时会列出 VS 挡路的窗口
   前提: VS 已启动。微软明确不建议对托管代码用 WinDbg, 此模式才是官方路径。
+  注: 已按微软 KB ms228772 注册 IOleMessageFilter, VS 忙时自动重试而非直接失败。
 
 CLI 调试(部署 -> 启动 -> 抓栈 -> 抓报错, 不依赖 VS):
   -Debug <manifest>    注册松散包并启动应用, 再抓托管调用栈 / 崩溃事件 / 应用日志
@@ -828,10 +833,40 @@ HTTP 端点:
             return 1;
         }
 
+        // 微软官方要求 (KB ms228772): 外部进程自动化 VS 必须注册 IOleMessageFilter,
+        // 否则 VS 一忙(典型=弹出模态对话框)所有 COM 调用立即被拒 0x80010001。
+        VsMessageFilter.BudgetMs = VsWaitSeconds * 1000;
+        VsMessageFilter.Register();
+
         try
         {
             Console.WriteLine($"ProgID    : {usedProgId}");
-            Console.WriteLine($"VS        : {dte.Name} {dte.Version}");
+
+            // 握手: VS 被模态对话框占住时, 连 dte.Name 都会 0x80010001。
+            // 等到 VS 空闲(或超时), 再往下走, 避免整轮自动化毫无信息地崩掉。
+            string vsName = "", vsVer = "";
+            var hw = Stopwatch.StartNew();
+            while (true)
+            {
+                try { vsName = (string)dte.Name; vsVer = (string)dte.Version; break; }
+                catch (Exception ex) when (IsVsBusy(ex))
+                {
+                    long left = VsWaitSeconds * 1000L - hw.ElapsedMilliseconds;
+                    if (left <= 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"VS 忙了 {hw.ElapsedMilliseconds} ms 仍未响应 —— 多半有未关闭的模态对话框。");
+                        DumpVsBusyHint();
+                        return 2;
+                    }
+                    // 单次 COM 调用的重试预算 = 剩余预算(至少 2s), 保证总时长受 -WaitVS 控制
+                    VsMessageFilter.BudgetMs = (int)Math.Max(2000, left);
+                    if (hw.ElapsedMilliseconds > 0 && hw.ElapsedMilliseconds % 5000 < 600)
+                        Console.WriteLine($"  VS 忙, 等待中 ... ({hw.ElapsedMilliseconds} ms)");
+                    Thread.Sleep(500);
+                }
+            }
+            Console.WriteLine($"VS        : {vsName} {vsVer}");
 
             string cur = "";
             try { cur = (string)dte.Solution.FullName; } catch { }
@@ -1031,8 +1066,121 @@ HTTP 端点:
         catch (Exception ex)
         {
             Console.Error.WriteLine("EnvDTE 调用失败: " + ex.Message);
+            if (IsVsBusy(ex)) DumpVsBusyHint();
             return 1;
         }
+        finally
+        {
+            VsMessageFilter.Revoke();
+        }
+    }
+
+    // ---- VS 忙 / RPC_E_CALL_REJECTED 处理 (微软官方 KB ms228772) ----
+    // 文档: https://learn.microsoft.com/previous-versions/visualstudio/visual-studio-2010/ms228772
+    // 现象(实测): VS 弹出模态对话框(部署失败/异常提示/任何要你点的框)时, 其主线程被占,
+    //   外部进程所有 EnvDTE 调用返回 RPC_E_CALL_REJECTED(0x80010001) 或
+    //   RPC_E_SERVERCALL_RETRYLATER(0x8001010A) —— 这就是"有弹窗就连不上"的真身。
+    // 正解: 客户端实现 IOleMessageFilter 并 CoRegisterMessageFilter, 由 COM 通道自动重试,
+    //   而不是自己 try/catch 了事。注意 IOleMessageFilter ≠ System.Windows.Forms.IMessageFilter。
+    [ComImport, Guid("00000016-0000-0000-C000-000000000046"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IOleMessageFilter
+    {
+        [PreserveSig] int HandleInComingCall(int dwCallType, IntPtr hTaskCaller,
+                                             int dwTickCount, IntPtr lpInterfaceInfo);
+        [PreserveSig] int RetryRejectedCall(IntPtr hTaskCallee, int dwTickCount, int dwRejectType);
+        [PreserveSig] int MessagePending(IntPtr hTaskCallee, int dwTickCount, int dwPendingType);
+    }
+
+    class VsMessageFilter : IOleMessageFilter
+    {
+        // 注意: RetryRejectedCall 的 dwTickCount 是 GetTickCount()(开机以来的毫秒),
+        // 不是"已等待多久" —— 拿它跟预算比毫无意义(常见网上示例的 bug)。
+        // 这里改用绝对截止时间。
+        static long _deadline;
+        public static void Arm(int budgetMs) => _deadline = Environment.TickCount64 + budgetMs;
+        public static int BudgetMs { set => Arm(value); }
+
+        [DllImport("ole32.dll")]
+        static extern int CoRegisterMessageFilter(IOleMessageFilter? newFilter,
+                                                  out IOleMessageFilter? oldFilter);
+
+        public static void Register() => CoRegisterMessageFilter(new VsMessageFilter(), out _);
+        public static void Revoke() => CoRegisterMessageFilter(null, out _);
+
+        // 我们只做客户端, 不做服务器: 入站调用直接接(0 = SERVERCALL_ISHANDLED)。
+        int IOleMessageFilter.HandleInComingCall(int dwCallType, IntPtr hTaskCaller,
+                                                 int dwTickCount, IntPtr lpInterfaceInfo) => 0;
+
+        // 调用被 VS 拒绝后, COM 会来问要不要重试。
+        // dwRejectType: 1=SERVERCALL_REJECTED(真拒绝) / 2=SERVERCALL_RETRYLATER(只是忙)
+        // 返回值: >=0 = 等这么多毫秒再重试; -1 = 放弃(抛 RPC_E_CALL_REJECTED)
+        int IOleMessageFilter.RetryRejectedCall(IntPtr hTaskCallee, int dwTickCount, int dwRejectType)
+        {
+            // 1=SERVERCALL_REJECTED / 2=SERVERCALL_RETRYLATER —— VS 弹对话框时两种都见过
+            if ((dwRejectType == 1 || dwRejectType == 2) && Environment.TickCount64 < _deadline)
+                return 250;   // 等 250ms 再重试
+            return -1;        // 超预算: 放弃, 抛 RPC_E_CALL_REJECTED
+        }
+
+        // 等待期间来了非 COM 消息: 让默认处理继续跑(2 = PENDINGMSG_WAITDEFPROCESS),
+        // 否则 VS 的消息泵被堵死, 对话框永远没人处理 -> 死锁。
+        int IOleMessageFilter.MessagePending(IntPtr hTaskCallee, int dwTickCount, int dwPendingType) => 2;
+    }
+
+    static bool IsVsBusy(Exception ex)
+    {
+        uint h = 0;
+        if (ex is COMException c) h = (uint)c.ErrorCode;
+        else if (ex.InnerException is COMException ic) h = (uint)ic.ErrorCode;
+        if (h == 0x80010001 || h == 0x8001010A) return true;
+        // dynamic(IDispatch) 后期绑定失败时是 RuntimeBinderException, 错误码只在消息里
+        var s = ex.ToString();
+        return s.Contains("0x80010001") || s.Contains("0x8001010A");
+    }
+
+    // VS 忙/超时时给出可操作的提示, 并把 VS 当前弹出的窗口标题列出来(只读, 不做任何操作)
+    static void DumpVsBusyHint()
+    {
+        Console.Error.WriteLine("");
+        Console.Error.WriteLine("==== VS 正忙: EnvDTE 调用被拒绝 (RPC_E_CALL_REJECTED 0x80010001) ====");
+        Console.Error.WriteLine("含义 : 不是连不上, 是 VS 主线程被一个模态对话框占着, 期间谁叫它都不理。");
+        Console.Error.WriteLine("怎么办: ① 去 VS 点掉那个对话框; ② 或加 -WaitVS <秒> 让我等它;");
+        Console.Error.WriteLine("        ③ 或绕开 VS 用 -Debug (不经 VS 的部署+启动+日志通道)。");
+        try
+        {
+            var pids = Process.GetProcessesByName("devenv")
+                              .Select(p => (uint)p.Id).ToHashSet();
+            if (pids.Count == 0) return;
+            var rows = new List<(uint Pid, string Cls, string Title)>();
+            EnumWindows((h, l) =>
+            {
+                if (!IsWindowVisible(h)) return true;
+                GetWindowThreadProcessId(h, out uint pid);
+                if (!pids.Contains(pid)) return true;
+                var cb = new StringBuilder(256);
+                GetClassName(h, cb, cb.Capacity);
+                int len = GetWindowTextLength(h);
+                var sb = new StringBuilder(Math.Max(len, 1) + 1);
+                if (len > 0) GetWindowText(h, sb, sb.Capacity);
+                rows.Add((pid, cb.ToString(), sb.ToString().Trim()));
+                return true;
+            }, IntPtr.Zero);
+
+            if (rows.Count > 0)
+            {
+                Console.Error.WriteLine("");
+                Console.Error.WriteLine("VS 窗口清单 (#32770 = 对话框类, 就是它挡路):");
+                foreach (var r in rows
+                    .OrderBy(r => r.Cls == "#32770" ? 0 : 1)   // 对话框排最前
+                    .Take(15))
+                {
+                    var flag = r.Cls == "#32770" ? " <== 对话框!" : "";
+                    Console.Error.WriteLine($"  · devenv({r.Pid}) [{r.Cls}] \"{r.Title}\"{flag}");
+                }
+            }
+        }
+        catch { }
     }
 
     // ---- 窗口检测: 证明"页面真的显示出来了" ----
@@ -1048,6 +1196,8 @@ HTTP 端点:
     static extern int GetWindowTextLength(IntPtr hWnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
     static void DumpWindows(HashSet<uint>? pids, string[] hostProcs)
     {
