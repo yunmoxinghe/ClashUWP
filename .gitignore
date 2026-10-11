@@ -1,0 +1,13 @@
+# 构建输出
+[Bb]in/
+[Oo]bj/
+.vs/
+
+# 用户级 IDE 配置
+*.user
+*.suo
+*.userprefs
+
+# 跳板工具产物（源码在 Tools/UwpBridge，exe 由 publish 生成）
+uwp-bridge.exe
+uwp-bridge.pdb
