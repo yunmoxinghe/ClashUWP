@@ -2,7 +2,6 @@ using System;
 using System.Threading.Tasks;
 
 using Microsoft.UI.Reactor.Core;
-using Windows.Networking.Vpn;
 
 using ClashUWP.Vpn;
 using static Microsoft.UI.Reactor.Factories;
@@ -40,10 +39,10 @@ namespace ClashUWP
 
             try
             {
-                VpnManagementErrorStatus status = await VpnProfileSetup.ConnectAsync();
-                setStatus(status == VpnManagementErrorStatus.Ok
-                    ? "已连接（试试 ping 10.7.0.1）"
-                    : $"连接失败: {status}");
+                // 直接把分步诊断显示出来：建 profile / 系统内 profile 数 / 目标 /
+                // 连接前状态 / 连接结果。骨架期宁可啰嗦，也不要一个看不出
+                // 卡在哪一步的状态码（上一版只回 CannotFindProfile，没法定位）。
+                setStatus(await VpnProfileSetup.ConnectAsync());
             }
             catch (Exception ex)
             {
@@ -59,8 +58,7 @@ namespace ClashUWP
 
             try
             {
-                VpnManagementErrorStatus status = await VpnProfileSetup.DisconnectAsync();
-                setStatus(status == VpnManagementErrorStatus.Ok ? "未连接" : $"断开失败: {status}");
+                setStatus(await VpnProfileSetup.DisconnectAsync());
             }
             catch (Exception ex)
             {
