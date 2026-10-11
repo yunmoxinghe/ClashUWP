@@ -14,6 +14,10 @@
     <PublishProfile>win-$(Platform).pubxml</PublishProfile>
     <DisableRuntimeMarshalling>true</DisableRuntimeMarshalling>
     <EnableMsixTooling>true</EnableMsixTooling>
+
+    <!-- CsWinRT1030：VpnChannel.Start 要传 IVector<HostName>（List<HostName>），
+         泛型 WinRT 接口跨 ABI 需要生成的 unsafe 代码，AOT 下必须开这个开关。 -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

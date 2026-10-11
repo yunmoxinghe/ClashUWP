@@ -4,7 +4,27 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-  IgnorableNamespaces="uap mp">
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap mp uap10 rescap">
+
+  <!--
+    ⚠️ 改这个文件之前先读这段：本清单与 .NET Native 时代的 UWP 有关键差异。
+
+    老 UWP（.NET Native / C#）的后台任务必须配 CLR 宿主：
+        <Extension Category="windows.activatableClass.inProcessServer">
+          <InProcessServer>
+            <Path>CLRHost.dll</Path>
+            <ActivatableClass ActivatableClassId="..." ThreadingModel="both" />
+          </InProcessServer>
+        </Extension>
+    官方 sample（microsoft/UwpVpnPluginSample · CSharp）正是这么写的。
+
+    但本项目是 net10-windows10.0.26100 + UseUwp（CoreCLR，不是 .NET Native）：
+    SDK 生成的清单里 <Application Executable="ClashUWP.exe" EntryPoint="ClashUWP.App">
+    直接激活托管类型，输出目录里根本没有 CLRHost.dll。
+    → 这里按现代形态写：Executable + EntryPoint 指向托管类，不加 activatableClass。
+  -->
 
   <Identity
     Name="421769c5-17f4-4287-b6c1-193222d21e14"
@@ -28,6 +48,7 @@
   </Resources>
 
   <Applications>
+    <!-- 前台 UI（Reactor.Uwp）。 -->
     <Application Id="App"
       Executable="$targetnametoken$.exe"
       EntryPoint="ClashUWP.App">
@@ -41,9 +62,50 @@
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
     </Application>
+
+    <!--
+      VPN 插件宿主。★ 单独一个 Application = 单独进程。
+      【官方 sample 清单内注释】："keep them running in two separate processes, so if one
+      is closed, it won't terminate the other"
+      → 关掉前台 UI 不会把隧道一起带走。
+
+      uap10:AppListEntry="none"：不出现在开始菜单 / 应用列表（它只是宿主，没有 UI）。
+
+      <uap:Task Type="vpnClient" />：声明本包提供 VPN 客户端插件。
+      【官方 sample 注释】："When your application is installed this background task will
+      automatically be registered by the VPN platform."
+      → 装包即注册，<b>不需要</b>自己 BackgroundTaskBuilder.Register。
+    -->
+    <Application Id="Plugin"
+      Executable="$targetnametoken$.exe"
+      EntryPoint="ClashUWP.Vpn.VpnBackgroundTask"
+      uap10:AppListEntry="none">
+      <Extensions>
+        <Extension Category="windows.backgroundTasks"
+          Executable="$targetnametoken$.exe"
+          EntryPoint="ClashUWP.Vpn.VpnBackgroundTask">
+          <BackgroundTasks>
+            <uap:Task Type="vpnClient" />
+          </BackgroundTasks>
+        </Extension>
+      </Extensions>
+    </Application>
   </Applications>
 
   <Capabilities>
     <Capability Name="internetClient" />
+    <!-- DatagramSocket 绑本地端口需要 internetClientServer；访问局域网段需要 privateNetworkClientServer -->
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
+
+    <!--
+      ★ 受限能力（restricted capability）：Windows.Networking.Vpn 全家族的前提。
+      【官方】VpnChannel / IVpnPlugIn / VpnManagementAgent / VpnPlugInProfile 的
+      Windows requirements 均列 *App capabilities: networkingVpnProvider*。
+
+      上架需微软审批（sample README："The VPN apps in Windows are curated"），
+      侧载 / 自签部署不受此限。
+    -->
+    <rescap:Capability Name="networkingVpnProvider" />
   </Capabilities>
 </Package>
