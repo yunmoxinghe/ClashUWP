@@ -10,13 +10,17 @@ namespace ClashUWP
 {
     /// <summary>
     /// 骨架期主界面：除了验证 Reactor.Uwp 已接管渲染，
-    /// 再加两个按钮走通 <see cref="VpnProfileSetup"/> 的建 profile / 连接 / 断开。
+    /// 再走通 <see cref="VpnProfileSetup"/> 的建 profile / 连接 / 断开。
     ///
     /// 这么做的用处：连接成功后，在本机 <c>ping 10.7.0.1</c>（任一走 VPN 的地址），
     /// 如果能收到 ICMP echo reply，就说明
-    ///   前台建 profile → 平台拉起 vpnClient 后台任务 → VpnChannel.Start 建 L3 网卡
-    ///   → Encapsulate 拿到原始 IP 包 → 主动注入 → 系统协议栈收到
+    /// 前台建 profile → 平台拉起 vpnClient 后台任务 → VpnChannel.Start 建 L3 网卡
+    /// → Encapsulate 拿到原始 IP 包 → 主动注入 → 系统协议栈收到
     /// 整条链路都是通的。此时再换真内核（mihomo dll），风险就收敛到内核本身了。
+    ///
+    /// ★ 按钮的分工照官方 sample 来：<c>CreateAppProfile</c> 与 <c>ConnectOnClick</c>
+    /// 是两个独立动作。我们之前合并成一个「连接 VPN」，等于自己制造了
+    /// 「刚建出来还没被平台索引」和「旧 profile 里的无效配置永远修不掉」两个坑。
     /// </summary>
     public sealed class MainComponent : Component
     {
@@ -29,8 +33,23 @@ namespace ClashUWP
                 TextBlock($"ClashUWP —— Reactor.Uwp 已接管（{count}）"),
                 TextBlock($"VPN：{vpnStatus}"),
                 Button("点一下", () => setCount(count + 1)),
+                Button("建/重建 profile", () => { _ = RecreateProfileAsync(setVpnStatus); }),
                 Button("连接 VPN", () => { _ = ConnectAsync(setVpnStatus); }),
                 Button("断开 VPN", () => { _ = DisconnectAsync(setVpnStatus); }));
+        }
+
+        private static async Task RecreateProfileAsync(Action<string> setStatus)
+        {
+            setStatus("重建中…");
+
+            try
+            {
+                setStatus(await VpnProfileSetup.RecreateProfileAsync());
+            }
+            catch (Exception ex)
+            {
+                setStatus($"异常: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         private static async Task ConnectAsync(Action<string> setStatus)
@@ -39,9 +58,9 @@ namespace ClashUWP
 
             try
             {
-                // 直接把分步诊断显示出来：建 profile / 系统内 profile 数 / 目标 /
-                // 连接前状态 / 连接结果。骨架期宁可啰嗦，也不要一个看不出
-                // 卡在哪一步的状态码（上一版只回 CannotFindProfile，没法定位）。
+                // 直接把分步诊断显示出来：目标 / 连接前状态 / 连接结果。
+                // 骨架期宁可啰嗦，也不要一个看不出卡在哪一步的状态码
+                // （最早那版只回 CannotFindProfile，没法定位）。
                 setStatus(await VpnProfileSetup.ConnectAsync());
             }
             catch (Exception ex)
