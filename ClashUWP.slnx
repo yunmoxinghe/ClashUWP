@@ -1,6 +1,6 @@
 <Solution>
   <!--
-    只保留 x64 / arm64：三个工程的 <Platforms> 都只声明了这两个
+    只保留 x64 / arm64：两个工程的 <Platforms> 都只声明了这两个
     （Reactor.Uwp 的原生桥 Reactor.Uwp.Native.dll 也只有这两个架构的预编译产物）。
     原先这里还映射了 x86，VS 选中 x86 时会因为工程不支持而部署失败。
   -->
@@ -8,16 +8,10 @@
     <Platform Name="arm64" />
     <Platform Name="x64" />
   </Configurations>
-  <Folder Name="/Vpn/">
-    <Project Path="ClashUWP.Core/ClashUWP.Core.csproj">
-      <Platform Solution="*|arm64" Project="arm64" />
-      <Platform Solution="*|x64" Project="x64" />
-    </Project>
-    <Project Path="ClashUWP.Vpn/ClashUWP.Vpn.csproj">
-      <Platform Solution="*|arm64" Project="arm64" />
-      <Platform Solution="*|x64" Project="x64" />
-    </Project>
-  </Folder>
+  <Project Path="ClashUWP.Vpn/ClashUWP.Vpn.csproj">
+    <Platform Solution="*|arm64" Project="arm64" />
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
   <Project Path="ClashUWP/ClashUWP.csproj">
     <Platform Solution="*|arm64" Project="arm64" />
     <Platform Solution="*|x64" Project="x64" />

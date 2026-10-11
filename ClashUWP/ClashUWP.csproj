@@ -30,9 +30,10 @@
       WinRT.Host.Shim.dll、WinRT.Host.runtimeconfig.json、ClashUWP.Vpn.dll）
       带进本工程的输出/包布局 —— 清单里 inProcessServer 的 Path 指的就是
       WinRT.Host.dll，它不在包里部署必然失败。不要手工拷贝这些文件。
+
+      顺带也是前台拿到 VpnPluginConfig 的途径（VpnProfileSetup 要用它序列化自定义 XML）。
   -->
   <ItemGroup>
-    <ProjectReference Include="..\ClashUWP.Core\ClashUWP.Core.csproj" />
     <ProjectReference Include="..\ClashUWP.Vpn\ClashUWP.Vpn.csproj" />
   </ItemGroup>
 </Project>

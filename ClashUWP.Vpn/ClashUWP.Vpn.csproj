@@ -23,8 +23,15 @@
 
     两条静默规则（违反不会报错，只会产出空壳 winmd 或编译失败）：
       1. AssemblyName 必须等于或覆盖 RootNamespace —— 见下方注释。
-      2. public 类型必须全部可 WinRT 投影 —— 所以 ClashVpnPlugin 是 internal，
-         只有 VpnBackgroundTask 一个 public 类型。
+      2. public 类型必须全部可 WinRT 投影。
+
+    ★ 关于第 2 条的实际边界（实测出来的，不是一开始就想到的）：
+      VpnPluginConfig 是 public 的，带 List&lt;string&gt; 属性和 static Parse()，
+      实测 CsWinRT 能正常投影，没有报错。所以并没有必要为了它再单独拆一个
+      普通类库工程 —— 前台 VpnProfileSetup 直接引用本工程的类型即可。
+      真正必须 internal 化的只有 ClashVpnPlugin 和 IpPacket：
+      前者平台不需要激活（由 VpnBackgroundTask 内部 new），
+      后者只有前者用，两者都不该被投影。
   -->
   <PropertyGroup>
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
@@ -52,10 +59,6 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.3.1" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\ClashUWP.Core\ClashUWP.Core.csproj" />
   </ItemGroup>
 
 </Project>
