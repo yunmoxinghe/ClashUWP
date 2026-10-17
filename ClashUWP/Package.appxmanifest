@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -26,14 +26,16 @@
       根因：exe 工程不产出 winmd，平台找不到可激活类。
 
       → 正确形态见文件末尾 <Extensions>（Package 级）：
-        后台任务类必须放在 CsWinRTComponent 工程（ClashUWP.Vpn）里，
-        Path 填 WinRT.Host.dll（CoreCLR 时代的宿主；老 .NET Native 才填 CLRHost.dll）。
+        后台任务类必须放在 CsWinRTComponent 工程（ClashUWP.Vpn）里。
+        该工程以「自包含组件」模式构建（PublishAot + NativeLib=Shared），再由主工程
+        CsWinRTMergeReferencedActivationFactories=true 合并进主模块 ClashUWP.dll，
+        所以 Path 填 ClashUWP.dll；不需要 WinRT.Host.dll 宿主（托管组件模式才需要）。
   -->
 
   <Identity
     Name="421769c5-17f4-4287-b6c1-193222d21e14"
     Publisher="CN=gold"
-    Version="1.0.0.0" />
+    Version="1.0.37.0" />
 
   <mp:PhoneIdentity PhoneProductId="421769c5-17f4-4287-b6c1-193222d21e14" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -133,18 +135,23 @@
     这是后台任务能被 WinRT 激活的注册点：
       · ActivatableClassId 必须与上面 <uap:Task Type="vpnClient"/> 那条
         Extension 的 EntryPoint <b>逐字相同</b>；
-      · Path 是宿主 DLL。本项目 CoreCLR → WinRT.Host.dll
-        （官方 CSharp sample 用的是 CLRHost.dll，那是 .NET Native 时代的产物，
-         本项目输出里没有那个文件，填它必然部署失败）。
+      · Path 是宿主模块。本项目走「全 AOT + merge」形态：主工程开了
+        CsWinRTMergeReferencedActivationFactories=true，被引用的组件 ClashUWP.Vpn
+        被合并进主工程自己的 native 模块，由该模块统一导出 DllGetActivationFactory
+        并转发激活调用。OutputType=WinExe 下 CsWinRT 把主工程 native 产物切成
+        共享库 ClashUWP.dll（另配极小 ClashUWP.exe 桩），所以这里填 ClashUWP.dll。
+        （托管组件形态填 WinRT.Host.dll；组件 AOT 自包含但不合并时填 ClashUWP.Vpn.dll；
+          更老的 .NET Native 填 CLRHost.dll。）
       · ThreadingModel="both"：VpnChannel.ProcessEventAsync 的回调线程不保证。
 
-    WinRT.Host.dll 由 ClashUWP.Vpn 工程（CsWinRTComponent=true）产出，
-    经 ProjectReference 自动进包 —— 不要手工拷贝。
+    ★ 打包要求：msix 里必须有 ClashUWP.dll（原生，导出 DllGetActivationFactory，
+      内含 VpnBackgroundTask 激活工厂）+ 旁边的 ClashUWP.exe 桩。
+      全 AOT 合并后不再需要 ClashUWP.Vpn.dll / WinRT.Host.* / WinRT.Runtime.dll。
   -->
   <Extensions>
     <Extension Category="windows.activatableClass.inProcessServer">
       <InProcessServer>
-        <Path>WinRT.Host.dll</Path>
+        <Path>ClashUWP.dll</Path>
         <ActivatableClass ActivatableClassId="ClashUWP.Vpn.VpnBackgroundTask" ThreadingModel="both" />
       </InProcessServer>
     </Extension>
