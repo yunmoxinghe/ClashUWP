@@ -11,3 +11,29 @@
 # 跳板工具产物（源码在 Tools/UwpBridge，exe 由 publish 生成）
 uwp-bridge.exe
 uwp-bridge.pdb
+.local/
+
+# winapp 打包产物（清单与源码在 ClashUWP.Cli，msix 每次重打包都变，不入库）
+*.msix
+*.msixbundle
+
+# MSIX 打包工作区（Publish 每次都重生成，内含 .msix 与签名产物）
+AppPackages/
+
+# ★ 签名证书：私钥入库 = 任何人拿到都能签出可安装的包。绝不入库。
+#   需要时由证书生成步骤在本机重建（见 Docs/03 / AGENTS.md 的部署流程）。
+*.pfx
+
+# Publish/Build 的日志转储（每次构建都变，只是当时的现场）
+publish*.log
+publish-*.log
+build-log*.txt
+
+# 本地临时脚本与抓取产物
+check-logs.ps1
+launch.ps1
+body.html
+screenshot.png
+
+# 组件打包产物（artifacts/packages/*.nupkg 由 `dotnet pack` 重新生成）
+artifacts/

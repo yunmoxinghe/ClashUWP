@@ -186,6 +186,13 @@ namespace ClashUWP.Vpn
         private uint _decapsulateCalls;
         /// <summary>首个 <c>Decapsulate</c> 回调的形状（包长），只记一次，进日志与快照。</summary>
         private string _decapFirstInfo = "";
+        /// <summary>★ 1.0.26（T3）：<c>encapBuffer.Status != Ok</c> 的次数。
+        /// 平台用它"报告操作 IVpnPacketBufferList 时的错误"（见 VpnPacketBuffer.Status 条文），
+        /// 我们<b>只读不判死</b>：这一列非 0 = 平台交来的 buffer 自己就带着问题，
+        /// 是"入站侧确实有东西、但形状不对"的直接证据，而不是我们的处理问题。</summary>
+        private uint _decapNonOkStatus;
+        /// <summary>首个非 Ok 的 Status 原文，只记一次（进日志与快照，避免按回调刷屏）。</summary>
+        private string _decapStatusFirst = "";
         /// <summary>已 <c>AppendVpnReceivePacketBuffer</c>、<b>还没 Flush</b> 的 receive buffer 条数
         ///   —— receive 侧"在借未还"的直接读数（Docs/09 O2，与 send 侧 <c>_sendBuffersLeft</c> 对称）。
         ///   ★ <b>静态</b>口径：注入路径（<see cref="InjectAppend"/> / <see cref="FlushReceive"/>）是
@@ -224,6 +231,17 @@ namespace ClashUWP.Vpn
 
         /// <summary>首个注入失败的原文（只记一次，避免逐包刷日志）。</summary>
         private static string s_injectFirstError = "";
+
+        /// <summary>★ 1.0.26（审计项 T2）：从 <b>send 池</b>取包失败的次数 —— 两条入口都算
+        ///   （默认臂 <c>RequestVpnPacketBuffer(Send)</c>、待测臂 <c>GetVpnSendPacketBuffer()</c>，
+        ///    1.0.27 复核轮把两条的位置换回来了，理由见 <see cref="LocalSettings.SendGetBuffer"/>）。
+        ///   这条 API 在<b>本仓库从未实测</b>（先遣项目也只有 C# 兜底分支的静态存在，从未触发），
+        ///   所以它自带这一列判据：<c>ka</c> 在涨而 <c>takeFail</c> 同步涨 = 取包这条路走不通，
+        ///   写 <c>sendGetBuffer=1</c> 才进这条臂；两列都不涨 = 平台压根没来要 keep-alive，另说。</summary>
+        private static int s_takeSendFailures;
+
+        /// <summary>首个 send 取包失败原文（只记一次；keep-alive 几十秒一次，也不该刷屏）。</summary>
+        private static string s_takeSendFirstError = "";
 
         /// <summary>注入失败后的背压休眠。不睡眠会在池空时逐包抛异常热转；
         /// 直接退出泵又会把回程永久断掉 —— 那个形状和黑洞无法区分。</summary>
@@ -530,39 +548,46 @@ namespace ClashUWP.Vpn
                     selfFilter);                           // trafficFilterAssignment ★ 0=**null**，1/2=本包分流
 
                 _started = true;
-                _encapsulatedPackets = 0;
-                _echoReplies = 0;
-                _unknownPackets = 0;
-                _injectedPackets = 0;
-                _nonUnicastDropped = 0;
-                _ipChecksumFixed = 0;
-                _transportChecksumFixed = 0;
-                _checksumFixLogged = 0;
-                _keepAlives = 0;
+                // ★ 1.0.26（T4）：以下计数全部改成 Interlocked.Exchange 归零，与写侧的
+                //   Interlocked.Increment/Add 同一口径。为什么值得改：这些字段在
+                //   <c>_started = true</c> 之后<b>立刻</b>可能被平台线程写（Encapsulate 只认
+                //   <c>_started</c>），而这里还有看门狗/Disconnect 两个读者 ——
+                //   裸赋值在别的线程眼里可以长期停在旧值上，"上一会话的数"就会被当成本轮的。
+                Interlocked.Exchange(ref _encapsulatedPackets, 0);
+                Interlocked.Exchange(ref _echoReplies, 0);
+                Interlocked.Exchange(ref _unknownPackets, 0);
+                Interlocked.Exchange(ref _injectedPackets, 0);
+                Interlocked.Exchange(ref _nonUnicastDropped, 0);
+                Interlocked.Exchange(ref _ipChecksumFixed, 0);
+                Interlocked.Exchange(ref _transportChecksumFixed, 0);
+                Interlocked.Exchange(ref _checksumFixLogged, 0);
+                Interlocked.Exchange(ref _keepAlives, 0);
                 // ★ 归还侧计数器每次 start 归零 —— 判据是"ret 与 encap 同步涨"，
                 //   留下上一会话的数会让同步性没法逐轮核对。档位同时固化进快照。
                 _encapReturnMode = LocalSettings.EncapReturn.ToString();
-                _sendBuffersReturned = 0;
-                _sendBuffersLeft = 0;
-                _sendReturnFailures = 0;
-                _sendBuffersFlushed = 0;
-                _sendReturnFirstError = "";
-                _encapsulateCalls = 0;
-                _encapListItemsSeen = 0;
-                _encapListSizeMax = 0;
-                _encapEnumerated = 0;
-                _encapEnumFirstError = "";
-                _sendBuffersReappended = 0;
-                _keepAliveOrphanBuffers = 0;
-                _encapsulateErrors = 0;
-                _encapsulateFirstError = "";
-                _decapsulateCalls = 0;
+                Interlocked.Exchange(ref _sendBuffersReturned, 0);
+                Interlocked.Exchange(ref _sendBuffersLeft, 0);
+                Interlocked.Exchange(ref _sendReturnFailures, 0);
+                Interlocked.Exchange(ref _sendBuffersFlushed, 0);
+                Interlocked.Exchange(ref _sendReturnFirstError, "");
+                Interlocked.Exchange(ref _encapsulateCalls, 0);
+                Interlocked.Exchange(ref _encapListItemsSeen, 0);
+                Interlocked.Exchange(ref _encapListSizeMax, 0);
+                Interlocked.Exchange(ref _encapEnumerated, 0);
+                Interlocked.Exchange(ref _encapEnumFirstError, "");
+                Interlocked.Exchange(ref _sendBuffersReappended, 0);
+                Interlocked.Exchange(ref _keepAliveOrphanBuffers, 0);
+                Interlocked.Exchange(ref _encapsulateErrors, 0);
+                Interlocked.Exchange(ref _encapsulateFirstError, "");
+                Interlocked.Exchange(ref _decapsulateCalls, 0);
                 _decapFirstInfo = "";
+                Interlocked.Exchange(ref _decapNonOkStatus, 0);
+                _decapStatusFirst = "";
                 // receive 侧两列也每次会话归零（静态跨会话留着就没法判"在借未还"是不是本轮的）。
                 Interlocked.Exchange(ref s_receiveBuffersPending, 0);
                 Interlocked.Exchange(ref s_receiveBuffersFlushed, 0);
-                _lastKeepAliveTick = 0;
-                _sessionStartTick = Environment.TickCount64;
+                Interlocked.Exchange(ref _lastKeepAliveTick, 0);
+                Interlocked.Exchange(ref _sessionStartTick, Environment.TickCount64);
 
                 // 注意：这里不能 .ToArray() —— 本工程里 Windows.Storage.Streams 的
                 //   WindowsRuntimeBufferExtensions 把 ToArray 抢成了 IBuffer 专属扩展，
@@ -600,6 +625,16 @@ namespace ClashUWP.Vpn
                 //   放在桥之后：桥的 failFast 若已经决定放弃这次连接，看门狗不该再插一脚
                 //   —— 它第一件事就是检查开关，开关关着（或桥失败路径已断开）就不会动手。
                 SessionWatchdog.Start(channel, _config, _connectBeganAt, this);
+
+                // 步 8.5 · ★【1.0.49】武装插件进程内的<b>整机物理网络兜底看门狗</b>。
+                //   ★ 为什么放在插件进程而不是只靠前台的 HealthMonitor：
+                //     前台 UWP 进程会被系统挂起/节流/关闭 ⇒ 那个 while 循环直接停摆，
+                //     而"物理网卡断了、隧道还装着"恰恰是最需要兜底的场景（用户看到整机断网）。
+                //     插件进程在会话期间是活跃的（数据面就在里面跑，平台保活），且不随前台生命周期走。
+                //   ★ 与 SessionWatchdog 的分工：那条判"隧道黑洞"（探隧道内 DNS），
+                //     这条判"物理网络是否还活着"（探 114.114.114.114，绕开隧道）。
+                //     两条都指向同一个拆隧道动作，用 Interlocked 门闩保证只有一个动手。
+                PhysicalNetworkWatchdog.Start();
             }
             catch (Exception ex)
             {
@@ -662,12 +697,35 @@ namespace ClashUWP.Vpn
                 //   为什么不只 rethrow：只抛出去时"平台到底怎么理解这次失败"是<b>推断</b>，
                 //   而 00:21 那类"半装状态没人收尾"（孤儿 NRPT + 幽灵路由 = 整机断网）
                 //   正是靠推断过活的路径长出来的。显式终止 = 把意图说给平台听。
-                // ★ <c>_started==true</c>（桥 FailFast）这一支<b>不调</b> TerminateConnection：
-                //   那时 L3 接口与 NRPT 已经装上，拆已跑通的会话超出该方法条文
-                //   （口径与取舍见 <see cref="LocalSettings.SessionWatchdog"/> 与 Docs/09 §4），
-                //   仍然只 rethrow，由平台拆通道后回调 Disconnect → <c>channel.Stop()</c> 收尾。
+                // ★ <c>_started==true</c>（桥 FailFast / 步 8 之后任何一处抛）这一支<b>不调</b>
+                //   TerminateConnection，改为<b>显式</b>发起平台级收尾：1.0.26 之前这里只 rethrow，
+                //   注释写着"由平台拆通道后回调 Disconnect 收尾"，而那个假设没有证据（同一个
+                //   catch 上面那段注释就记着实测反例"Start 失败 ⇒ 不会有 Disconnect 来收尾"，
+                //   run 20 还观察过 OS 拆通道时直接换新进程重新 Connect、从不回调 Disconnect）。
+                //   "拆不拆得干净"这件事 00:21 已经量过一次代价（孤儿 NRPT + 幽灵路由 = 整机断网，
+                //   Docs/08 §10.10），所以不再靠推断。理由与取舍全在 <see cref="RequestPostStartTeardown"/>。
                 if (!_started)
                     AbortConnectionAttempt(channel, "start failed: " + ex.GetType().Name);
+                else
+                {
+                    // ★★ 1.0.27（复核轮）：把这条<b>已失败</b>的 channel 上的数据面闸亲手关上。
+                    //   旧写法在这一支什么都不复位：`_started` 只在 :549 置真、只在
+                    //   <c>Disconnect</c> 的第一行置假 ⇒ 异常抛出后它仍是 <c>true</c>，
+                    //   而下游两道闸都读它：
+                    //     · <c>EncapsulateCore</c> 的 <c>if (!_started) return;</c> —— 平台在
+                    //       拆这条会话的途中若还往本实例交包，我们会<b>对一个正在销毁的通道</b>
+                    //       跑完整数据面（桥还在、泵已被摘，包直接进 dial）；1.0.34 的外层守卫
+                    //       只保证"不抛出去"，不保证"不干活"。
+                    //     · <c>PumpLoop</c> 的 <c>while (... && _started ...)</c> —— 本 catch 已经
+                    //       Cancel 了 s_pumpCts，这里是第二道保险。
+                    //   为什么写在这一行而不是 catch 开头：上面 :647-656 的<b>阶段归因</b>
+                    //   （"Start 已成功，异常出在后续步骤" vs "StartWithTrafficFilter 异常"）
+                    //   和这里的分支判定读的都是同一个 <c>_started</c>，提前置假会把
+                    //   桥 FailFast 伪装成 Start 失败 —— 那正是 Docs/09 C4 记过的坑。
+                    //   幂等：<c>Disconnect</c> 真来了再置一次同样的值，无副作用。
+                    _started = false;
+                    RequestPostStartTeardown("post-start 异常 " + ex.GetType().Name);
+                }
 
                 throw;
             }
@@ -702,6 +760,101 @@ namespace ClashUWP.Vpn
                 LogSession($"evt=terminate-connection-failed reason={reason} " +
                            $"err={ex.GetType().Name}: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// 发起收尾之前先让出的秒数：给平台把这次 Connect 的失败上报处理完的时间。
+        /// ★ 这是保险，不是实测结论 —— "断开请求与 Connect 失败同时到达"的形状没量过。
+        /// </summary>
+        private const int PostStartTeardownDelaySeconds = 3;
+
+        /// <summary>
+        /// Connect 内、<b>Start 成功之后</b>才失败的收尾出口（1.0.26，审计项 T1）。
+        ///
+        /// 【要修的是什么】旧实现在这一支什么都不做，只 <c>throw;</c>，注释写着
+        ///   "由平台拆通道后回调 Disconnect → channel.Stop() 收尾"。这个假设没有证据支撑：
+        ///   ① 同一个 catch 上面就记着实测反例 —— "Start 失败 ⇒ 不会有 Disconnect 来收尾"；
+        ///   ② run 20 观察过 OS 拆通道时直接换新进程重新 Connect，<b>从不</b>回调 Disconnect；
+        ///   ③ 00:21 那次整机断网（Docs/08 §10.10）正是"没人收尾"长出来的形状：接口被扯掉时
+        ///      平台不清它自己下发的 NRPT，路由还挂在已消失的 ifIndex 上。
+        ///   ⇒ "异常抛出去，平台自然会拆干净"是推断，不能再当依赖。
+        ///
+        /// 【这一支为什么不能用平台对象上的出口】
+        ///   · <c>channel.TerminateConnection</c>：条文只管<b>建连尝试</b>
+        ///     "Terminates the connection attempt performed inside IVpnPlugIn.Connect.
+        ///      Should not be called on reconnect cases." —— 此时 L3 接口与 NRPT 已经装上，
+        ///     拿它拆一条已 Start 的会话超出条文。
+        ///   · <c>channel.Stop()</c>：条文 "Destroys a previously established VPN channel object.
+        ///     Disassociates and closes the outerTunnelTransport connection to the VPN server."，
+        ///     官方 sample 只在 <c>IVpnPlugIn.Disconnect</c> 里调它（先遣项目
+        ///     VpnPlugInImpl.cpp:775 同），语义是<b>回应平台的断开请求</b>，不是插件发起断开。
+        ///   · 插件侧<b>没有</b> <c>Disconnect()</c>（26100 的 VpnChannel 方法表逐条核对过，
+        ///     见 <see cref="GracefulTeardown"/> 类注释）。
+        ///   ⇒ 站得住的只有用户级那一条：<c>VpnManagementAgent.DisconnectProfileAsync</c>，
+        ///     也就是 <see cref="GracefulTeardown"/> 那道<b>唯一</b>的闸。本方法是它的第三个
+        ///     触发点（前台、看门狗、这里），不新写第二种拆法。
+        ///
+        /// 【用闸里的哪一个入口】<see cref="GracefulTeardown.EnsureSessionTornDownAsync"/>
+        ///   —— 发起平台级断开并<b>等</b>会话收干净，但<b>不删 profile</b>；不用
+        ///   <see cref="GracefulTeardown.DisconnectThenDeleteAsync"/>，因为它额外删 profile。
+        ///   删 profile 是"拆掉 RasMan 自动重拨的燃料"这一目的下的动作（看门狗判死时才需要），
+        ///   代价是用户必须回前台重建才能再拨 —— 桥 FailFast 不该没收用户的配置。
+        ///   重拨风暴那条病因（828 + 系统无限重拨）已由外层目标换成静默黑洞 192.0.2.1 解决
+        ///   （1.0.25），不靠删 profile 压。
+        ///
+        /// 【为什么必须排在 SessionWatchdog.Start 之前也可触发】看门狗是步 8 才武装的，
+        ///   而"桥 FailFast"这类异常出在步 7 —— 那时看门狗还没跑。若收尾只有看门狗一个触发点，
+        ///   这一支仍然是"没人收尾"。所以它必须直接在 Connect 的 catch 里可达；同时先
+        ///   <c>SessionWatchdog.Stop</c> 把另一个闸关掉，保证同一轮只有一个发起者
+        ///   （否则日志里分不清隧道是谁拆的 —— 看门狗动手会写 evt=watchdog-trip）。
+        ///
+        /// 【为什么丢后台线程】<c>IVpnPlugIn.Connect</c> 是<b>同步</b>回调（返回 void），
+        ///   而这道闸最长要等 <see cref="GracefulTeardown.WaitSeconds"/> = 20 s 确认会话收干净。
+        ///   在平台回调里同步等 20 s 等于把平台的建连状态机钉住；run 34 的实证是同步回调里
+        ///   出问题会让平台此后不再交包。所以这里只负责"把收尾这件事发出去"，不在原地等。
+        ///
+        /// 【rethrow 为什么保留】这是判断，不是顺手：
+        ///   ① 这一支已经是"连接失败"，异常是把失败原因送上去的<b>唯一</b>通道
+        ///      （TerminateConnection 不能用，见上）；吞掉它 = 平台以为这条隧道建成了，
+        ///      而我们正在把它拆掉，状态比原来更不一致。
+        ///   ② 前台"连不上自动退回直连"依赖连接失败被上报（1.0.x 的既有产品行为）。
+        ///   ③ 保留 rethrow 就是保留发布版已经跑过的形态；改成吞异常是一次<b>行为变更</b>，
+        ///     本轮的规矩是没有实测不做行为变更。
+        ///   ★ 代价必须写明：throw 出 Connect 之后平台会不会回调 Disconnect，仍然没有实测数据。
+        ///     所以收尾<b>不依赖</b>那个回调 —— 本方法自己把会话拆干净；Disconnect 真来了
+        ///     也只是再走一遍已有的 <c>DisconnectCore</c>。
+        /// </summary>
+        private void RequestPostStartTeardown(string why)
+        {
+            // 唯一闸：先停看门狗，避免两个发起者同时断开。
+            try { SessionWatchdog.Stop("post-start 失败，收尾由 Connect 的 catch 发起"); }
+            catch { /* Stop 内部已兜住，这里只防进程级意外 */ }
+
+            LogSession($"evt=post-start-teardown reason={why} delay={PostStartTeardownDelaySeconds}s " +
+                       "入口=EnsureSessionTornDownAsync（只等不删 profile）");
+            RollingLog.Warn("post-start-teardown",
+                why + " → Start 已成功但 Connect 抛出，发起平台级断开（不删 profile）");
+
+            // ★ 后台任务里任何异常都必须自己吃掉：这条 Task 一旦抛出，就是"从插件进程
+            //   漏出去一个未观察异常"，而它跑在会话收尾的正中间。
+            _ = Task.Run(async () =>
+            {
+                string report;
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(PostStartTeardownDelaySeconds))
+                        .ConfigureAwait(false);
+                    (bool ok, string torn) = await GracefulTeardown.EnsureSessionTornDownAsync()
+                        .ConfigureAwait(false);
+                    report = (ok ? "会话已确认收干净 " : "★未确认收干净，profile 保留，需手工 rasdial /disconnect ") + torn;
+                }
+                catch (Exception ex)
+                {
+                    report = $"收尾异常={ex.GetType().Name}: {ex.Message}";
+                }
+                LogSession($"evt=post-start-teardown-done report={report}");
+                RollingLog.Warn("post-start-teardown", report);
+            });
         }
 
         // ────────────────────────────────────────────────────────────────────
@@ -756,11 +909,17 @@ namespace ClashUWP.Vpn
             // ★ 归因三列，进函数第一件事就记，任何分支都跑不到漏：
             //   calls（平台回调了几次）/ seen（列表里一共几个包）/ max（单批最大）。
             //   run 34 就是缺这三列，"encap=0" 到底是"平台没交包"还是"枚举器是空的"分不开。
-            _encapsulateCalls++;
+            // ★ 1.0.26（T4）：这三列全部走 Interlocked。旧写法是裸 <c>++</c> / <c>+=</c>，
+            //   而读它们的人不止一个线程：<c>DatafaceCounters()</c> 由<b>看门狗线程</b>每 10 s 读、
+            //   <c>WriteDatafaceSnapshot()</c> 由 Disconnect 线程读 ⇒ 写侧必须原子，
+            //   否则"计数在涨但心跳读到旧值"会被读成"数据面停了"（run 30 那类误判的形状）。
+            Interlocked.Increment(ref _encapsulateCalls);
             uint listSize = 0;
             try { listSize = packets.Size; } catch { /* 极端情况下取不到 Size，下面按 0 处理 */ }
-            _encapListItemsSeen += listSize;
-            if (listSize > _encapListSizeMax)
+            Interlocked.Add(ref _encapListItemsSeen, listSize);
+            // max 只有一个写者（就是本线程这一处），且比较-赋值不构成跨线程账目 ⇒ 保持普通赋值，
+            // 用 Max 的循环写法反而会引入一次多余的 Interlocked 读。
+            if (listSize > System.Threading.Volatile.Read(ref _encapListSizeMax))
                 _encapListSizeMax = listSize;
 
             // ★ 档 3（run 33 之后新增，官方 remarks 原文见 TryReturnSendBuffer 的注释）：
@@ -803,8 +962,8 @@ namespace ClashUWP.Vpn
                     {
                         byte[] packet = buffer.Buffer.ToArray();
                         int length = (int)buffer.Buffer.Length;
-                        _encapsulatedPackets++;
-                        _encapEnumerated++;
+                        Interlocked.Increment(ref _encapsulatedPackets);
+                        Interlocked.Increment(ref _encapEnumerated);
                         Interlocked.Increment(ref _sendBuffersLeft);
                         HandleOutboundPacket(channel, packet, length);
                     }
@@ -846,7 +1005,7 @@ namespace ClashUWP.Vpn
                 byte[] packet = buffer.Buffer.ToArray();
                 int length = (int)buffer.Buffer.Length;
 
-                _encapsulatedPackets++;
+                Interlocked.Increment(ref _encapsulatedPackets);
 
                 // ★★ 【run 27/28/31/32 停在 7188 包的那条漏】拷完就得把 buffer 交回平台，
                 //   且必须对<b>每一个</b>包都交（包括下面刻意丢掉的组播/广播包）。
@@ -874,9 +1033,16 @@ namespace ClashUWP.Vpn
         /// </summary>
         private void HandleOutboundPacket(VpnChannel channel, byte[] packet, int length)
         {
-            if (_encapsulatedPackets <= MaxTunSamples)
+            // ★ 1.0.26（T4）：本方法里的计数一律 Interlocked，读一律 Volatile.Read 取一次进局部量。
+            //   原因不是"Encapsulate 会并发"（平台串行调用它），而是<b>读的人并发</b>：
+            //   看门狗线程每 10 s 读 DatafaceCounters()、Disconnect 线程读快照，
+            //   裸 uint 的写在另一线程眼里可以长期停在旧值上 —— "数在涨但心跳读到不动"
+            //   会被读成"数据面停了"，这正是 run 30 那类误判的形状。
+            //   判据（前 N 包采样 / 每 N 包一行日志）用的是同一次读到的值，语义与原实现一致。
+            uint encapSeen = System.Threading.Volatile.Read(ref _encapsulatedPackets);
+            if (encapSeen <= MaxTunSamples)
                 AddSample(s_outSamples,
-                    $"#{_encapsulatedPackets} {IpPacket.Describe(packet, length)}");
+                    $"#{encapSeen} {IpPacket.Describe(packet, length)}");
 
             // ★ 组播 / 受限广播 / 0/8 不喂内核（对齐安卓：VpnService 压根不捕获广播类流量）。
             //   喂进去的后果是 sing-tun 的 LinkEndpointFilter 把它们原样回写 tun，
@@ -886,7 +1052,7 @@ namespace ClashUWP.Vpn
             //     档 3 靠平台 cleanup），这里 return 不再欠平台的。
             if (IpPacket.IsNonUnicastDestination(packet, length))
             {
-                _nonUnicastDropped++;
+                Interlocked.Increment(ref _nonUnicastDropped);
                 return;
             }
 
@@ -903,9 +1069,9 @@ namespace ClashUWP.Vpn
                 if (fixedFields != IpPacket.ChecksumFix.None)
                 {
                     if ((fixedFields & IpPacket.ChecksumFix.IpHeader) != 0)
-                        _ipChecksumFixed++;
+                        Interlocked.Increment(ref _ipChecksumFixed);
                     if ((fixedFields & IpPacket.ChecksumFix.Transport) != 0)
-                        _transportChecksumFixed++;
+                        Interlocked.Increment(ref _transportChecksumFixed);
 
                     if (_checksumFixLogged == 0 &&
                         Interlocked.Exchange(ref _checksumFixLogged, 1) == 0)
@@ -917,8 +1083,9 @@ namespace ClashUWP.Vpn
                 int rc = MihomoBridge.clash_bridge_put_packet(packet, length);
                 if (rc != 0)
                 {
-                    _unknownPackets++;
-                    if (_unknownPackets == 1)
+                    // ★ "== 1" 这种"只报第一次"的门闩，必须用 Interlocked 的<b>返回值</b>判，
+                    //   不能"先 ++ 再读"：读到的可能是别的线程已经加过的值，首报会漏或多报。
+                    if (Interlocked.Increment(ref _unknownPackets) == 1)
                         channel.LogDiagnosticMessage("ClashUWP: put_packet 失败 rc=" + rc);
                 }
             }
@@ -928,17 +1095,19 @@ namespace ClashUWP.Vpn
                 // ★ 只在真注入成功时才计 echoReplies —— 否则"应答数"会大于"内核收下的包数"，
                 //   把池子借空伪造成"回程正常"。失败原因由 NoteInjectFailure 统一记录。
                 if (Inject(channel, reply))
-                    _echoReplies++;
+                    Interlocked.Increment(ref _echoReplies);
             }
             else
             {
-                _unknownPackets++;
+                Interlocked.Increment(ref _unknownPackets);
             }
 
-            if (_encapsulatedPackets % LogEveryNPackets == 0)
+            if (encapSeen % LogEveryNPackets == 0)
             {
                 channel.LogDiagnosticMessage(
-                    $"ClashUWP: 已处理 {_encapsulatedPackets} 包（注入 {_injectedPackets}，echo 应答 {_echoReplies}，异常 {_unknownPackets}）.");
+                    $"ClashUWP: 已处理 {encapSeen} 包（注入 {System.Threading.Volatile.Read(ref _injectedPackets)}，" +
+                    $"echo 应答 {System.Threading.Volatile.Read(ref _echoReplies)}，" +
+                    $"异常 {System.Threading.Volatile.Read(ref _unknownPackets)}）.");
             }
         }
 
@@ -1029,20 +1198,20 @@ namespace ClashUWP.Vpn
                 if (mode == 4)
                 {
                     packets.Append(buffer);
-                    _sendBuffersReappended++;
+                    Interlocked.Increment(ref _sendBuffersReappended);
                     Interlocked.Increment(ref _sendBuffersLeft);
                     return;
                 }
 
                 channel.AppendVpnSendPacketBuffer(buffer);
-                _sendBuffersReturned++;
+                Interlocked.Increment(ref _sendBuffersReturned);
 
                 // 档 2 = 每包一次 Flush（run 35/37 实测成立、产品默认）；
                 // 档 5 = 逐包 Append、每批一次 Flush（Flush 由调用方在循环外做）。
                 if (mode == 2)
                 {
                     channel.FlushVpnSendPacketBuffers();
-                    _sendBuffersFlushed++;
+                    Interlocked.Increment(ref _sendBuffersFlushed);
                 }
             }
             catch (Exception ex)
@@ -1062,7 +1231,7 @@ namespace ClashUWP.Vpn
             try
             {
                 channel.FlushVpnSendPacketBuffers();
-                _sendBuffersFlushed++;
+                Interlocked.Increment(ref _sendBuffersFlushed);
             }
             catch (Exception ex)
             {
@@ -1077,15 +1246,18 @@ namespace ClashUWP.Vpn
         /// </summary>
         private void NoteSendReturnFailure(string stage, Exception ex, VpnChannel channel)
         {
-            _sendReturnFailures++;
-            if (_sendReturnFirstError.Length == 0)
+            Interlocked.Increment(ref _sendReturnFailures);
+            // ★ 首因原文用 CompareExchange 抢占，而不是"判空再写"：Encapsulate 与
+            //   GetKeepAlivePayload 两条归还路径可能在不同线程失败，判空再写会让两条路各写一次、
+            //   把"首个"变成"任一个"。CompareExchange 只有在"原本仍是空串"时才写成功。
+            string reason = stage + " " + ex.GetType().Name + ":" +
+                ex.Message.Replace('\r', ' ').Replace('\n', ' ');
+            if (Interlocked.CompareExchange(ref _sendReturnFirstError, reason, "") == "")
             {
-                _sendReturnFirstError = stage + " " + ex.GetType().Name + ":" +
-                    ex.Message.Replace('\r', ' ').Replace('\n', ' ');
                 try
                 {
                     channel.LogDiagnosticMessage(
-                        "ClashUWP: send buffer 归还失败（首个）" + _sendReturnFirstError);
+                        "ClashUWP: send buffer 归还失败（首个）" + reason);
                 }
                 catch { /* 日志出口偶尔不可用 */ }
             }
@@ -1113,17 +1285,66 @@ namespace ClashUWP.Vpn
             //   说明外层传输确实进了数据，而我们把它整个扔了 —— 那是漏收，不是"设计如此"。
             //   推理说它不会被调用不算证据，计数才算。所以这里只记数、不碰 buffer。
             //   ★ 只记数也不许抛：Decapsulate 同样是平台同步回调。
+            //
+            // ★★ 【本方法不得请求 buffer —— 1.0.26 审计项 T3 写死的不变式】
+            //   【官方 remarks 原文】（先遣项目 docs/65 逐字引的 MSDN
+            //   <c>ivpnplugin_decapsulate_1667754039</c>）：
+            //     "It is required that any **IVpnPacketBuffer** objects requested by the plugin
+            //      be returned to the VPN framework **via either the *decapsulatedPackets* chain**,
+            //      to inject into the client TCP/IP stack, **or the *controlPacketsToSend* chain**,
+            //      to reply back to the VPN server."
+            //   以及 <c>RequestVpnPacketBuffer</c> 自己的 remarks（docs/65 同篇引
+            //   <c>vpnchannel_requestvpnpacketbuffer_7633600</c>，★ 这条正是 7188 停摆的机制原文）：
+            //     "Any **IVpnPacketBuffer** object requested by the plugin must eventually be
+            //      returned to the VPN platform (**i.e. via IVpnPlugIn.Encapsulate or
+            //      IVpnPlugin.Decapsulate**). Otherwise the plugin may be unable to request new
+            //      buffers until the outstanding buffers have been returned."
+            //   ⇒ 在本方法里借 buffer 只有两条合法出路（塞进那两个出参链），而本架构<b>不在这儿投包</b>
+            //     （回程由 <see cref="Inject"/> 在泵线程主动注入，见下面的"注入不在这里"），
+            //     所以在这里借= 白借，还只能靠 Append+Flush 那套脱离回调上下文的归还 ——
+            //     那就是 docs/65 判给官方 sample 的 A2 违规，也正是我们量过的池子耗尽死。
+            //   ★ 将来要在这里处理入站包，唯一合法形态是：<b>取包 → 填进 <c>decapsulatedPackets</c>
+            //     或 <c>controlPacketsToSend</c> 出参链</b>；任何"先借了回头再还"的写法一律不许。
+            //
+            // 【注入不在这里】本方法<b>不调</b> <c>AppendVpnReceivePacketBuffer</c>：
+            //   出参链是平台在回调返回时读的，泵线程用的是另一条已量通的形态（run 35/37）。
+            //   把两条路混在一起会让 <c>rxpend</c> 这一列同时被两个上下文改，事后对不上账。
             try
             {
                 Interlocked.Increment(ref _decapsulateCalls);
+
+                // ★ T3 的 Status 读取：<c>VpnPacketBuffer.Status</c> 在 26100 的投影里<b>存在</b>
+                //   （本地元数据 <c>P:Windows.Networking.Vpn.VpnPacketBuffer.Status</c>，
+                //    返回 <c>VpnPacketBufferStatus</c>：只有 <c>Ok</c> / <c>InvalidBufferSize</c> 两值），
+                //   所以读它是安全的 —— 与 <c>VpnPacketBufferList</c> 的坑不同（那个列表没有
+                //   GetAt/索引器，foreach 在运行时抛 InvalidCastException，档 3 就死在这儿，
+                //   Docs/09 §9）。<b>只读、只记，不做任何处置。</b>
+                string status = "读不到";
+                try { status = encapBuffer?.Status.ToString() ?? "null"; }
+                catch (Exception exSt) { status = exSt.GetType().Name; }
+
+                if (!status.Equals("Ok", StringComparison.Ordinal))
+                {
+                    Interlocked.Increment(ref _decapNonOkStatus);
+                    if (_decapStatusFirst.Length == 0)
+                        _decapStatusFirst = status;
+                }
+
                 if (_decapFirstInfo.Length == 0)
                 {
                     uint len = 0;
                     try { len = encapBuffer?.Buffer?.Length ?? 0; } catch { }
-                    _decapFirstInfo = $"#{_decapsulateCalls} len={len} " +
+                    _decapFirstInfo = $"#{_decapsulateCalls} len={len} status={status} " +
                         $"out={decapsulatedPackets?.Size ?? 0} ctl={controlPacketsToSend?.Size ?? 0}";
                     channel.LogDiagnosticMessage(
                         "ClashUWP: ★ Decapsulate 被回调了（本架构预期不会）：" + _decapFirstInfo);
+                }
+                // 非 Ok 且已经记过首行 ⇒ 单独再报一次这一条，别把"平台一直在交坏 buffer"糊成一列数字。
+                else if (!status.Equals("Ok", StringComparison.Ordinal))
+                {
+                    channel.LogDiagnosticMessage(
+                        $"ClashUWP: Decapsulate 第 {_decapsulateCalls} 次回调，encapBuffer.Status={status}" +
+                        $"（首次={_decapStatusFirst}，只记录不处置）.");
                 }
             }
             catch { /* 观测点绝不影响到平台回调 */ }
@@ -1154,11 +1375,18 @@ namespace ClashUWP.Vpn
             try
             {
                 long now = Environment.TickCount64;
-                long gapMs = _lastKeepAliveTick == 0 ? 0 : now - _lastKeepAliveTick;
-                _lastKeepAliveTick = now;
-                _keepAlives++;
+                long gapMs = System.Threading.Interlocked.Read(ref _lastKeepAliveTick) == 0
+                    ? 0 : now - System.Threading.Interlocked.Read(ref _lastKeepAliveTick);
+                Interlocked.Exchange(ref _lastKeepAliveTick, now);
+                // ★ T4：用返回值当"第几次"，别再"先 ++ 再读" —— 心跳线程同时在读这一列。
+                uint kaSeq = (uint)Interlocked.Increment(ref _keepAlives);
 
-                channel.RequestVpnPacketBuffer(VpnDataPathType.Send, out VpnPacketBuffer buf);
+                // ★ 1.0.26（T2）：取包入口收进 <see cref="TakeSendBuffer"/>，两条官方入口按开关二选一。
+                //   1.0.27 复核轮把默认摆回 run 35/37 量通过的 <c>RequestVpnPacketBuffer(Send)</c>，
+                //   <c>GetVpnSendPacketBuffer()</c> 为 <c>sendGetBuffer=1</c> 的待测臂（依据见
+                //   <see cref="LocalSettings.SendGetBuffer"/>）。
+                //   两条都借同一个 send 池，写入与"交回出参/orphan 归还"的形状完全不变。
+                VpnPacketBuffer? buf = TakeSendBuffer(channel);
                 borrowed = buf;
                 if (buf != null)
                 {
@@ -1175,10 +1403,10 @@ namespace ClashUWP.Vpn
 
                 // 只在前 3 次和每 20 次写系统日志，避免按 keep-alive 周期刷屏；
                 // 完整节奏（次数/首末间隔）在 Disconnect 的快照里给。
-                if (_keepAlives <= 3 || _keepAlives % 20 == 0)
+                if (kaSeq <= 3 || kaSeq % 20 == 0)
                 {
                     channel.LogDiagnosticMessage(
-                        $"ClashUWP: keep-alive #{_keepAlives}，距上次 {gapMs / 1000.0:F1} s，" +
+                        $"ClashUWP: keep-alive #{kaSeq}，距上次 {gapMs / 1000.0:F1} s，" +
                         $"交回包={(keepAlivePacket == null ? "null" : "1B")}，会话已 {ElapsedSeconds():F0} s");
                 }
             }
@@ -1192,15 +1420,18 @@ namespace ClashUWP.Vpn
             }
 
             // ★★ 借了却没交回的 buffer 必须<b>主动归还</b>（Docs/09 A2）。
-            //   这条路径原来是真漏：RequestVpnPacketBuffer(Send) 一旦成功、后面任何一步抛
+            //   这条路径原来是真漏：取包（<c>TakeSendBuffer</c>：默认臂 GetVpnSendPacketBuffer /
+            //   对照臂 RequestVpnPacketBuffer(Send)）一旦成功、后面任何一步抛
             //   （写 IBuffer 越界、AsStream 失败…），<c>keepAlivePacket</c> 就停在 null，
             //   借出的 buffer 再没人管 —— 和"send 池借空停在 7188 包"是同一条病根，
             //   只是 keep-alive 节奏慢（几十秒一次），撞不满配额所以一直没现形。
+            //   ★ T2 换取包入口时<b>没有动</b>这段：借到就必须还的义务与用哪条 API 借的无关，
+            //     而这条 orphan 归还正是"取包臂换了也不能漏还"的保证（TakeSendBuffer 的注释同口径）。
             //   归还走 Append+Flush（run 33/35 证明"Append 只是入队、必须 Flush 才回池子"），
             //   失败只计数不抛 —— 这个 catch 之外再抛就等于从平台回调里漏出去。
             if (borrowed != null)
             {
-                _keepAliveOrphanBuffers++;
+                Interlocked.Increment(ref _keepAliveOrphanBuffers);
                 try
                 {
                     borrowed.Buffer!.Length = 0;              // 空包：不把半截 keep-alive 发出去
@@ -1232,6 +1463,14 @@ namespace ClashUWP.Vpn
         /// ★ <c>ret</c>（归还的 send buffer 数）是 run 32 之后最关键的一列：
         ///   <c>ret</c> 与 <c>encap</c> 必须<b>同步涨</b>。一旦 ret 落后，就是"包进来了、
         ///   buffer 没还"，平台 send 池被逐包借空 —— 那正是四臂同停在 7188 包的机制。
+        ///
+        /// ★ 1.0.26（T2）新增 <c>takeFail</c>：send 池<b>取包</b>失败次数（待测臂
+        ///   <c>GetVpnSendPacketBuffer()</c> 在本仓库从未实测，这一列就是它的判据；默认臂
+        ///   <c>RequestVpnPacketBuffer(Send)</c> 失败也记同一列，见 <see cref="TakeSendBuffer"/>；
+        ///   原文原因随 <c>disconnect</c> 行的 <c>takeErr</c> 出来）。
+        ///   ★ 本方法只<b>追加</b>字段、不改已有字段名，也不加毫秒 —— 心跳行是
+        ///     <c>dataface-sessions.txt</c> 的机器契约（<c>CountConnectsSinceAsync</c> 要按
+        ///     前 19 字符取时间戳、按 <c>evt=connect-begin</c> 数重拨）。
         /// </summary>
         internal string DatafaceCounters() =>
             $"encap={_encapsulatedPackets} inj={_injectedPackets} ka={_keepAlives} " +
@@ -1243,6 +1482,7 @@ namespace ClashUWP.Vpn
             $"rxpend={System.Threading.Volatile.Read(ref s_receiveBuffersPending)} " +
             $"rxflush={System.Threading.Volatile.Read(ref s_receiveBuffersFlushed)} " +
             $"decap={_decapsulateCalls} kaOrphan={_keepAliveOrphanBuffers} " +
+            $"takeFail={System.Threading.Volatile.Read(ref s_takeSendFailures)} " +
             $"big={s_oversizedPackets} drop={_nonUnicastDropped}";
 
 
@@ -1309,6 +1549,11 @@ namespace ClashUWP.Vpn
             //   而那时拆隧道是正常收尾，不是黑洞）。
             SessionWatchdog.Stop("平台回调 Disconnect");
 
+            // ★【1.0.49】物理网络兜底看门狗同样要停：平台已在收尾，
+            //   它继续探只会读到"探针不通"（那正是正常收尾的形态，不是黑洞），
+            //   判死之后会做一次多余的拆隧道动作。
+            PhysicalNetworkWatchdog.Stop("平台回调 Disconnect");
+
             // ★ 会话日志：活多久、收了多少包、平台索取过几次 keep-alive。
             //   828 到底是"平台拆通道不回调"还是"回调了我们自己收尾"，就看这一行
             //   与下一条 connect-begin 之间的间隔（不回调 ⇒ 两行 connect-begin 相邻、无 disconnect）。
@@ -1320,6 +1565,7 @@ namespace ClashUWP.Vpn
                        $"left={_sendBuffersLeft} retErr={_sendReturnFirstError} enumErr={_encapEnumFirstError} " +
                        $"encapErr={_encapsulateErrors} encapErrFirst={_encapsulateFirstError} " +
                        $"injFail={s_injectFailures} injErr={s_injectFirstError} " +
+                       $"takeFail={System.Threading.Volatile.Read(ref s_takeSendFailures)} takeErr={s_takeSendFirstError} " +
                        $"rxpend={System.Threading.Volatile.Read(ref s_receiveBuffersPending)} " +
                        $"rxflush={System.Threading.Volatile.Read(ref s_receiveBuffersFlushed)} " +
                        $"decap={_decapsulateCalls} decapFirst={_decapFirstInfo} " +
@@ -1433,6 +1679,14 @@ namespace ClashUWP.Vpn
                 $"ReceiveBatch={LocalSettings.ReceiveBatch} InjectGetBuffer={(LocalSettings.InjectGetBuffer ? 1 : 0)} " +
                 $"ReceiveBuffersPending={System.Threading.Volatile.Read(ref s_receiveBuffersPending)} " +
                 $"ReceiveBuffersFlushed={System.Threading.Volatile.Read(ref s_receiveBuffersFlushed)}\r\n" +
+                // ★ 1.0.26（T2）：send 池取包臂与它的失败计数。1.0.27 复核轮把默认摆回
+                //   RequestVpnPacketBuffer（run 35/37 量通的那条），GetVpnSendPacketBuffer 变成
+                //   sendGetBuffer=1 的待测臂 —— KeepAlives 涨而 TakeSendFailures 同步涨
+                //   = 当前臂取不到包（两臂都记同一列，所以这一列与 SendGetBuffer 一起读才有意义）。
+                //   快照里写这一行是机器契约的一部分：字段名不动，值只是 0/1。
+                $"SendGetBuffer={(LocalSettings.SendGetBuffer ? 1 : 0)} " +
+                $"TakeSendFailures={System.Threading.Volatile.Read(ref s_takeSendFailures)} " +
+                $"TakeSendFirstError={s_takeSendFirstError}\r\n" +
                 // ★ Decapsulate 计数：预期恒为 0（不走 outer transport）。非 0 就是"外层确实进了数据
                 //   却被我们扔了"的直接证据 —— 这条推理以前只是推理，现在可证伪（Docs/09 O1）。
                 $"DecapsulateCalls={_decapsulateCalls} DecapFirst={_decapFirstInfo} " +
@@ -1488,17 +1742,47 @@ namespace ClashUWP.Vpn
         /// </summary>
         private void StartMihomoBridge(VpnChannel channel, string config, string? configPath)
         {
-            // ★ G10（Docs/12 §5 第 2 项）：内核 home 从「包安装目录」换成「LocalState」，
-            //   并把随包的 Country.mmdb 复制进去 —— 两件事必须一起做，因为 mihomo 的
-            //   MMDB 解析就是 ReadDir(home) 里找 Country.mmdb。
-            //   home 之前是只读目录，后果是三件静默失败：<cache.db 选节点持久化>、
-            //   <provider 落盘>、<热重载的 path 安全阀（SafePaths 只有 home 之内）>。
-            //   为什么必须"复制"而不是"直接指过去"，以及退回包目录的兜底口径，
-            //   全写在 <see cref="KernelHome"/> 的类注释里。
-            string mmdbDir = KernelHome.Ensure();
-
-            lock (s_bridgeGate)
+            // ★ 观测性修复（1.0.41）：桥的生命周期过去只走 channel.LogDiagnosticMessage
+            //   （发给平台，<b>不进 RollingLog</b>），于是 plugin.log 里 kernel-home 之后一片
+            //   安静，把"其实跑得好好的"误读成"内核没起来"。这里每个分支都补一条 RollingLog。
+            // ★ 健壮性修复：给"取 s_bridgeGate 锁"和"clash_bridge_start 的 P/Invoke"各加超时。
+            //   实测形态（1.0.38，pid=8964 会话无 disconnect、pid=3196 新进程 evt=start 后彻底
+            //   静默）最像两种卡死：① 上一会话的 Disconnect 在锁内做 clash_bridge_stop/BoundInterface
+            //   的 native 调用没返回 → 新进程 Start 卡在取锁；② 新进程 clash_bridge_start 撞 9090
+            //   端口（上一进程残留桥还占着）卡死在 hub.ApplyConfig。两种都会把 Connect 线程永久
+            //   wedge 且日志无痕。加超时后从"静默永久卡死"变成"有记录的失败 + failFast 拆连接"。
+            //   代价：超时的 native 调用线程会被弃用（它不持锁，弃用不影响锁），换 Connect 不被拖死。
+            string mmdbDir;
+            try
             {
+                mmdbDir = KernelHome.Ensure();
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Error("bridge-start", $"KernelHome.Ensure 异常: {ex.GetType().Name}: {ex.Message}", ex);
+                _bridgeDiag = "KernelHome.Ensure 异常: " + ex.Message;
+                s_bridgeGlobal = false;
+                if (LocalSettings.FailFast) throw;
+                return;
+            }
+
+            bool lockTaken = false;
+            try
+            {
+                // 取锁也要限时：上一任收尾若卡在 native Stop，这里不能无限等。
+                if (!Monitor.TryEnter(s_bridgeGate, TimeSpan.FromSeconds(10)))
+                {
+                    string msg = "取 s_bridgeGate 锁超时 10s（上一会话的桥收尾/Stop 仍卡在 native P/Invoke）";
+                    RollingLog.Error("bridge-start", msg);
+                    channel.LogDiagnosticMessage("ClashUWP: mihomo " + msg);
+                    _bridgeDiag = msg;
+                    s_bridgeGlobal = false;
+                    if (LocalSettings.FailFast)
+                        throw new InvalidOperationException("mihomo 内核桥取锁超时，已按 failFast 放弃本次连接：" + msg);
+                    return;
+                }
+                lockTaken = true;
+
                 // 上一任的泵先摘除（它可能还挂在已 Stop 的旧 channel 上）。
                 var old = s_pumpCts;
                 s_pumpCts = null;
@@ -1512,35 +1796,54 @@ namespace ClashUWP.Vpn
 
                 int rc = 0;
                 bool calledStart = false;
+                bool startTimedOut = false;
 
                 if (!s_bridgeResident)
                 {
                     // 路径 1：本进程首次（或上一次以 residentBridge=0 停过桥）→ 全量启动。
                     // 路径 2：常驻复用 —— 根本不再调用 clash_bridge_start，
                     //   这样"同进程第二次 Start"这条病态路径在本版本里不存在。
-                    try
+                    RollingLog.Info("bridge-start",
+                        $"本进程首次启动桥 mtu={_config.Mtu} drained={drained} " +
+                        $"mmdbDir={(mmdbDir.Length == 0 ? "(空!)" : mmdbDir)}");
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    var startTask = Task.Run(() => MihomoBridge.Start(config, (int)_config.Mtu, mmdbDir));
+                    calledStart = true;
+                    if (!startTask.Wait(TimeSpan.FromSeconds(20)))
                     {
-                        rc = MihomoBridge.Start(config, (int)_config.Mtu, mmdbDir);
-                        calledStart = true;
+                        startTimedOut = true;
+                        rc = -99;
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        // 常见于 DLL 缺失（DllNotFoundException）或入口缺失（EntryPointNotFoundException）。
-                        channel.LogDiagnosticMessage("ClashUWP: mihomo bridge 启动异常: " + ex.Message);
-                        _bridgeDiag = "启动异常: " + ex.Message;
-                        s_bridgeGlobal = false;
-                        return;
+                        rc = startTask.Result;
+                        RollingLog.Info("bridge-start", $"clash_bridge_start 返回 rc={rc} 用时={sw.ElapsedMilliseconds}ms");
                     }
                 }
 
+                if (startTimedOut)
+                {
+                    string msg = "clash_bridge_start 超时 20s（疑似卡死在 P/Invoke / hub.ApplyConfig / 9090 被上一进程占用）";
+                    RollingLog.Error("bridge-start", msg);
+                    channel.LogDiagnosticMessage("ClashUWP: mihomo " + msg);
+                    _bridgeDiag = msg;
+                    s_bridgeGlobal = false;
+                    if (LocalSettings.FailFast)
+                        throw new InvalidOperationException("mihomo 内核启动超时，已按 failFast 放弃本次连接：" + msg);
+                    return;
+                }
+
+                string lastErr = calledStart ? MihomoBridge.LastError() : "";
+
                 if (s_bridgeResident ||
-                    (calledStart && rc == -2 && MihomoBridge.LastError().Contains("already started")))
+                    (calledStart && rc == -2 && lastErr != null && lastErr.Contains("already started")))
                 {
                     // 桥已在跑（常驻或残留）：泵改挂到当前 channel，数据面继续可用。
                     s_bridgeResident = true;
                     s_bridgeGlobal = true;
                     _bridgeDiag = $"复用常驻内核（排空 {drained} 包" +
                                   (configChanged ? "，配置已变 → 尝试热重载" : "，配置未变") + "）";
+                    RollingLog.Info("bridge-start", _bridgeDiag);
                     channel.LogDiagnosticMessage("ClashUWP: 内核常驻，回程泵改挂当前 channel.");
 
                     if (configChanged)
@@ -1548,8 +1851,9 @@ namespace ClashUWP.Vpn
                 }
                 else if (rc != 0)
                 {
-                    channel.LogDiagnosticMessage($"ClashUWP: mihomo bridge start 失败 rc={rc}: {MihomoBridge.LastError()}");
-                    _bridgeDiag = $"start 失败 rc={rc}: {MihomoBridge.LastError()}";
+                    RollingLog.Error("bridge-start", $"start 失败 rc={rc}: {lastErr}");
+                    channel.LogDiagnosticMessage($"ClashUWP: mihomo bridge start 失败 rc={rc}: {lastErr}");
+                    _bridgeDiag = $"start 失败 rc={rc}: {lastErr}";
                     s_bridgeGlobal = false;
 
                     // ★ failFast（默认开）：内核没起来就<b>不要</b>留着这条隧道。
@@ -1559,7 +1863,7 @@ namespace ClashUWP.Vpn
                     //   物理网卡立刻恢复 —— "连不上就退回直连"比"连上了但全黑"有用得多。
                     if (LocalSettings.FailFast)
                         throw new InvalidOperationException(
-                            $"mihomo 内核启动失败，已按 failFast 放弃本次连接：rc={rc} {MihomoBridge.LastError()}");
+                            $"mihomo 内核启动失败，已按 failFast 放弃本次连接：rc={rc} {lastErr}");
 
                     return;
                 }
@@ -1568,6 +1872,7 @@ namespace ClashUWP.Vpn
                     s_bridgeGlobal = true;
                     s_bridgeResident = true;
                     _bridgeDiag = $"本进程首次启动（排空 {drained} 包）";
+                    RollingLog.Info("bridge-start", "mihomo bridge 已启动，回程泵运行中.");
                     channel.LogDiagnosticMessage("ClashUWP: mihomo bridge 已启动，回程泵运行中.");
                 }
 
@@ -1578,6 +1883,22 @@ namespace ClashUWP.Vpn
                 var cts = new CancellationTokenSource();
                 s_pumpCts = cts;
                 _ = Task.Run(() => PumpLoop(channel, cts.Token));
+            }
+            catch (Exception ex)
+            {
+                // ★ StartMihomoBridge 内部的任何异常都必须进 RollingLog，否则会被外层 catch
+                //   （只走 channel 日志）吞掉，plugin.log 里什么都不留（这正是最初的观测盲区）。
+                RollingLog.Error("bridge-start", $"StartMihomoBridge 异常: {ex.GetType().Name}: {ex.Message}", ex);
+                channel.LogDiagnosticMessage($"ClashUWP: StartMihomoBridge 异常: {ex.GetType().Name}: {ex.Message}");
+                _bridgeDiag = $"桥启动失败: {ex.Message}";
+                s_bridgeGlobal = false;
+
+                if (LocalSettings.FailFast)
+                    throw;
+            }
+            finally
+            {
+                if (lockTaken) Monitor.Exit(s_bridgeGate);
             }
         }
 
@@ -1860,9 +2181,12 @@ namespace ClashUWP.Vpn
         ///   泵一遇 <c>0x8007045B</c> 就整条退出 —— 一次背压就把回程永久关掉，
         ///   那是比丢一个包严重得多的病，见 PumpLoop 的注释）。
         ///
-        /// 【官方】RequestVpnPacketBuffer(VpnDataPathType, out VpnPacketBuffer)：
-        ///   "Requests an IVpnPacketBuffer from the specified pool. There is one IVpnPacketBuffer
-        ///    pool for the send path and another IVpnPacketBuffer pool for the receive path."
+        /// 【官方】RequestVpnPacketBuffer(VpnDataPathType, out VpnPacketBuffer)
+        ///   （本地 26100 元数据逐字，★ 整句以 "<b>Not supported.</b>" 开头）：
+        ///   "Not supported. Requests a IVpnPacketBuffer from the specified pool. There is one
+        ///    IVpnPacketBuffer for the send path and another IVpnPacketBuffer for the receive path"
+        ///   枚举 <c>VpnDataPathType</c> 同样被标："VpnDataPathType is not supported and may be
+        ///   altered or unavailable in the future."
         /// 【官方】AppendVpnReceivePacketBuffer(VpnPacketBuffer)：
         ///   "Appends a receive VpnPacketBuffer object to the channel."
         /// 【官方】FlushVpnReceivePacketBuffers()：
@@ -1872,8 +2196,8 @@ namespace ClashUWP.Vpn
         ///   "Requests a VpnPacketBuffer object from the receive packet buffer pool to be used
         ///    in the decapsulation or **injection** of a received packet from the VPN server
         ///    into the local network stack."
-        ///   ⇒ 已实现为<b>可切换</b>的取包入口，见 <see cref="TakeReceiveBuffer"/>
-        ///     （<c>settings.txt: injectGetBuffer</c>，默认仍走 <c>RequestVpnPacketBuffer</c>）。
+        ///   ⇒ 取包入口已收进 <see cref="TakeReceiveBuffer"/>，1.0.26 起<b>默认走这条</b>
+        ///     （<c>settings.txt: injectGetBuffer=0</c> 才回退到 <c>RequestVpnPacketBuffer</c>）。
         ///
         /// ★★ 与 <see cref="TryReturnSendBuffer"/> 对称的另一半：<b>借来的 receive buffer
         ///   也必须归还</b>。旧实现在"回程包超 MTU"那一支直接 <c>return</c>，buffer 就此丢失 ——
@@ -1957,38 +2281,58 @@ namespace ClashUWP.Vpn
         /// </summary>
         private static void FlushReceive(VpnChannel channel)
         {
-            int pending = System.Threading.Volatile.Read(ref s_receiveBuffersPending);
+            // ★★ 1.0.26（T4）：旧写法是 <c>Volatile.Read(pending)</c> → Flush → <c>Add(-pending)</c>，
+            //   这三步<b>不是原子的</b>。读与销账之间 <c>InjectAppend</c> 还能往里 Increment
+            //   （泵线程与 <c>Encapsulate</c> 的 echo 回落线程都会走到这两个方法），
+            //   于是 <c>Add(-pending)</c> 会把"这期间刚借出去、还没提交"的 buffer 一起销掉 ——
+            //   <c>rxpend</c> 长期偏低。而 <c>rxpend</c> 是我们判断"receive 池有没有被借空"的
+            //   <b>唯一</b>一列（run 32 的 send 侧泄漏就是靠它的对称列先现形的）：
+            //   数错了比没数更糟，它会把"正在借空"读成"干净"。
+            //   ⇒ 现在用 <c>Interlocked.Exchange</c> 一次<b>取走</b>整段 pending（取走后新借的从 0 记），
+            //     Flush 失败再把<b>取走的量原样加回去</b>，"失败不算已提交"的口径不变。
+            //   ★ 残余误差必须写明：Exchange 之后、Flush 之前新 Append 的 buffer 会被这次 Flush
+            //     一起提交掉，但它们记在"在借"里，要等下一次 Flush 才销账 ⇒
+            //     <c>rxpend</c> 只会<b>偏高</b>（保守方向），<c>rxflush</c> 可能重复计一次。
+            //     这两列都是<b>纯诊断</b>（没有任何分支读它们做决策），所以取保守侧；
+            //     判"有没有借空"看的是趋势不绝对值 —— 单调上涨才是病。
+            int taken = Interlocked.Exchange(ref s_receiveBuffersPending, 0);
             try
             {
                 channel.FlushVpnReceivePacketBuffers();
             }
             catch (Exception ex)
             {
+                // 一次失败的 Flush 什么都没提交：把取走的量放回"在借"，
+                // 让 rxpend 继续诚实反映借没还的量，而不是被一次失败的 Flush 抹平。
+                if (taken > 0)
+                    Interlocked.Add(ref s_receiveBuffersPending, taken);
                 NoteInjectFailure("flush", ex);
                 return;
             }
 
-            if (pending > 0)
-            {
-                // 只在 Flush 成功后销账：失败时 buffer 仍算"在借未还"，
-                // 让 rxpend 这一列诚实反映借没还的量，而不是被一次失败的 Flush 抹平。
-                Interlocked.Add(ref s_receiveBuffersPending, -pending);
-                Interlocked.Add(ref s_receiveBuffersFlushed, pending);
-            }
+            if (taken > 0)
+                Interlocked.Add(ref s_receiveBuffersFlushed, taken);
         }
 
         /// <summary>
         /// 从 receive 池取一个 buffer，两条官方入口按开关二选一。
         ///
-        /// 【默认】<c>RequestVpnPacketBuffer(VpnDataPathType.Receive, out buf)</c>：
-        ///   "Requests an IVpnPacketBuffer from the specified pool. There is one pool for the
-        ///    send path and another pool for the receive path." —— run 35/37 就是这条。
-        /// 【<c>injectGetBuffer=1</c>】<c>GetVpnReceivePacketBuffer()</c>：
-        ///   "...to be used in the decapsulation or <b>injection</b> of a received packet from
-        ///    the VPN server into the local network stack." —— 官方<b>点名</b>给 injection 的入口，
-        ///   本品在 <c>Decapsulate</c> 之外（泵线程）投包，条文上更贴这一条。
-        /// ★ 两条借的是同一个池、还的路径（Append+Flush）也一样，差别只在取包层 ⇒
-        ///   没有实测证据前不改默认（口径同 <c>EncapReturn</c>）。
+        /// 【默认（1.0.26 起）】<c>GetVpnReceivePacketBuffer()</c>：
+        ///   "Requests a VpnPacketBuffer object from the receive packet buffer pool to be used
+        ///    in the decapsulation or <b>injection</b> of a received packet from the VPN server
+        ///    into the local network stack" —— 官方<b>点名</b>给 injection 的入口，本品在
+        ///   <c>Decapsulate</c> 之外（泵线程）投包，正是这条。先遣项目 docs/76 的
+        ///   <c>injectmode=1</c> 实测：24 包全部 <c>attempt=0</c> 一次成功，成功率没掉。
+        /// 【对照臂 <c>injectGetBuffer=0</c>】<c>RequestVpnPacketBuffer(VpnDataPathType.Receive, out buf)</c>：
+        ///   "Not supported. Requests a IVpnPacketBuffer from the specified pool. There is one
+        ///    IVpnPacketBuffer for the send path and another IVpnPacketBuffer for the receive path"
+        ///   —— run 35/37 量到 18202 包用的就是它，但本地 26100 元数据在这句<b>前面</b>写着
+        ///   "<b>Not supported.</b>"，枚举 <c>VpnDataPathType</c> 也标了 "is not supported and
+        ///   may be altered or unavailable in the future" ⇒ 降为对照臂，<b>不删</b>（新臂在本仓库仍未实测）。
+        /// ★ 两条借的是同一个池、归还路径（Append+Flush）也一样，差别只在取包层。
+        ///   取包失败（抛 / 返回 null）都由 <c>InjectAppend</c> 的 catch 计进
+        ///   <c>injFail</c>/<c>injErr</c>（stage=<c>request</c>）⇒ 判据仍是
+        ///   <c>rxpend</c> 不单调上涨、<c>rxflush</c> 与 <c>inj</c> 同步、长跑不停摆。
         /// </summary>
         private static VpnPacketBuffer TakeReceiveBuffer(VpnChannel channel)
         {
@@ -2004,6 +2348,73 @@ namespace ClashUWP.Vpn
             if (buf == null)
                 throw new InvalidOperationException("RequestVpnPacketBuffer(Receive) 返回 null");
             return buf;
+        }
+
+        /// <summary>
+        /// 从 <b>send 池</b>取一个 buffer（目前只有 <c>GetKeepAlivePayload</c> 用），
+        /// 两条官方入口按 <see cref="LocalSettings.SendGetBuffer"/> 二选一。1.0.26（审计项 T2）新增。
+        ///
+        /// 【默认（1.0.27 复核轮摆回）】<c>RequestVpnPacketBuffer(VpnDataPathType.Send, out buf)</c>：
+        ///   本地 26100 元数据里这条整句以"<b>Not supported.</b>"开头，连它吃的
+        ///   <c>VpnDataPathType</c> 都被标 "is not supported and may be altered or
+        ///   unavailable in the future" —— 按条文它<b>本该</b>是待测臂，但它是唯一一条
+        ///   量过 18202 包 / 38 轮 204 无中断的路径（run 35/37）。没有对照证据之前，
+        ///   "条文更贴"不构成把热路径默认换成零实测入口的理由（口径同
+        ///   <see cref="LocalSettings.EncapReturn"/>：档 3 就是"看着更贴条文"却死在投影层的那次）。
+        /// 【待测臂 <c>sendGetBuffer=1</c>】<c>GetVpnSendPacketBuffer()</c>："Retrieves a VpnPacketBuffer
+        ///   object from the send packet buffer pool to use in encapsulation and transmission of
+        ///   a data packet from the client network stack to the VPN server." —— 官方给 send 池的
+        ///   <b>具名</b>入口，而 keep-alive 正是"要真的发出去"的那一个包（见 <c>ResolveOuterTarget</c>）。
+        ///   ★ 它在<b>两个仓库里都零实测</b>（先遣项目只有 C# 兜底分支的静态存在，从未触发），
+        ///     投影层会不会抛也无记录 ⇒ 授权后单变量跑，判据见 Docs/09 §12.6 第 1 项；
+        ///     代码里两条入口都保留，谁都不许删。
+        ///
+        /// 【失败口径】两条入口都只可能两种失败：抛异常 / 返回 null。
+        ///   · 抛异常 ⇒ <b>原样继续抛</b>，由 <c>GetKeepAlivePayload</c> 既有的 catch 兜住
+        ///     （它已经会把 <c>keepAlivePacket</c> 置 null 并记日志）—— 这不是新发明的失败形态，
+        ///     旧臂抛的时候走的就是同一条出口；
+        ///   · 返回 null ⇒ 计数后返回 null，调用方照常交 null。
+        ///   两种都进 <c>takeFail</c>/<c>takeErr</c>，所以判"新臂行不行"看的是这两列，不是猜。
+        /// ★ 借到的 buffer 的<b>归还义务在调用方</b>：交给出参 = 交回平台；
+        ///   没交出去（null / 异常）就必须走 orphan 归还包括 Append+Flush，见
+        ///   <c>GetKeepAlivePayload</c> 末尾那段（Docs/09 A2）。
+        /// </summary>
+        private static VpnPacketBuffer? TakeSendBuffer(VpnChannel channel)
+        {
+            try
+            {
+                if (LocalSettings.SendGetBuffer)
+                {
+                    VpnPacketBuffer? got = channel.GetVpnSendPacketBuffer();
+                    if (got == null)
+                    {
+                        NoteTakeSendFailure("get=1 GetVpnSendPacketBuffer() 返回 null");
+                        return null;
+                    }
+                    return got;
+                }
+
+                channel.RequestVpnPacketBuffer(VpnDataPathType.Send, out VpnPacketBuffer buf);
+                if (buf == null)
+                    NoteTakeSendFailure("get=0 RequestVpnPacketBuffer(Send) 返回 null");
+                return buf;
+            }
+            catch (Exception ex)
+            {
+                NoteTakeSendFailure($"get={(LocalSettings.SendGetBuffer ? 1 : 0)} " +
+                                    $"{ex.GetType().Name}:{ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>send 池取包失败计数 + 首个原因（不写日志：keep-alive 节奏慢，
+        /// 原因随 <c>Disconnect</c> 快照与心跳的 <c>takeFail/takeErr</c> 两列出来）。
+        /// 静态口径：跨会话累计，与 <see cref="NoteInjectFailure"/> 一致。</summary>
+        private static void NoteTakeSendFailure(string reason)
+        {
+            Interlocked.Increment(ref s_takeSendFailures);
+            if (s_takeSendFirstError.Length == 0)
+                s_takeSendFirstError = reason.Replace('\r', ' ').Replace('\n', ' ');
         }
 
         /// <summary>注入失败计数 + 首个原因（只写一次日志）。静态口径：跨会话累计。</summary>

@@ -35,7 +35,7 @@
   <Identity
     Name="421769c5-17f4-4287-b6c1-193222d21e14"
     Publisher="CN=gold"
-    Version="1.0.37.0" />
+    Version="1.0.50.0" />
 
   <mp:PhoneIdentity PhoneProductId="421769c5-17f4-4287-b6c1-193222d21e14" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -54,7 +54,23 @@
   </Resources>
 
   <Applications>
-    <!-- 前台 UI（Reactor.Uwp）。 -->
+    <!--
+      前台 UI（Reactor.Uwp）。
+
+      ★ windows.appService 扩展 = in-app AppService（clashuwp-cli 的连接点）：
+        · <b>不写 EntryPoint</b> —— 这正是要的形态。官方规则：Application 级
+          appService 扩展带 EntryPoint 时走独立后台任务宿主；不带时连接激活
+          的是<b>本前台进程</b>的 App.OnBackgroundActivated(AppServiceTriggerDetails)，
+          遥控的才是 VpnSession/健康哨兵/DebugCommandLoop 真实状态所在的那个进程。
+          （background-task AppService 会起空壳宿主，看不到主进程内存 —— 选错
+            形态整个通道就白做。）
+        · 与上方 Plugin 的 backgroundTasks 不同，这里<b>不需要</b>
+          Package 级 activatableClass.inProcessServer 注册 —— 那条"事实 2"
+          只约束后台任务激活；in-app AppService 由前台进程自己接收，没有
+          独立的 WinRT 类要平台去 LoadLibrary。
+        · Name 必须与 CLI 侧 AppServiceConnection.AppServiceName 逐字一致：
+          "ClashUWP.Debug"（见 ClashUWP.Cli/Program.cs）。
+    -->
     <Application Id="App"
       Executable="$targetnametoken$.exe"
       EntryPoint="ClashUWP.App">
@@ -67,6 +83,11 @@
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"/>
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.appService">
+          <uap:AppService Name="ClashUWP.Debug" />
+        </uap:Extension>
+      </Extensions>
     </Application>
 
     <!--

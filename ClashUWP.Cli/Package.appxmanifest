@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap2="http://schemas.microsoft.com/appx/manifest/uap/windows10/2"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap2 uap3 uap5 uap10 desktop desktop4 desktop6 rescap">
+
+  <!--
+    ═══════════════════════════════════════════════════════════════════════════
+    本清单按官方两篇文档逐条对齐（2026-10-18）：
+      · 「Packaging a CLI Executable as MSIX」winapp CLI 官方指南
+        https://learn.microsoft.com/windows/apps/dev-tools/winapp-cli/guides/packaging-cli
+      · 「uap5:AppExecutionAlias」清单架构参考（含 Subsystem 属性与最低 OS）
+        https://learn.microsoft.com/uwp/schemas/appxpackage/uapmanifestschema/element-uap5-appexecutionalias
+    每一条改动在下面注释里都写明它对应官方哪一节，方便日后复核，不要合并成一句"按官方改"。
+    ═══════════════════════════════════════════════════════════════════════════
+  -->
+
+  <Identity
+    Name="ClashUWP.Cli"
+    Publisher="CN=gold"
+    Version="1.0.1.0" />
+
+  <Properties>
+    <DisplayName>ClashUWP.Cli</DisplayName>
+    <PublisherDisplayName>gold</PublisherDisplayName>
+    <!-- ★ 官方指南 4.4 要求 Properties 里写 Description（Store 提交与设置页"应用信息"读它）。 -->
+    <Description>Debug CLI for ClashUWP: sends one-line commands to the app over AppService.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:PackageIntegrity>
+      <uap10:Content Enforcement="on"/>
+    </uap10:PackageIntegrity>
+  </Properties>
+
+  <Dependencies>
+    <!-- MinVersion 18362 ≥ 两件事的门槛：执行别名要 16299，desktop4:Subsystem 要 17763。
+         → 上面的 desktop4 / uap5 虽然挂在 IgnorableNamespaces 里，在本机这台机上仍永远真生效。 -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.18362.0" MaxVersionTested="10.0.26200.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us"/>
+  </Resources>
+
+  <!--
+    打包形态：folder mode —— 用 winapp 的 package 命令指向 dotnet publish 的布局目录，
+    并显式给出本清单与签名证书（证书口令为空）。
+    所以 Executable 必须是<b>真实 exe 名</b>而不是构建期占位符：本工程没有 msbuild 打包目标
+    去替换它。（★ 踩过的坑：winapp 的占位符扫描连 XML 注释也扫，本文件任何位置都不要再
+      写出那个字面量，否则打包直接报 "manifest contains unresolved placeholders"。）
+
+    EntryPoint=Windows.FullTrustApplication + runFullTrust：桌面桥 full-trust 形态，
+    进程在容器外（mediumIL）跑 —— 这正是桌面进程能 OpenAsync 连主应用 AppService 的前提。
+    官方等价写法是 uap10:RuntimeBehavior="packagedClassicApp" + uap10:TrustLevel="mediumIL"
+    （见 Application 元素架构参考的「valid combinations of activation info」），
+    两种写法二选一，<b>同时写且互相矛盾会报错</b>，这里保留 1809 就支持的 EntryPoint 形态。
+  -->
+  <Applications>
+    <Application Id="clashUWP.Cli"
+      Executable="clashuwp-cli.exe"
+      EntryPoint="Windows.FullTrustApplication"
+      desktop4:SupportsMultipleInstances="true">
+
+      <!--
+        ★ AppListEntry="none" —— 官方 CLI 指南 4.2 明文要求：
+          "CLI tools are invoked from the terminal, so they don't need a Start menu entry".
+        注意它是 <uap:VisualElements> 的属性，<b>不是</b> <Application> 的属性（挂错位置
+        部署直接 0xC00CE015，主应用那份清单里已实测过一次）。
+        磁贴图片仍要留：图标是 Store 提交与其它上下文的硬要求，隐藏入口不等于免图标。
+      -->
+      <uap:VisualElements
+        DisplayName="ClashUWP.Cli"
+        Description="ClashUWP AppService remote CLI"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\MedTile.png"
+        Square44x44Logo="Assets\AppList.png"
+        AppListEntry="none">
+        <uap:DefaultTile Wide310x150Logo="Assets\WideTile.png" />
+      </uap:VisualElements>
+
+      <!--
+        ★ 执行别名（官方 CLI 指南 4.3）：装包后 Windows 在
+          %LOCALAPPDATA%\Microsoft\WindowsApps 建重解析点，那个目录在 PATH 上，
+          于是终端里直接 `clashuwp-cli status` 就能跑（卸包时别名自动删除）。
+          除此之外没有别的办法让打包应用进 PATH —— 手工复制 exe 到 WindowsApps
+          或改 PATH 都不许碰。
+
+        desktop4:Subsystem="console"（挂在别名元素上）：架构参考把 Subsystem 列为
+          <uap5:AppExecutionAlias> 的可选属性（值 console / windows，别名级最低 OS 16299）。
+          它告诉 Shell 这个别名指向控制台程序：从<b>不带控制台</b>的上下文（资源管理器、
+          设置页）启动时会展出一个控制台窗口；从已有终端里跑则继承父控制台，输出照常。
+
+        ★ 配套必需、<b>不是我选的</b>：<Application> 上的
+          desktop4:SupportsMultipleInstances="true" 是上面那个 console 声明的<b>硬前提</b>。
+          打包时 makeappx 实测直接拒绝（0x80080204）：
+            "The AppExecutionAlias element cannot declare the attribute Subsystem with
+             value console without declaring the attribute SupportsMultipleInstances
+             with value true in element Application."
+          这跟架构参考 Application 元素那页的备注是同一件事的正反面：
+            "Console apps will always be multi-instanced and must explicitly declare
+             SupportsMultipleInstances."
+          —— 也就是说官方「Create a UWP console app」模板把两个属性一起写，不是给
+          C++/WinRT UWP 控制台应用特供的仪式感，而是校验器强制的成对声明。
+          对本工程没有副作用：这是 full-trust 桌面桥 exe，本来就每次调用起一个新进程
+          （调试 CLI 连着发多条命令是常态）。
+          唯一要记的约束：声明了 SupportsMultipleInstances 就<b>不能</b>再声明
+          ResourceGroup（两者互斥），以后若要把多个扩展归到同一宿主进程，得先动这里。
+      -->
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console">
+            <uap5:ExecutionAlias Alias="clashuwp-cli.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

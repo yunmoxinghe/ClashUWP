@@ -51,10 +51,16 @@ internal static class Program
 
     // VS 官方自动化调试 (EnvDTE): 命令行 F5
     static bool VsDebugMode;
+    static bool VsDumpMode;   // 只读: 把 VS 的窗口/弹层/子控件文字全列出来, 用于定位"DTE 被谁挡住了"
+    static bool VsDismissMode; // 只点掉 VS 的单按钮安全提示框(不启动调试)
+    static bool VsDryRunDismiss; // 提示框只读不点(配合 -nodismiss 之外的细粒度控制)
+    static string VsClosePopup = ""; // 显式关指定弹层 HWND(十六进制)，用于人眼确认过的纯通知框
     static string VsSolution = "";
     static bool VsStop;
     static bool VsContinue;   // 中断时自动 Debug.Continue (区分"异常断住"与"真崩溃")
     static int VsWaitSeconds = 20;  // VS 忙(如弹模态对话框)时的等待预算, 秒
+    static bool VsDismissDialogs = true;  // 自动关闭 VS 的模态对话框(内容会先打印出来)
+    static bool VsFixDeploy = true;       // 自动把启动项目在活动配置里勾上 Deploy
 
     static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -114,12 +120,24 @@ internal static class Program
                     DebugPackage = args[++i]; break;
                 case "-vsdebug":
                     VsDebugMode = true; break;
+                case "-vsdump":
+                    VsDumpMode = true; break;
+                case "-vsdismiss":
+                    VsDismissMode = true; break;
+                case "-vsdismissdry":
+                    VsDryRunDismiss = true; break;
+                case "-vsclose":
+                    VsClosePopup = args[++i]; break;
                 case "-solution":
                     VsSolution = args[++i]; break;
                 case "-stop":
                     VsStop = true; break;
                 case "-waitvs":
                     VsWaitSeconds = int.Parse(args[++i]); break;
+                case "-nodismiss":
+                    VsDismissDialogs = false; break;
+                case "-nofixdeploy":
+                    VsFixDeploy = false; break;
                 case "-continue":
                     VsContinue = true; break;
                 case "-h": case "-help": case "--help":
@@ -193,6 +211,8 @@ internal static class Program
         }
 
         // VS 官方自动化调试: 通过 EnvDTE 让已运行的 VS 执行 Debug.Start(等价 F5)
+        if (VsDumpMode) return VsDumpWindows();
+        if (VsDismissMode) return DismissVsPopups(VsDryRunDismiss) ? 0 : 1;
         if (VsDebugMode) return VsDebugApp();
 
         // CLI 调试模式: 注册(可选) -> 启动 -> 抓托管栈 -> 抓崩溃事件 -> 抓应用日志
@@ -208,6 +228,8 @@ internal static class Program
 用法:
   uwp-bridge.exe -Build <项目路径> [-Configuration Release] [-Platform x64] [-Json]
   uwp-bridge.exe -VsDebug [-Solution <路径.slnx>] [-Seconds 10] [-Stop]
+  uwp-bridge.exe -VsDump
+  uwp-bridge.exe -VsDismiss [-VsDismissDry]
   uwp-bridge.exe -Debug <AppxManifest.xml> [-Seconds 10] [-Kill]
   uwp-bridge.exe [-Port 18755] [-Token xxx] [-AllowArbitrary]
   uwp-bridge.exe -SelfTest [-ProbeMsBuild] [-ProbeBuild <项目>] -Once
@@ -218,6 +240,9 @@ VS 官方调试(推荐给托管 C#/VB 项目 —— EnvDTE, 等价 VS 里按 F5)
   -Stop                结束前执行 Debug.StopDebugging
   -Seconds N           调试运行多少秒后抓取(默认 10)
   -WaitVS N            VS 忙/弹对话框时最多等 N 秒(默认 20); 超时会列出 VS 挡路的窗口
+  -VsDump              只读体检: 列出 devenv 全部窗口 + 激活弹层(GW_ENABLEDPOPUP) + 子控件文字
+  -VsDismiss           只点掉 VS 的单按钮安全提示框(确定/OK/关闭); 多按钮框一律不动
+  -VsDismissDry        配合 -VsDump/-VsDebug: 提示框只打印不点击
   前提: VS 已启动。微软明确不建议对托管代码用 WinDbg, 此模式才是官方路径。
   注: 已按微软 KB ms228772 注册 IOleMessageFilter, VS 忙时自动重试而非直接失败。
 
@@ -805,6 +830,98 @@ HTTP 端点:
         return 0;
     }
 
+    /// <summary>
+    /// 窗口体检（只读）。
+    ///
+    /// 【为什么加这个】<c>-VsDebug</c> 反复报 <c>RPC_E_CALL_REJECTED</c>（VS 忙），
+    ///   但 <c>devenv</c> 的 CPU 几乎为 0 —— 说明主线程不是在算，而是卡在某个模态消息循环里。
+    ///   老的 <see cref="DismissVsDialogs"/> 只认 <c>#32770</c>（Win32 原生对话框类），
+    ///   而新版 VS 的对话框是 WPF 承载的 <c>HwndWrapper[...]</c> / Custom 类窗口，
+    ///   于是出现「明明有框挡路，清单里却一个对话框都没有」。
+    ///   这里把 devenv 的顶层窗口、<c>GW_ENABLEDPOPUP</c>（当前激活弹层 = 模态框本体）、
+    ///   属主为 VS 的<b>其它进程</b>窗口（UAC / 证书信任 / 设备选择这类框常不归 devenv）
+    ///   连同子控件文字一并列出，纯只读，不动任何窗口。
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    static int VsDumpWindows()
+    {
+        Console.WriteLine("===== VS 窗口体检（只读） =====");
+        var vs = Process.GetProcessesByName("devenv");
+        if (vs.Length == 0)
+        {
+            Console.WriteLine("没有 devenv 进程。");
+            return 1;
+        }
+        var pids = vs.Select(p => (uint)p.Id).ToHashSet();
+        Console.WriteLine("devenv PID: " + string.Join(", ", pids));
+
+        var top = new List<(IntPtr Hwnd, uint Pid, string Cls, string Title)>();
+        EnumWindows((h, l) =>
+        {
+            GetWindowThreadProcessId(h, out uint pid);
+            var (cls, title) = Describe(h);
+            top.Add((h, pid, cls, title));
+            return true;
+        }, IntPtr.Zero);
+
+        var vsTop = top.Where(r => pids.Contains(r.Pid)).ToList();
+        foreach (var r in vsTop)
+        {
+            bool vis = IsWindowVisible(r.Hwnd);
+            IntPtr popup = GetWindow(r.Hwnd, GW_ENABLEDPOPUP);
+            IntPtr owner = GetWindow(r.Hwnd, GW_OWNER);
+            Console.WriteLine("");
+            Console.WriteLine($"[devenv/{r.Pid}] 0x{r.Hwnd.ToInt64():X} [{r.Cls}] \"{r.Title}\" visible={vis}");
+            if (owner != IntPtr.Zero)
+            {
+                var (oc, ot) = Describe(owner);
+                Console.WriteLine($"    属主: [{oc}] \"{ot}\"");
+            }
+            if (popup != IntPtr.Zero && popup != r.Hwnd)
+            {
+                var (pc, pt) = Describe(popup);
+                Console.WriteLine($"    ★ 激活弹层 GW_ENABLEDPOPUP = 0x{popup.ToInt64():X} [{pc}] \"{pt}\"  <== 挡住 DTE 的通常就是它");
+                foreach (var t in ReadDialogText(popup).Distinct().Take(30))
+                    Console.WriteLine("        " + (t.Length > 200 ? t[..200] + "..." : t));
+            }
+            foreach (var t in ReadDialogText(r.Hwnd).Distinct().Take(15))
+                Console.WriteLine("    子控件: " + (t.Length > 200 ? t[..200] + "..." : t));
+        }
+
+        Console.WriteLine("");
+        Console.WriteLine("---- 属主指向 devenv 窗口的其它进程窗口 ----");
+        var vsHwnds = vsTop.Select(x => x.Hwnd).ToHashSet();
+        int n = 0;
+        foreach (var r in top.Where(r => !pids.Contains(r.Pid) && IsWindowVisible(r.Hwnd)))
+        {
+            IntPtr o = GetWindow(r.Hwnd, GW_OWNER);
+            if (o == IntPtr.Zero || !vsHwnds.Contains(o)) continue;
+            string pname = "?";
+            try { pname = Process.GetProcessById((int)r.Pid).ProcessName; } catch { }
+            Console.WriteLine($"  · {pname}({r.Pid}) [{r.Cls}] \"{r.Title}\"");
+            foreach (var t in ReadDialogText(r.Hwnd).Distinct().Take(12))
+                Console.WriteLine("      " + (t.Length > 200 ? t[..200] + "..." : t));
+            n++;
+        }
+        if (n == 0) Console.WriteLine("  (无)");
+        return 0;
+    }
+
+    static (string Cls, string Title) Describe(IntPtr h)
+    {
+        var cb = new StringBuilder(256);
+        GetClassName(h, cb, cb.Capacity);
+        int len = GetWindowTextLength(h);
+        var sb = new StringBuilder(Math.Max(len, 1) + 1);
+        if (len > 0) GetWindowText(h, sb, sb.Capacity);
+        return (cb.ToString(), sb.ToString().Trim());
+    }
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    const uint GW_OWNER = 4;
+    const uint GW_ENABLEDPOPUP = 6;
+
     // ---------------- VS 官方自动化调试 (EnvDTE): 命令行 F5 ----------------
     // 说明: 这是微软官方的 VS 自动化接口, 不是自制机制。
     //   * 接口: EnvDTE.DTE / DTE.Debugger / DTE.ExecuteCommand("Debug.Start")
@@ -846,11 +963,25 @@ HTTP 端点:
             // 等到 VS 空闲(或超时), 再往下走, 避免整轮自动化毫无信息地崩掉。
             string vsName = "", vsVer = "";
             var hw = Stopwatch.StartNew();
+            long lastDismissAttempt = -10000;
             while (true)
             {
                 try { vsName = (string)dte.Name; vsVer = (string)dte.Version; break; }
                 catch (Exception ex) when (IsVsBusy(ex))
                 {
+                    // 第一反应: 如果 VS 上挂着模态对话框, 读它的文字并关掉它(等价点"确定"),
+                    // 否则等再久也没用 —— 无人值守场景下这是唯一出路。
+                    // ★ 每 8 秒重试一次(原来只试一次): VS 会在一个自动化回合里
+                    //   连着弹好几个框（"调试会话已结束"→"部署完成"→…），一次性尝试
+                    //   只能干掉第一个，后面的照样把 DTE 挡死。
+                    if (VsDismissDialogs && hw.ElapsedMilliseconds - lastDismissAttempt >= 8000)
+                    {
+                        lastDismissAttempt = hw.ElapsedMilliseconds;
+                        Console.WriteLine($"  VS 忙, 尝试识别并点掉安全提示框 ({hw.ElapsedMilliseconds} ms) ...");
+                        bool a = DismissVsDialogs();
+                        bool b = DismissVsPopups(VsDryRunDismiss);
+                        if (a || b) { Thread.Sleep(500); continue; }
+                    }
                     long left = VsWaitSeconds * 1000L - hw.ElapsedMilliseconds;
                     if (left <= 0)
                     {
@@ -938,6 +1069,11 @@ HTTP 端点:
                 catch (Exception ex) { Console.WriteLine("设置启动项目失败: " + ex.Message); }
             }
 
+            // UWP 项目的 Deploy 开关: 没勾上时 VS 会弹模态框 "The project needs to be deployed
+            // before we can debug. Please enable Deploy in the Configuration Manager." 并卡住自动化。
+            // 用官方 EnvDTE 属性 SolutionContext.ShouldDeploy 勾上(等价于配置管理器里打勾)。
+            if (VsFixDeploy) EnsureDeployEnabled(dte, startup);
+
             // 官方 F5
             Console.WriteLine("");
             Console.WriteLine("执行 Debug.Start (等价在 VS 里按 F5) ...");
@@ -946,9 +1082,19 @@ HTTP 端点:
             // dbgDebugMode: 1=Design 2=Run 3=Break
             int mode = 1;
             var sw = Stopwatch.StartNew();
+            int nextDlgSweep = 0;
             while (sw.ElapsedMilliseconds < 240000)
             {
                 Thread.Sleep(1000);
+                VsMessageFilter.Arm(10000);   // 续期: 生成/部署期间 VS 会短暂拒绝调用
+                // 启动阶段 VS 还会弹框(部署失败/警告等)。若不处理, 每次 CurrentMode 都被拒,
+                // 我们会一直误读成"设计态"。所以周期性扫一遍并关掉(内容先打印)。
+                if (VsDismissDialogs && sw.ElapsedMilliseconds >= nextDlgSweep)
+                {
+                    nextDlgSweep = (int)sw.ElapsedMilliseconds + 3000;
+                    DismissVsDialogs();
+                    DismissVsPopups(VsDryRunDismiss);   // 新版 VS 的框是 WPF 弹层, 不在 #32770 里
+                }
                 try { mode = (int)dte.Debugger.CurrentMode; } catch { }
                 if (mode != 1) break;
             }
@@ -978,6 +1124,7 @@ HTTP 端点:
             for (int t = 0; t < DebugSeconds; t++)
             {
                 Thread.Sleep(1000);
+                VsMessageFilter.Arm(10000);   // 续期: 应用刚启动时 VS 可能仍在忙
                 try { mode = (int)dte.Debugger.CurrentMode; } catch { }
                 if (mode == 2)   // dbgBreakMode = 2 (官方枚举值)
                 {
@@ -1075,6 +1222,55 @@ HTTP 端点:
         }
     }
 
+    // UWP 调试前必须让项目处于"部署"状态, 否则 VS 弹:
+    //   "The project needs to be deployed before we can debug.
+    //    Please enable Deploy in the Configuration Manager."
+    // 官方 API: EnvDTE.SolutionContext.ShouldDeploy
+    //   https://learn.microsoft.com/dotnet/api/envdte.solutioncontext.shoulddeploy
+    [SupportedOSPlatform("windows")]
+    static void EnsureDeployEnabled(dynamic dte, string startup)
+    {
+        try
+        {
+            dynamic cfg = dte.Solution.SolutionBuild.ActiveConfiguration;
+            Console.WriteLine($"活动配置  : {(string)cfg.Name}");
+            bool changed = false, seen = false;
+            foreach (dynamic ctx in (dynamic)cfg.SolutionContexts)
+            {
+                string proj = (string)ctx.ProjectName;
+                bool want = startup.Length == 0;
+                if (!want)
+                {
+                    foreach (var s in startup.Split(','))
+                    {
+                        var n = s.Trim();
+                        if (n.Length == 0) continue;
+                        var leaf = n.Contains('\\') ? n[(n.LastIndexOf('\\') + 1)..] : n;
+                        leaf = leaf.Replace(".csproj", "", StringComparison.OrdinalIgnoreCase);
+                        if (leaf.Equals(proj, StringComparison.OrdinalIgnoreCase) ||
+                            n.Equals(proj, StringComparison.OrdinalIgnoreCase)) { want = true; break; }
+                    }
+                }
+                if (!want) continue;
+                seen = true;
+                bool sd = (bool)ctx.ShouldDeploy;
+                Console.WriteLine($"Deploy    : {proj} = {sd}");
+                if (!sd)
+                {
+                    ctx.ShouldDeploy = true;
+                    changed = true;
+                    Console.WriteLine($"            -> 已勾上 Deploy (ShouldDeploy=true)");
+                }
+            }
+            if (!seen) Console.WriteLine("Deploy    : 未在活动配置里找到启动项目对应项");
+            else if (!changed) Console.WriteLine("Deploy    : 启动项目已勾选, 无需修改");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Deploy 检查失败(可忽略): " + ex.Message);
+        }
+    }
+
     // ---- VS 忙 / RPC_E_CALL_REJECTED 处理 (微软官方 KB ms228772) ----
     // 文档: https://learn.microsoft.com/previous-versions/visualstudio/visual-studio-2010/ms228772
     // 现象(实测): VS 弹出模态对话框(部署失败/异常提示/任何要你点的框)时, 其主线程被占,
@@ -1149,23 +1345,8 @@ HTTP 端点:
         Console.Error.WriteLine("        ③ 或绕开 VS 用 -Debug (不经 VS 的部署+启动+日志通道)。");
         try
         {
-            var pids = Process.GetProcessesByName("devenv")
-                              .Select(p => (uint)p.Id).ToHashSet();
+            var rows = EnumVsWindows(out var pids);
             if (pids.Count == 0) return;
-            var rows = new List<(uint Pid, string Cls, string Title)>();
-            EnumWindows((h, l) =>
-            {
-                if (!IsWindowVisible(h)) return true;
-                GetWindowThreadProcessId(h, out uint pid);
-                if (!pids.Contains(pid)) return true;
-                var cb = new StringBuilder(256);
-                GetClassName(h, cb, cb.Capacity);
-                int len = GetWindowTextLength(h);
-                var sb = new StringBuilder(Math.Max(len, 1) + 1);
-                if (len > 0) GetWindowText(h, sb, sb.Capacity);
-                rows.Add((pid, cb.ToString(), sb.ToString().Trim()));
-                return true;
-            }, IntPtr.Zero);
 
             if (rows.Count > 0)
             {
@@ -1178,10 +1359,215 @@ HTTP 端点:
                     var flag = r.Cls == "#32770" ? " <== 对话框!" : "";
                     Console.Error.WriteLine($"  · devenv({r.Pid}) [{r.Cls}] \"{r.Title}\"{flag}");
                 }
+
+                // 把对话框里的文字读出来(纯只读): 通常就能看到 VS 到底在报什么
+                foreach (var dlg in rows.Where(r => r.Cls == "#32770"))
+                {
+                    var lines = ReadDialogText(dlg.Hwnd);
+                    if (lines.Count > 0)
+                    {
+                        Console.Error.WriteLine($"  └ 对话框内容 (devenv({dlg.Pid})):");
+                        foreach (var t in lines.Distinct().Take(10))
+                            Console.Error.WriteLine("      " + (t.Length > 300 ? t[..300] + "..." : t));
+                    }
+                }
             }
         }
         catch { }
     }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    const uint WM_CLOSE = 0x0010;
+
+    // 枚举 VS(devenv)的可见窗口
+    static List<(IntPtr Hwnd, uint Pid, string Cls, string Title)> EnumVsWindows(out HashSet<uint> pids)
+    {
+        var set = Process.GetProcessesByName("devenv").Select(p => (uint)p.Id).ToHashSet();
+        pids = set;
+        var rows = new List<(IntPtr, uint, string, string)>();
+        if (set.Count == 0) return rows;
+        EnumWindows((h, l) =>
+        {
+            if (!IsWindowVisible(h)) return true;
+            GetWindowThreadProcessId(h, out uint pid);
+            if (!set.Contains(pid)) return true;
+            var cb = new StringBuilder(256);
+            GetClassName(h, cb, cb.Capacity);
+            int len = GetWindowTextLength(h);
+            var sb = new StringBuilder(Math.Max(len, 1) + 1);
+            if (len > 0) GetWindowText(h, sb, sb.Capacity);
+            rows.Add((h, pid, cb.ToString(), sb.ToString().Trim()));
+            return true;
+        }, IntPtr.Zero);
+        return rows;
+    }
+
+    static List<string> ReadDialogText(IntPtr dlg)
+    {
+        var lines = new List<string>();
+        EnumChildWindows(dlg, (h, l) =>
+        {
+            int len = GetWindowTextLength(h);
+            if (len <= 0) return true;
+            var sb = new StringBuilder(len + 1);
+            GetWindowText(h, sb, sb.Capacity);
+            var t = sb.ToString().Trim().Replace("\r\n", " / ").Replace("\n", " / ");
+            if (t.Length > 0) lines.Add(t);
+            return true;
+        }, IntPtr.Zero);
+        return lines;
+    }
+
+    // 读 VS 的模态对话框(#32770)内容并关闭它(WM_CLOSE, 等价点"确定"/右上角 X)。
+    // 这不是 VS 自动化 API —— DTE 自身无法关闭它自己弹的框, 所以走标准 Win32 窗口消息。
+    static bool DismissVsDialogs()
+    {
+        try
+        {
+            var rows = EnumVsWindows(out _);
+            var dlgs = rows.Where(r => r.Cls == "#32770").ToList();
+            if (dlgs.Count == 0) return false;
+            foreach (var d in dlgs)
+            {
+                Console.WriteLine($"检测到 VS 模态对话框 (devenv({d.Pid}) \"{d.Title}\"):");
+                foreach (var t in ReadDialogText(d.Hwnd).Distinct().Take(10))
+                    Console.WriteLine("    " + (t.Length > 300 ? t[..300] + "..." : t));
+                SendMessage(d.Hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                Console.WriteLine("    -> 已关闭该对话框 (WM_CLOSE), 继续 ...");
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// 点掉新版 VS 的模态提示框。
+    ///
+    /// 【为什么还要这一个】<see cref="DismissVsDialogs"/> 只认 <c>#32770</c>（Win32 原生
+    ///   对话框类）。实测 VS 18 的提示框（本轮卡住 DTE 的就是「调试会话已结束。」）
+    ///   <b>不是</b> #32770，而是 WPF 弹层：要从主窗口的 <c>GW_ENABLEDPOPUP</c> 才拿得到。
+    ///   所以之前出现「VS 明明被框挡住，窗口清单里却一个对话框都没有」。
+    ///
+    /// 【安全边界】只点<b>恰好一个按钮</b>且按钮文字在 <c>确定/OK/关闭/Close</c>
+    ///   白名单里的纯提示框。带「取消/是/否/保存」的多按钮框一律只打印不动 ——
+    ///   那种框点错会丢改动或改配置，不是我能替用户决定的。
+    /// </summary>
+    static bool DismissVsPopups(bool dryRun)
+    {
+        int handled = 0;
+        try
+        {
+            foreach (var r in EnumVsWindows(out _))
+            {
+                IntPtr popup = GetWindow(r.Hwnd, GW_ENABLEDPOPUP);
+                if (popup == IntPtr.Zero || popup == r.Hwnd || !IsWindowVisible(popup))
+                    continue;
+
+                var buttons = new List<(IntPtr H, string T)>();
+                EnumChildWindows(popup, (h, l) =>
+                {
+                    if (!GetClassNameOf(h).Equals("Button", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                    string t = GetWindowTextOf(h);
+                    if (t.Length > 0) buttons.Add((h, t));
+                    return true;
+                }, IntPtr.Zero);
+
+                if (buttons.Count == 0)
+                {
+                    // WPF 弹层里的按钮不是 Win32 Button 子窗口, 光看子控件会一无所获。
+                    // 这里把「类名 | 文字」全打出来, 便于判断到底是不是纯提示框。
+                    var kids = new List<string>();
+                    EnumChildWindows(popup, (h, l) =>
+                    {
+                        string c = GetClassNameOf(h);
+                        string t = GetWindowTextOf(h);
+                        kids.Add($"[{c}] \"{t}\" visible={IsWindowVisible(h)}");
+                        return true;
+                    }, IntPtr.Zero);
+                    Console.WriteLine($"  弹层 0x{popup.ToInt64():X} [{GetClassNameOf(popup)}] 主窗口=\"{r.Title}\" 无 Win32 按钮, 子窗口 {kids.Count} 个:");
+                    foreach (var k in kids.Take(20))
+                        Console.WriteLine("      " + (k.Length > 200 ? k[..200] + "..." : k));
+
+                    // ★ 第三档：没有 Win32 按钮时，按<b>文字</b>判断是不是纯通知。
+                    //   本轮卡住 DTE 的「调试会话已结束。」就是这一类：它是 WPF 弹层，
+                    //   <b>自己一个子窗口都没有</b>，文字挂在主框架的子窗口上 ——
+                    //   所以取文要把「弹层子树 + 属主框架子树」并起来看。
+                    //   对纯通知发 WM_CLOSE 等价于点 X / 按 Esc —— 这就是「知道了」。
+                    //   但凡文字里出现疑问/取舍词（是否、保存、取消、覆盖、丢失…），
+                    //   说明这框在等用户做决定，一律不动，交回用户。
+                    var texts = ReadDialogText(popup)
+                        .Concat(ReadDialogText(r.Hwnd))
+                        .Select(t => t.Trim())
+                        .Where(t => t.Length > 0 && t != r.Title && t != GetWindowTextOf(popup))
+                        .Distinct()
+                        .ToList();
+                    string joined = string.Join(" ", texts);
+                    string[] riskWords = { "是否", "保存", "取消", "覆盖", "丢失", "还原",
+                                           "删除", "确定要", "选择", "重试", "忽略", "全部" };
+                    bool risky = riskWords.Any(w => joined.Contains(w));
+                    if (texts.Count > 0 && !risky)
+                    {
+                        if (dryRun)
+                            Console.WriteLine($"      (dry-run: 纯通知，本可 WM_CLOSE: {joined})");
+                        else
+                        {
+                            SendMessage(popup, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                            Console.WriteLine($"      -> 已 WM_CLOSE 纯通知弹层: {joined}");
+                        }
+                        handled++;
+                    }
+                    else
+                        Console.WriteLine("      跳过：文字里含取舍词或为空，这框在等用户决定，不动。");
+                    continue;
+                }
+
+                Console.WriteLine($"  弹层 0x{popup.ToInt64():X} [{GetClassNameOf(popup)}] 主窗口=\"{r.Title}\"");
+                foreach (var t in ReadDialogText(popup).Distinct().Take(8))
+                    Console.WriteLine("      内容: " + (t.Length > 200 ? t[..200] + "..." : t));
+
+                string[] safe = { "确定", "OK", "关闭", "Close" };
+                if (buttons.Count == 1 &&
+                    safe.Any(s => buttons[0].T.Equals(s, StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (dryRun)
+                        Console.WriteLine($"      (dry-run: 本可点唯一按钮「{buttons[0].T}」)");
+                    else
+                    {
+                        SendMessage(buttons[0].H, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                        Console.WriteLine($"      -> 已点击唯一按钮「{buttons[0].T}」");
+                    }
+                    handled++;
+                }
+                else
+                    Console.WriteLine("      跳过：非单按钮安全框（可能是 是/否/取消/保存），不替用户点。");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("  弹层处理异常: " + ex.Message);
+        }
+        return handled > 0;
+    }
+
+    static string GetClassNameOf(IntPtr h)
+    {
+        var sb = new StringBuilder(256);
+        GetClassName(h, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    static string GetWindowTextOf(IntPtr h)
+    {
+        int len = GetWindowTextLength(h);
+        if (len <= 0) return "";
+        var sb = new StringBuilder(len + 1);
+        GetWindowText(h, sb, sb.Capacity);
+        return sb.ToString().Trim().Replace("\r\n", " / ").Replace("\n", " / ");
+    }
+
+    const uint BM_CLICK = 0x00F5;
 
     // ---- 窗口检测: 证明"页面真的显示出来了" ----
     // UWP 窗口通常由 ApplicationFrameHost 托管, 所以 ClashUWP.exe 自身可能没有可见窗口。
@@ -1198,6 +1584,8 @@ HTTP 端点:
     static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll")]
+    static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
     static void DumpWindows(HashSet<uint>? pids, string[] hostProcs)
     {
@@ -1280,6 +1668,7 @@ HTTP 端点:
     // 官方 DTE: ToolWindows.ErrorList.ErrorItems —— 部署/启动失败会落在这里
     static void DumpErrorList(dynamic dte, string title)
     {
+        VsMessageFilter.Arm(VsWaitSeconds * 1000);   // 续期: VS 可能正在部署, 调用会被暂时拒绝
         try
         {
             // 强类型 DTE2 (微软官方 interop): 直接 vtable 调用, 不做名字解析
@@ -1411,6 +1800,7 @@ HTTP 端点:
     //    -> IWpfTextView -> TextBuffer) 需在 VSIX 进程内取得 ServiceProvider, 外部进程做不到。
     static (string Text, string Note) ReadOutputPane(dynamic dte, string[] names, List<string>? allNames)
     {
+        VsMessageFilter.Arm(VsWaitSeconds * 1000);   // 续期: 同 DumpErrorList
         try
         {
             var dte2 = (DTE2)dte;

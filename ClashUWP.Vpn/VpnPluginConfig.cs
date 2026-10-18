@@ -49,8 +49,14 @@ namespace ClashUWP.Vpn
 ///   <c>CsWinRT1006: The member 'DnsServers' has the type
     ///   'System.Collections.Generic.List`1' ... not a valid Windows Runtime type</c>。
         ///   IList&lt;T&gt; 会被投影成 <c>Windows.Foundation.Collections.IVector&lt;T&gt;</c>。
+        /// ★ 默认值对齐安卓版（ClashMetaForAndroid 的 mihomo <c>config/defaults.go</c>
+        ///   + <c>VpnService.Builder.addDnsServer</c>）：国内 DNS <c>223.5.5.5</c> /
+        ///   <c>119.29.29.29</c>，不是 1.1.1.1 / 8.8.8.8。
+        ///   原默认在国内网络直连不通，隧道内一旦 DNS 出问题就是纯黑洞；
+        ///   这两个地址既能被 <c>tun.dns-hijack: [any:53]</c> 正常应答，也符合
+        ///   「本机在国内」的基线（见 memory: Local network baseline）。
         /// </summary>
-        public IList<string> DnsServers { get; } = new List<string> { "1.1.1.1", "8.8.8.8" };
+        public IList<string> DnsServers { get; } = new List<string> { "223.5.5.5", "119.29.29.29" };
 
         /// <summary>走 VPN 的路由（CIDR）。空 = 全走（默认路由）。</summary>
         public IList<string> IncludeRoutes { get; } = new List<string> { "0.0.0.0/0" };

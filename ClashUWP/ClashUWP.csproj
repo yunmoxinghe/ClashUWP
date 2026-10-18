@@ -64,7 +64,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Reactor.Uwp" Version="0.1.0-alpha.9" />
+    <PackageReference Include="Reactor.Uwp" Version="0.1.0-alpha.13" />
     <!-- 消费 ClashUWP.Vpn 这一已 AOT 化的 CsWinRT 组件所需的投影支持：
          组件 AOT 后其 GetTargetPath 是 .winmd，.NET 5+ 直接引用 winmd 会报
          NETSDK1130；本包在构建时从 winmd 生成 C# 投影绕开该错误。 -->
@@ -91,7 +91,7 @@
          TCP 直接 WSAEACCES 10013 / ICMP General failure，本地瞬败而非超时；
          V1 Start() 又静默不装 inclusion 路由）。1.0.6 的校验和补齐与采样一并保留。
          ★ 插件源码改了就必须重新 pack 并抬版本号，否则主工程吃的还是旧 nupkg。 -->
-    <PackageReference Include="ClashUWP.Vpn" Version="1.0.25" />
+    <PackageReference Include="ClashUWP.Vpn" Version="1.0.29" />
   </ItemGroup>
 
   <!--

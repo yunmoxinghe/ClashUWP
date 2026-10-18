@@ -1,0 +1,17 @@
+# Go 模块缓存与构建产物
+go.sum.bak
+Gopkg.lock
+
+# ★ 内核二进制（107 MB）：由 Go 工具链编译产出，不是源码。
+#   ★ 它之所以必须忽略，还有一个更硬的理由：Docs/12 §3 记着 G5 被卡在
+#     "没有 Go 工具链 / 没有 mihomo 源码" 上 —— 也就是说**这个 dll 是拿不出来的**，
+#     一旦入库就再也无法验证它对应哪份 Go 源码（缺了 go.sum 的原始提交信息）。
+#   重新构建的路径见 Docs/03 与 AGENTS.md 的部署流程。
+clash_bridge.dll
+clash_bridge.pdb
+
+# GeoIP 数据库（7.6 MB）：随内核版本走的二进制资源，可从 mihomo 官方渠道重新获取。
+Country.mmdb
+
+# 编译日志
+build.log

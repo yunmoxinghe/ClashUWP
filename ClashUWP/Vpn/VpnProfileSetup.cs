@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -35,7 +34,12 @@ namespace ClashUWP.Vpn
     /// </summary>
     public static class VpnProfileSetup
     {
-        internal const string ProfileName = "ClashUWP";
+        /// <summary>
+        /// 主 profile 名字。<b>不在这里定义字面量</b>：真正的唯一定义在组件的
+        /// <c>GracefulTeardown.ProfileName</c>，因为收尾那边也要按同一个名字认人
+        /// （见 <see cref="FindOurProfileAsync"/> 的注释），两处各写一遍早晚会漂移。
+        /// </summary>
+        internal const string ProfileName = ClashUWP.Vpn.GracefulTeardown.ProfileName;
 
         private static readonly VpnManagementAgent Agent = new();
 
@@ -59,31 +63,57 @@ namespace ClashUWP.Vpn
                 if (profile is VpnPlugInProfile pluginProfile &&
                     pluginProfile.VpnPluginPackageFamilyName == PackageFamilyName)
                 {
-                    return pluginProfile;
+                    // ★ 必须再按名字锁定主 profile：探测会在同一包下留下
+                    //   ClashUWP-Probe / ClashUWP-Dataface，只按 family 匹配会
+                    //   「删错对象」（2026-10-15 实测：recreate 删掉了残留 Probe，
+                    //   主 profile 反而没被重建）。
+                    if (pluginProfile.ProfileName == ProfileName)
+                        return pluginProfile;
                 }
             }
+            // 主 profile 不存在就返回 null，让调用方走「新建」；绝不把探测杂 profile
+            // 当主 profile 交出去。
             return null;
         }
 
         /// <summary>
         /// 【官方 sample 的 DeleteExistingProfile】：先 Disconnect 再 Delete。
         /// 顺序反了会失败 —— 一个还连着的 profile 是删不掉的。
+        ///
+        /// ★★ 但"先 Disconnect"这句 sample 原文里藏着一个它没讲的坑：
+        ///   <c>DisconnectProfileAsync</c> 返回 <b>Ok</b> 只代表"断开请求已受理"，
+        ///   不代表平台已经把会话收干净。2026-10-16 00:21 的事故就是照字面顺序
+        ///   紧接着删，结果删在平台仍记 <c>CONN=1</c> 的时候 —— OS 直接扯掉接口，
+        ///   既不回调插件 Disconnect，也不清它自己下发的 NRPT 与路由，
+        ///   留下一条 Namespace=<c>.</c> 的孤儿 DNS 策略 + 死接口上的幽灵路由 = 整机断网。
+        ///   所以这里必须过 <see cref="GracefulTeardown.EnsureTornDownAsync"/> 这道闸：
+        ///   等不到收尾就<b>不删</b>，并把原因如实回话（宁可让调用方重试，
+        ///   也不再拿用户的网卡赌一次）。
         /// </summary>
-        private static async Task<VpnPlugInProfile?> DeleteOurProfileAsync()
+        private static async Task<string> DeleteOurProfileAsync()
         {
             VpnPlugInProfile? profile = await FindOurProfileAsync();
             if (profile == null)
-                return null;
+                return "删旧=无";
 
-            await Agent.DisconnectProfileAsync(profile);
+            (bool ok, string report) = await GracefulTeardown.EnsureTornDownAsync(profile);
+            if (!ok)
+            {
+                // ★ 这是一条必须进发布版日志的告警：它意味着"我们主动放弃了删除"，
+                //   而放弃删除正是防止整机断网的闸生效。只看返回值看不出来它救过一次。
+                RollingLog.Warn("profile-delete-refused", $"主 profile 会话未收干净，拒绝删除 —— {report}");
+                return $"删旧=拒绝（{report}）";
+            }
+
             await Agent.DeleteProfileAsync(profile);
-            return profile;
+            RollingLog.Info("profile", "主 profile 已删除（重建流程的删旧步）");
+            return "删旧=完成";
         }
 
         /// <summary>
         /// 【官方 sample 的 CreateAppProfile】：建一个新 profile。
         /// </summary>
-        private static async Task<VpnManagementErrorStatus> AddProfileAsync(VpnPluginConfig config)
+        private static async Task<VpnManagementErrorStatus> AddProfileAsync(VpnPluginConfig config, string serverUri)
         {
             var pluginProfile = new VpnPlugInProfile
             {
@@ -116,11 +146,43 @@ namespace ClashUWP.Vpn
             //   GetProfilesAsync 也照样能读到这个 profile，但 ConnectProfileAsync 会报
             //   CannotFindProfile，因为平台解析不了这个端点。
             //   也就是说：**建 profile 的返回值 Ok 不代表这个 profile 是可连的。**
-            pluginProfile.ServerUris.Add(new Uri("http://127.0.0.1"));
+            pluginProfile.ServerUris.Add(new Uri(serverUri));
 
             // 【官方】AddProfileFromObjectAsync(IVpnProfile)："Creates a new VPN Profile based on
             //   the VpnProfile input object."
             return await Agent.AddProfileFromObjectAsync(pluginProfile);
+        }
+
+        /// <summary>
+        /// 读 <c>LocalState\profile-server.txt</c> 的第一行作为 profile 的 ServerUri。
+        ///
+        /// 【口径】文件里没有效行 / 文件不存在 / 不是绝对 URI ⇒ 一律回默认占位
+        ///   <c>http://127.0.0.1</c>，所以不写文件时行为和以前完全一致。
+        ///   必须是带 scheme 的绝对地址（如 <c>http://192.168.0.1</c>）：
+        ///   <c>new Uri("192.168.0.1")</c> 会当成相对地址不报错，但平台用不了，
+        ///   所以这里显式要求 <c>UriKind.Absolute</c>。
+        /// </summary>
+        private static async Task<string> ReadProfileServerOverrideAsync()
+        {
+            const string fallback = "http://127.0.0.1";
+            try
+            {
+                Windows.Storage.StorageFile file = await Windows.Storage.ApplicationData.Current.LocalFolder
+                    .GetFileAsync("profile-server.txt");
+                string text = await Windows.Storage.FileIO.ReadTextAsync(file);
+                foreach (string raw in text.Split('\n'))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0 || line.StartsWith("#"))
+                        continue;
+                    return new Uri(line, UriKind.Absolute).ToString();
+                }
+            }
+            catch
+            {
+                // 缺文件/读失败/非法 URI 都是正常路径，不抛给调用方
+            }
+            return fallback;
         }
 
         /// <summary>
@@ -135,11 +197,23 @@ namespace ClashUWP.Vpn
             config ??= new VpnPluginConfig();
             var sb = new StringBuilder();
 
-            VpnPlugInProfile? old = await DeleteOurProfileAsync();
-            sb.Append(old == null ? "删旧=无" : "删旧=完成");
+            // 先清扫探测残留（异常/中止的连接会留下 Connecting 态的 Probe/Dataface，
+            // 它们与本包同 family，会干扰按 family 匹配的各处逻辑）。
+            await DeleteByNameAsync("ClashUWP-Probe");
+            await DeleteByNameAsync("ClashUWP-Dataface");
 
-            VpnManagementErrorStatus add = await AddProfileAsync(config);
-            sb.Append($", 新建={add}");
+            sb.Append(await DeleteOurProfileAsync());
+
+            // ★ server 地址可以在不重装包的前提下换（LocalState/profile-server.txt）。
+            //   为什么要留这个口子：run 14 实测「节点 /32 排除路由被平台装到了环回接口
+            //   ifIdx=1」，而平台要给排除路由挑接口，挑的依据最可疑的就是 profile 的
+            //   ServerUris —— 我们一直填的是 http://127.0.0.1，等于告诉平台
+            //   "VPN 服务器在环回上"。换掉它必须是单变量实验，所以默认值保持
+            //   127.0.0.1 不变，只在文件存在时覆盖，并且把用到的值原样写进返回值。
+            string server = await ReadProfileServerOverrideAsync();
+
+            VpnManagementErrorStatus add = await AddProfileAsync(config, server);
+            sb.Append($", 新建={add}, server={server}");
             if (add != VpnManagementErrorStatus.Ok)
                 return sb.ToString();
 
@@ -153,12 +227,19 @@ namespace ClashUWP.Vpn
                 sb.Append($"({uri})");
             sb.Append($", 状态={now.ConnectionStatus}");
 
-            Debug.WriteLine($"VpnProfileSetup.RecreateProfileAsync: {sb}");
+            RollingLog.Info("profile-recreate", sb.ToString());
             return sb.ToString();
         }
 
         /// <summary>
         /// 「连接 VPN」按钮。<b>只连接，不建 profile</b> —— 与官方 sample 的分工一致。
+        ///
+        /// ★ <c>ConnectProfileAsync</c> 返回 <c>Ok</c> 只代表「平台接受了这个请求」，
+        ///   不代表隧道真的建立。之前调用方把 Ok 当成已连接，于是连接失败时
+        ///   健康哨兵照样开跑，量到的全是<b>直连</b>网络 —— 国内 OK、国外超时、
+        ///   最后 <c>断开=NoConnection</c>，日志看着像「隧道健康但海外不通」，
+        ///   实际上压根没有隧道。这种假绿灯会把整轮排障带到错误的方向上，
+        ///   所以这里必须轮询到 profile 的真实状态再返回。
         /// </summary>
         public static async Task<string> ConnectAsync()
         {
@@ -167,11 +248,33 @@ namespace ClashUWP.Vpn
                 return "找不到我们的 profile，请先点「建/重建 profile」";
 
             var sb = new StringBuilder();
-            sb.Append($"[{target.ProfileName}] 状态={target.ConnectionStatus}, ");
-            sb.Append($"连接={await Agent.ConnectProfileAsync(target)}");
+            sb.Append($"[{target.ProfileName}] 发起前状态={target.ConnectionStatus}, ");
+            sb.Append($"连接请求={await Agent.ConnectProfileAsync(target)}");
 
-            Debug.WriteLine($"VpnProfileSetup.ConnectAsync: {sb}");
+            // 轮询真实状态，最多 20 秒。★ 这里用字符串而不是枚举成员名：
+            //   CsWinRT 投影里的 VpnManagementConnectionStatus 并没有文档简名里的
+            //   NotConfigured / Waiting 这些成员（实测编译报 CS0117），
+            //   而调用方只关心「到底 Connected 没有」，字符串口径最稳。
+            string now = target.ConnectionStatus.ToString();
+            for (int i = 0; i < 20; i++)
+            {
+                await Task.Delay(1000);
+                VpnPlugInProfile? fresh = await FindOurProfileAsync();
+                if (fresh == null) { now = "Profile缺失"; break; }
+                now = fresh.ConnectionStatus.ToString();
+                if (now != "Connecting" && now != "Waiting") break;
+            }
+            sb.Append($", 实际状态={now}");
+
+            RollingLog.Info("profile-connect", sb.ToString());
             return sb.ToString();
+        }
+
+        /// <summary>我们 profile 的当前连接状态文本；profile 不存在返回 "Profile缺失"。</summary>
+        public static async Task<string> OurStatusAsync()
+        {
+            VpnPlugInProfile? p = await FindOurProfileAsync();
+            return p == null ? "Profile缺失" : p.ConnectionStatus.ToString();
         }
 
         public static async Task<string> DisconnectAsync()
@@ -180,7 +283,171 @@ namespace ClashUWP.Vpn
             if (profile == null)
                 return "找不到我们的 profile";
 
-            return $"断开={await Agent.DisconnectProfileAsync(profile)}";
+            // ★ 断开是"恢复网络的兜底手段"，它到底成没成必须留下可查的一行。
+            //   注意 Ok 只代表请求被受理，会话收干净与否由 GracefulTeardown 那道闸判定。
+            string r = $"断开={await Agent.DisconnectProfileAsync(profile)}";
+            RollingLog.Info("profile-disconnect", r);
+            return r;
         }
+
+        // ---------------- 安全连通性探测 ----------------
+
+        /// <summary>
+        /// 探测 profile 的 ServerUris 到底能不能被平台接受。
+        ///
+        /// ★ 【为什么敢在别人不在时跑 —— 网络安全性】
+        ///   这个临时 profile 的 CustomConfiguration 里<b>只</b>写
+        ///   <c>&lt;route&gt;203.0.113.0/24&lt;/route&gt;</c>（RFC 5737 文档保留段，
+        ///   没有任何真实流量会命中它），且**不写 dns**。
+        ///   对照主 profile 的 <c>0.0.0.0/0</c>：主 profile 一旦连上会劫持全部流量
+        ///   （插件目前只回 ICMP，TCP/UDP 会全断）—— 那才是危险动作，这里刻意避开。
+        ///   所以即使探测连接成功，本机既有路由也不受影响。
+        ///
+        /// ★ 【要回答的问题】
+        ///   已经确认 profile 本身是好的（LocalState/rasphone.pbk 里
+        ///   ServerListServerName=127.0.0.1、ManagementApp 与当前包全名一致，
+        ///   端口 0 的旧假设不成立）。剩下最可疑的就是「回环地址不被接受」——
+        ///   官方 sample 用的是真实 IPv4(10.137.192.135)。
+        ///   用同一份安全配置、只换 ServerUris 各连一次，就能单变量隔离出答案。
+        ///
+        /// 跑完自删，不留残留 profile。
+        /// </summary>
+        public static async Task<string> ProbeConnectAsync()
+        {
+            const string probeName = "ClashUWP-Probe";
+            var sb = new StringBuilder();
+
+            // 只放一条文档保留段路由，绝不写 0.0.0.0/0，也不写 dns。
+            const string safeConfig =
+                "<clash><clientIpV4>10.7.0.2</clientIpV4><mtu>1400</mtu>" +
+                "<maxFrame>1500</maxFrame><route>203.0.113.0/24</route></clash>";
+
+            var cases = new (string Label, string Server, bool Ui)[]
+            {
+                // 单变量隔离，每次只动一个条件：
+                //   ① 基线：回环地址 + 无系统UI + 立即连（复现用户点「连接」的路径）
+                //   ② 只换地址 → 证明「回环不被接受」是否成立
+                //   ③ 只换成 RequireVpnClientAppUI=true（主 profile 就是 true）
+                //   （原④「加 3 秒延迟」是旧 CannotFindProfile 假设的用例，现已过时且
+                //     反而触发 0x800703E3 假失败，接真内核前移除。）
+                ("loopback",  "http://127.0.0.1",      false),
+                ("realip",    "http://10.137.192.135", false),
+                ("ui-true",   "http://127.0.0.1",      true),
+            };
+
+            foreach ((string label, string server, bool requireUi) in cases)
+            {
+                // 先删干净，保证每次都是新建（新建 vs 复用正是之前踩过的坑）。
+                await DeleteByNameAsync(probeName);
+
+                var profile = new VpnPlugInProfile
+                {
+                    ProfileName = probeName,
+                    VpnPluginPackageFamilyName = PackageFamilyName,
+                    RequireVpnClientAppUI = requireUi,
+                    CustomConfiguration = safeConfig,
+                    AlwaysOn = false,
+                };
+                profile.ServerUris.Add(new Uri(server));
+
+                VpnManagementErrorStatus add = await Agent.AddProfileFromObjectAsync(profile);
+
+                // ★ 关键：把「回读失败」和「平台连不上」分成两个不同的字符串。
+                //   上一版两者都输出 CannotFindProfile，等于把自己赋的值和平台返回的值
+                //   混在一起，根本分不清是「Add 完 GetProfilesAsync 读不到」还是
+                //   「读到了但平台连不上」—— 而这两种是完全不同的病。
+                string conn;
+                if (add != VpnManagementErrorStatus.Ok)
+                {
+                    conn = $"Add失败={add}";
+                }
+                else
+                {
+                    VpnPlugInProfile? fresh = await FindByNameAsync(probeName);
+                    if (fresh == null)
+                    {
+                        conn = "回读=NULL(Add返回Ok但GetProfilesAsync读不到)";
+                    }
+                    else
+                    {
+                        VpnManagementErrorStatus c = await Agent.ConnectProfileAsync(fresh);
+                        VpnPlugInProfile? after = await FindByNameAsync(probeName);
+                        conn = $"平台返回={c}, 连后回读={(after == null ? "NULL" : after.ConnectionStatus.ToString())}";
+                    }
+                }
+
+                sb.AppendLine($"[{label}] ui={requireUi} server={server} 建={add} 连={conn}");
+
+                // 无论成败都收尾：断开 + 删掉，避免留下脏 profile。
+                // ★★ 但"断开 + 删掉"不能连着两句写 —— 2026-10-16 00:21 的整机断网就是这么来的：
+                //   <c>DisconnectProfileAsync</c> 返回 <c>Ok</c> 只代表"请求已受理"，
+                //   紧接着删 = 在平台仍记 <c>CONN=1</c> 的时候删 profile ⇒ OS 直接扯掉接口，
+                //   既不回调插件 Disconnect，也不清它自己下发的 NRPT 与路由，
+                //   留下根 Namespace 的孤儿 DNS 策略 + 死接口上的幽灵路由。
+                //   ⇒ 与 <see cref="DeleteOurProfileAsync"/>/<see cref="DeleteByNameAsync"/> 同一条闸：
+                //     过 <c>GracefulTeardown.EnsureTornDownAsync</c>，等不到收尾就<b>不删</b>，
+                //     宁可留一个残留 profile（用户可手工清），也不拿网卡赌一次。
+                VpnPlugInProfile? toClean = await FindByNameAsync(probeName);
+                if (toClean != null)
+                {
+                    (bool torn, string teardownReport) =
+                        await GracefulTeardown.EnsureTornDownAsync(toClean);
+                    sb.AppendLine($"  收尾[{label}]={(torn ? "可删" : "拒绝删")} {teardownReport}");
+                    if (torn)
+                        await Agent.DeleteProfileAsync(toClean);
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private static async Task<VpnPlugInProfile?> FindByNameAsync(string name)
+        {
+            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            foreach (IVpnProfile p in profiles)
+            {
+                if (p is VpnPlugInProfile pp && pp.ProfileName == name)
+                    return pp;
+            }
+            return null;
+        }
+
+        private static async Task DeleteByNameAsync(string name)
+        {
+            VpnPlugInProfile? existing = await FindByNameAsync(name);
+            if (existing == null)
+                return;
+
+            // 同一道闸：探测 profile 也可能停在 Connecting/Connected（异常收尾的会话就是这样）。
+            (bool ok, _) = await GracefulTeardown.EnsureSessionTornDownAsync(name);
+            if (!ok)
+            {
+                RollingLog.Warn("profile-delete-refused", $"{name} 会话未收干净，拒绝删除");
+                return;
+            }
+            await Agent.DeleteProfileAsync(existing);
+        }
+
+        /// <summary>
+        /// 【防护措施：拆掉自动重拨的燃料】断开并删除 ClashUWP profile。
+        ///
+        /// 为什么要删 profile 而不是只断开：run 25 之后从事件日志（Application 里的
+        /// RasClient 源）查明，异常收尾的连接会被 RasMan 无条件重拨 ——
+        /// 单日 dial=413 / connected=413 / terminated=414，终止原因码 828 占 411 次，
+        /// 相邻 dial 间隔稳定 97±2 秒，发起者是 SYSTEM。只要 profile 还在，
+        /// 这条循环就不会停，用户的网络会被长期占住（本次只能靠系统"网络重置"打断）。
+        /// 断开只是停当下一次；删除 profile 才是让 RasMan 再也找不到可拨的对象。
+        ///
+        /// ★★ 但"断完立刻删"是 2026-10-16 炸网卡的那一手（详见
+        ///   <see cref="GracefulTeardown"/> 的类注释）：删除发生在平台仍记 <c>CONN=1</c>
+        ///   的时候，OS 直接扯接口 ⇒ 孤儿根 NRPT + 幽灵路由 = 整机断网。
+        ///   所以本方法现在只是<b>转发</b>到组件里那一份实现：
+        ///   平台级断开 → 轮询等会话真的离开 Connected（最多 20 s）→ 才删 → 残留自检。
+        ///   等不到就<b>拒绝删除</b>并把原因回出来，绝不为了"防止重拨"去换"整机断网"。
+        ///
+        /// 本方法只在"这一轮已经判定不健康"的收尾路径上调用，绝不用于正常连接流程。
+        /// </summary>
+        public static async Task<string> DropProfileAsync() =>
+            await GracefulTeardown.DisconnectThenDeleteAsync("前台请求（VpnProfileSetup.DropProfileAsync）");
     }
 }

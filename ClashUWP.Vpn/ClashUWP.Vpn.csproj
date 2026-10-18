@@ -49,7 +49,7 @@
     <AssemblyName>ClashUWP.Vpn</AssemblyName>
     <!-- 本地 feed 分发：每次插件代码变更需 bump 此版本并同步主工程 PackageReference，
          否则 NuGet 会命中全局缓存里的旧 nupkg（同版本号不重新拉取）。 -->
-    <Version>1.0.25</Version>
+    <Version>1.0.29</Version>
 
     <CsWinRTComponent>true</CsWinRTComponent>
     <UseUwp>true</UseUwp>
