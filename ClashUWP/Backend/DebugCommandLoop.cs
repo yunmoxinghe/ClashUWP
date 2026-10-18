@@ -65,8 +65,12 @@ namespace ClashUWP.Backend
                 //   VpnSession 里做，不再靠这条回路自己记得。顺序与原来一致：
                 //   connect 先武装再连（即使连接卡死/异常，哨兵硬上限到点必断，
                 //   网络绝不会被长期占死），disconnect 先解除哨兵再断。
-                case "connect":
-                    return await VpnSession.ConnectAsync();
+                case var c when c == "connect" || c.StartsWith("connect "):
+                    // ★ connect [订阅id]：不带参 = 连基础 profile；带参 = 连该订阅专属的系统 profile，
+                    //   即「在快速设置里点那条订阅」的自动化等价物（同一平台路径，见 VpnSession.ConnectAsync）。
+                    //   ★ subId 用 arg（原大小写）：cmd 已被 ToLowerInvariant，订阅 id 由 URL 派生，
+                    //     路径段大小写可能非小写，lower 会拼不出文件名。
+                    return await VpnSession.ConnectAsync(arg.Length > 0 ? arg : null);
                 case "disconnect":
                     return await VpnSession.DisconnectAsync();
                 case "recreate":
@@ -122,6 +126,61 @@ namespace ClashUWP.Backend
                 case var c when c.StartsWith("logtail"):
                     // ★ logtail：读滚动日志尾部。纯读，不碰隧道也不改 profile。
                     return RunLogTail(arg);
+                case "sub" or "subscription":
+                    // ★ sub：读 LocalState\config.yaml 的元信息（节点/规则/组/协议）。
+                    //   纯读：不碰隧道、不重装包、不改订阅原文。
+                    //   【刻意只读不做管理】从 URL 拉订阅、更新、多 profile 是 Docs/12 §5
+                    //   的 G1 缺口，本命令只回答"现在装的是什么订阅"，不假装能换。
+                    return SubscriptionView.OneLine(await SubscriptionView.LoadAsync());
+                case var c when c.StartsWith("subfetch") || c.StartsWith("fetch"):
+                    // ★ subfetch <URL>：拉一份订阅，落成 profile，并立即设为生效。
+                    //   ★ 碰什么：写 LocalState\subscriptions\ 与 settings.txt，
+                    //     并把生效那份复制到 config.yaml。**不碰隧道、不重启内核** ——
+                    //     内核是常驻的，改了文件它不知道，要 reload 才生效（见 reload 命令）。
+                    //   ★ 与 MihomoController 相反：这里必须走系统代理（订阅是公网地址，
+                    //     用户在墙内；而那边的 UseProxy=false 是防"被自己下发的代理劫走"）。
+                    {
+                        string u = arg.Length > 0 ? arg : "";
+                        if (u.StartsWith("subfetch")) u = u.Substring(8).Trim();
+                        var r = await SubscriptionManager.FetchAsync(u, activate: true);
+                        return r.Message;
+                    }
+                case var c when c.StartsWith("subupdate") || c == "update":
+                    // ★ subupdate：按当前生效 profile 的 URL 重拉一次。
+                    {
+                        var r = await SubscriptionManager.UpdateActiveAsync();
+                        return r.Message;
+                    }
+                case var c when c.StartsWith("sublist"):
+                    // ★ sublist：列出所有 profile（▶ = 当前生效）。
+                    {
+                        var active = await SubscriptionManager.GetActiveAsync();
+                        var list = await SubscriptionManager.ListAsync();
+                        return SubscriptionManager.OneLine(list, active);
+                    }
+                case var c when c.StartsWith("subuse") || c.StartsWith("subswitch"):
+                    // ★ subuse <id>：切到某份 profile（复制到 config.yaml）。
+                    {
+                        string id = arg;
+                        foreach (string pfx in new[] { "subuse", "subswitch" })
+                            if (id.StartsWith(pfx)) { id = id.Substring(pfx.Length).Trim(); break; }
+                        if (id.Length == 0) return "subuse 需要参数：subuse <profile id>（先用 sublist 看）";
+                        var r = await SubscriptionManager.ActivateAsync(id);
+                        return r.Message;
+                    }
+                case var c when c.StartsWith("subdel"):
+                    // ★ subdel <id>：删一份 profile（不许删当前生效的）。
+                    {
+                        string id = arg.StartsWith("subdel") ? arg.Substring(6).Trim() : arg;
+                        if (id.Length == 0) return "subdel 需要参数：subdel <profile id>";
+                        var r = await SubscriptionManager.DeleteAsync(id);
+                        return r.Message;
+                    }
+                case var c when c == "profiles" || c.StartsWith("profiles"):
+                    // ★ profiles：列出本包名下的系统 VPN profile（名称/subId/是否进系统UI/状态）。
+                    //   纯读。核验「快速设置 VPN 面板会出现哪几条」的判据就在这里 ——
+                    //   系统 UI 不可自动化点击，但 RequireVpnClientAppUI 的回读值可以。
+                    return await VpnProfileSetup.ListOurProfilesAsync();
                 case var c when c.StartsWith("reload"):
                     // ★ reload <绝对路径>：主动热重载内核配置（PUT /configs?force=true）。
                     //   ★ 为什么必须有它：内核是**常驻**的（residentBridge=1），
@@ -135,7 +194,7 @@ namespace ClashUWP.Backend
                         arg.Length > 0 ? arg : DefaultKernelConfigPath());
                 default:
                     RollingLog.Warn("cmd-unknown", cmd);
-                    return $"未知命令: {cmd}（支持 status/connect/disconnect/recreate/probe/controller/conf/groups/logs/select <组名> <节点名>/bind <网卡名|->/mode <rule|global|direct>/delay [节点名]/connections [kill <id>|kill-all]/logtail [app|plugin|sessions] [行数]/reload [配置绝对路径]；★ 已无 watchdog-off）";
+                    return $"未知命令: {cmd}（支持 status/connect [订阅id]/disconnect/recreate/probe/controller/conf/groups/profiles/logs/sub/sublist/subfetch <URL>/subupdate/subuse <id>/subdel <id>/select <组名> <节点名>/bind <网卡名|->/mode <rule|global|direct>/delay [节点名]/connections [kill <id>|kill-all]/logtail [app|plugin|sessions] [行数]/reload [配置绝对路径]；★ 已无 watchdog-off）";
             }
         }
 

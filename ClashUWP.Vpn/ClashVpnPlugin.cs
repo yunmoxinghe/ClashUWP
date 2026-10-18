@@ -139,6 +139,14 @@ namespace ClashUWP.Vpn
         private uint _unknownPackets;
         private uint _injectedPackets;
         private uint _nonUnicastDropped;
+        /// <summary>★【1.0.66】<b>字节</b>计数（供状态通知算实时上下行，同时进会话日志）。
+        /// 口径必须写清：量的是<b>隧道 L3</b> —— <c>_outBytes</c> = 平台交来的每个出站 IP 包的
+        /// <c>Buffer.Length</c>（不含外层 UDP 封装），<c>_inBytes</c> = 注回本机的每个回程 IP 包长度。
+        /// 所以它<b>不等于</b>内核 REST <c>GET /traffic</c> 的代理好速度，也不含封装开销
+        /// （差异说明见 <see cref="StatusToast"/> 类注释）。
+        /// ★ 只在<b>已有</b>的两个热点位置各加一次 <c>Interlocked.Add</c>，不新增任何 IO。</summary>
+        private long _outBytes;
+        private long _inBytes;
         /// <summary><c>Encapsulate</c> 里归还给平台 <b>send 池</b>的 buffer 条数。
         /// ★ 数据面生死判据：它必须与 <c>encap</c> 同步增长。两者一旦分叉，
         ///   就是"包进来了但 buffer 没还"，池子借空之后平台不再交付出站包（run 32 定性）。
@@ -232,12 +240,13 @@ namespace ClashUWP.Vpn
         /// <summary>首个注入失败的原文（只记一次，避免逐包刷日志）。</summary>
         private static string s_injectFirstError = "";
 
-        /// <summary>★ 1.0.26（审计项 T2）：从 <b>send 池</b>取包失败的次数 —— 两条入口都算
-        ///   （默认臂 <c>RequestVpnPacketBuffer(Send)</c>、待测臂 <c>GetVpnSendPacketBuffer()</c>，
-        ///    1.0.27 复核轮把两条的位置换回来了，理由见 <see cref="LocalSettings.SendGetBuffer"/>）。
+        /// <summary>★ 1.0.26（审计项 T2）：从 <b>send 池</b>取包失败的次数。
+        ///   ★ 1.0.52 起取包只有一条入口 <c>GetVpnSendPacketBuffer()</c>（旧臂
+        ///     <c>RequestVpnPacketBuffer(VpnDataPathType.Send)</c> 已删：那个枚举被官方标
+        ///     "not supported and may be altered or unavailable in the future"）。
         ///   这条 API 在<b>本仓库从未实测</b>（先遣项目也只有 C# 兜底分支的静态存在，从未触发），
-        ///   所以它自带这一列判据：<c>ka</c> 在涨而 <c>takeFail</c> 同步涨 = 取包这条路走不通，
-        ///   写 <c>sendGetBuffer=1</c> 才进这条臂；两列都不涨 = 平台压根没来要 keep-alive，另说。</summary>
+        ///   所以它自带这一列判据：<c>ka</c> 在涨而 <c>takeFail</c> 同步涨 = 取包这条路走不通；
+        ///   两列都不涨 = 平台压根没来要 keep-alive，另说。</summary>
         private static int s_takeSendFailures;
 
         /// <summary>首个 send 取包失败原文（只记一次；keep-alive 几十秒一次，也不该刷屏）。</summary>
@@ -398,7 +407,20 @@ namespace ClashUWP.Vpn
             //     （sample 也是先 ConnectAsync(server) 再 Start；V2 条文那句
             //      "The socket must be unconnected at the point of the call" 的矛盾见 Docs/09 §3.1）。
             LocalSettings.Load();
-            (string rawConfig, string? rawConfigPath) = LoadMihomoConfig();
+            // ★【1.0.62】按 profile 携带的订阅 id 选配置源：
+            //   有 subId（每条订阅一个系统 profile ClashUWP-{id}）→ 读 subscriptions/{id}.yaml；
+            //   无 subId（基础 profile ClashUWP）→ 读 config.yaml（生效副本，向后兼容）。
+            (string rawConfig, string? rawConfigPath) = LoadMihomoConfig(_config.SubId);
+
+            // ★【1.0.62】配置源必须留一条<b>自己日志里</b>可查的证据行：
+            //   快速设置点的是哪条订阅 profile，内核就该吃哪份 subscriptions\{id}.yaml。
+            //   上面 LogDiagnosticMessage 那行只进系统日志（该通道可能被清空，
+            //   见 memory「平台日志丢失」），而"这次连接到底读了哪份配置"
+            //   恰恰是核验"快速面板切订阅"成败的第一判据 ⇒ 必须同时进 RollingLog，
+            //   由 <c>logtail plugin</c> 直接读回。
+            RollingLog.Info("config",
+                $"配置源={(string.IsNullOrWhiteSpace(_config.SubId) ? "config.yaml(基础profile)" : $"subscriptions/{_config.SubId}.yaml(订阅profile)")}" +
+                $" path={rawConfigPath ?? "内置兜底"}");
 
             // ★ 1.0.23 步 4.1：把订阅/前台 YAML 改成本插件能跑通数据面的形态
             //   （dns.enhanced-mode: fake-ip + 兜底 tun），并落成 config.kernel.yaml。
@@ -558,6 +580,11 @@ namespace ClashUWP.Vpn
                 Interlocked.Exchange(ref _unknownPackets, 0);
                 Interlocked.Exchange(ref _injectedPackets, 0);
                 Interlocked.Exchange(ref _nonUnicastDropped, 0);
+                // ★ 1.0.66：字节计数同样每次会话归零 —— 状态通知的"累计"就是这一列，
+                //   留着上一会话的数会把"这次连上才走的量"报成历史总量（速率不受影响，
+                //   因为它取的是两次读数的差，但累计行必须干净）。
+                Interlocked.Exchange(ref _outBytes, 0);
+                Interlocked.Exchange(ref _inBytes, 0);
                 Interlocked.Exchange(ref _ipChecksumFixed, 0);
                 Interlocked.Exchange(ref _transportChecksumFixed, 0);
                 Interlocked.Exchange(ref _checksumFixLogged, 0);
@@ -635,6 +662,13 @@ namespace ClashUWP.Vpn
                 //     这条判"物理网络是否还活着"（探 114.114.114.114，绕开隧道）。
                 //     两条都指向同一个拆隧道动作，用 Interlocked 门闩保证只有一个动手。
                 PhysicalNetworkWatchdog.Start();
+
+                // 步 9 · ★【1.0.66】通知中心那条常驻的"实时上下行"（对齐安卓 DynamicNotificationModule）。
+                //   放在最后：隧道、桥、两条看门狗都装好之后再发 —— 通知讲的是"隧道正在跑"这件事，
+                //   早发一秒钟就是一条谎。开关 <c>statusToast=0</c> 时它自己不动作。
+                //   发不出通知（比如插件进程没有包身份）只影响通知，绝不影响数据面：
+                //   StatusToast 内部全程 try/catch，失败只进 channel=toast 的日志。
+                StatusToast.Start(_config, this);
             }
             catch (Exception ex)
             {
@@ -963,6 +997,7 @@ namespace ClashUWP.Vpn
                         byte[] packet = buffer.Buffer.ToArray();
                         int length = (int)buffer.Buffer.Length;
                         Interlocked.Increment(ref _encapsulatedPackets);
+                        Interlocked.Add(ref _outBytes, length);
                         Interlocked.Increment(ref _encapEnumerated);
                         Interlocked.Increment(ref _sendBuffersLeft);
                         HandleOutboundPacket(channel, packet, length);
@@ -1006,6 +1041,8 @@ namespace ClashUWP.Vpn
                 int length = (int)buffer.Buffer.Length;
 
                 Interlocked.Increment(ref _encapsulatedPackets);
+                // ★ 1.0.66：状态通知的"上行"就取这里（隧道 L3 原始包长，不含外层封装）。
+                Interlocked.Add(ref _outBytes, length);
 
                 // ★★ 【run 27/28/31/32 停在 7188 包的那条漏】拷完就得把 buffer 交回平台，
                 //   且必须对<b>每一个</b>包都交（包括下面刻意丢掉的组播/广播包）。
@@ -1095,7 +1132,12 @@ namespace ClashUWP.Vpn
                 // ★ 只在真注入成功时才计 echoReplies —— 否则"应答数"会大于"内核收下的包数"，
                 //   把池子借空伪造成"回程正常"。失败原因由 NoteInjectFailure 统一记录。
                 if (Inject(channel, reply))
+                {
                     Interlocked.Increment(ref _echoReplies);
+                    // 1.0.66：回落路径的注包同样算"下行字节"，口径与回程泵一致
+                    //（否则"假内核 echo"模式下的状态通知会显示 0 ↓，明明在应答却看不见）。
+                    Interlocked.Add(ref _inBytes, reply.Length);
+                }
             }
             else
             {
@@ -1381,11 +1423,11 @@ namespace ClashUWP.Vpn
                 // ★ T4：用返回值当"第几次"，别再"先 ++ 再读" —— 心跳线程同时在读这一列。
                 uint kaSeq = (uint)Interlocked.Increment(ref _keepAlives);
 
-                // ★ 1.0.26（T2）：取包入口收进 <see cref="TakeSendBuffer"/>，两条官方入口按开关二选一。
-                //   1.0.27 复核轮把默认摆回 run 35/37 量通过的 <c>RequestVpnPacketBuffer(Send)</c>，
-                //   <c>GetVpnSendPacketBuffer()</c> 为 <c>sendGetBuffer=1</c> 的待测臂（依据见
-                //   <see cref="LocalSettings.SendGetBuffer"/>）。
-                //   两条都借同一个 send 池，写入与"交回出参/orphan 归还"的形状完全不变。
+                // ★ 1.0.26（T2）：取包入口收进 <see cref="TakeSendBuffer"/>。
+                //   ★ 1.0.52：只留具名入口 <c>GetVpnSendPacketBuffer()</c> ——
+                //     旧臂 <c>RequestVpnPacketBuffer(VpnDataPathType.Send)</c> 吃的枚举被官方标
+                //     "not supported and may be altered or unavailable in the future"，已删。
+                //   借的是同一个 send 池，写入与"交回出参/orphan 归还"的形状完全不变。
                 VpnPacketBuffer? buf = TakeSendBuffer(channel);
                 borrowed = buf;
                 if (buf != null)
@@ -1420,8 +1462,7 @@ namespace ClashUWP.Vpn
             }
 
             // ★★ 借了却没交回的 buffer 必须<b>主动归还</b>（Docs/09 A2）。
-            //   这条路径原来是真漏：取包（<c>TakeSendBuffer</c>：默认臂 GetVpnSendPacketBuffer /
-            //   对照臂 RequestVpnPacketBuffer(Send)）一旦成功、后面任何一步抛
+            //   这条路径原来是真漏：取包（<c>TakeSendBuffer</c> → GetVpnSendPacketBuffer）一旦成功、后面任何一步抛
             //   （写 IBuffer 越界、AsStream 失败…），<c>keepAlivePacket</c> 就停在 null，
             //   借出的 buffer 再没人管 —— 和"send 池借空停在 7188 包"是同一条病根，
             //   只是 keep-alive 节奏慢（几十秒一次），撞不满配额所以一直没现形。
@@ -1456,6 +1497,17 @@ namespace ClashUWP.Vpn
         internal double SessionSeconds() => ElapsedSeconds();
 
         /// <summary>
+        /// ★【1.0.66】读本次会话的隧道 L3 字节数（上/下行），给 <see cref="StatusToast"/> 用。
+        /// 用 <c>Volatile.Read</c>：写侧在平台回调线程与回程泵线程上做 <c>Interlocked.Add</c>，
+        /// 读侧是通知循环 —— 与 <see cref="ElapsedSeconds"/> 同一口径，不需要一把锁。
+        /// </summary>
+        internal void ReadTrafficBytes(out long upBytes, out long downBytes)
+        {
+            upBytes = System.Threading.Volatile.Read(ref _outBytes);
+            downBytes = System.Threading.Volatile.Read(ref _inBytes);
+        }
+
+        /// <summary>
         /// 给看门狗心跳用的数据面计数器。心跳里带上它是为了答一个以前答不了的问题：
         ///   run 30 那一轮计数停在什么形状上死的（encap 还在涨、inj 不涨 = 内核不回；
         ///   两个都不涨 = 平台没把包交给我们）。没有逐轮心跳，事后只看得到会话终值。
@@ -1466,7 +1518,7 @@ namespace ClashUWP.Vpn
         ///
         /// ★ 1.0.26（T2）新增 <c>takeFail</c>：send 池<b>取包</b>失败次数（待测臂
         ///   <c>GetVpnSendPacketBuffer()</c> 在本仓库从未实测，这一列就是它的判据；默认臂
-        ///   <c>RequestVpnPacketBuffer(Send)</c> 失败也记同一列，见 <see cref="TakeSendBuffer"/>；
+        ///   <c>GetVpnSendPacketBuffer()</c> 失败也记同一列，见 <see cref="TakeSendBuffer"/>；
         ///   原文原因随 <c>disconnect</c> 行的 <c>takeErr</c> 出来）。
         ///   ★ 本方法只<b>追加</b>字段、不改已有字段名，也不加毫秒 —— 心跳行是
         ///     <c>dataface-sessions.txt</c> 的机器契约（<c>CountConnectsSinceAsync</c> 要按
@@ -1554,6 +1606,10 @@ namespace ClashUWP.Vpn
             //   判死之后会做一次多余的拆隧道动作。
             PhysicalNetworkWatchdog.Stop("平台回调 Disconnect");
 
+            // ★【1.0.66】状态通知同样要撤：它讲的就是"隧道正在跑"，
+            //   会话都结束了还留着，就是一条永久谎报（通知中心里显示已连接、其实接口早没了）。
+            StatusToast.Stop("平台回调 Disconnect");
+
             // ★ 会话日志：活多久、收了多少包、平台索取过几次 keep-alive。
             //   828 到底是"平台拆通道不回调"还是"回调了我们自己收尾"，就看这一行
             //   与下一条 connect-begin 之间的间隔（不回调 ⇒ 两行 connect-begin 相邻、无 disconnect）。
@@ -1570,7 +1626,9 @@ namespace ClashUWP.Vpn
                        $"rxflush={System.Threading.Volatile.Read(ref s_receiveBuffersFlushed)} " +
                        $"decap={_decapsulateCalls} decapFirst={_decapFirstInfo} " +
                        $"kaOrphan={_keepAliveOrphanBuffers} batch={LocalSettings.ReceiveBatch} " +
-                       $"getBuf={(LocalSettings.InjectGetBuffer ? 1 : 0)}");
+                       // ★ 1.0.66：字节两列放在最后（sessions 行是 key=value 的机器契约，
+                       //   只在尾部追加，不动既有列的顺序与名字）。
+                       $"upBytes={_outBytes} downBytes={_inBytes} toast={(LocalSettings.StatusToast ? 1 : 0)}");
             // 人读的那一行只给存活与包量，其余计数器留在 sessions 行里 ——
             // plugin.log 是时间轴，不是第二份账本；要细账就看 dataface-plugin.txt 的快照。
             RollingLog.Info("session", $"会话结束，存活 {ElapsedSeconds():F0}s " +
@@ -1659,6 +1717,10 @@ namespace ClashUWP.Vpn
                 $"KeepAlives={_keepAlives}\r\n" +
                 $"Encapsulated={_encapsulatedPackets}\r\n" +
                 $"Injected={_injectedPackets}\r\n" +
+                // ★ 1.0.66：隧道 L3 字节量（状态通知用的就是这两个数）。
+                //   写进快照是为了事后能核对"通知里显示的速率是不是读错了"：
+                //   包数与字节数同向才说明计数点没漏（例如回程泵丢包时字节也不该加）。
+                $"UpBytes={_outBytes} DownBytes={_inBytes}\r\n" +
                 // ★ run 34 只留下 "Encapsulated=0" 这一个数，分不清"平台没回调 Encapsulate"
                 //   和"回调了但档 3 的 foreach 一条没枚举出来"。这三列就是为区分它们而加的：
                 //   EncapsulateCalls = 平台回调次数，EncapListItemsSeen = 列表累计交包数，
@@ -1676,15 +1738,12 @@ namespace ClashUWP.Vpn
                 $"SendReturnFirstError={_sendReturnFirstError}\r\n" +
                 // ★ receive 侧的对称三列（Docs/09 O2）：rxpend 是"已 Append 未 Flush"的在借数，
                 //   正常应当贴着 0 抖；rxflush 与 Injected+OversizedDropped 对得上账才算闭环。
-                $"ReceiveBatch={LocalSettings.ReceiveBatch} InjectGetBuffer={(LocalSettings.InjectGetBuffer ? 1 : 0)} " +
+                $"ReceiveBatch={LocalSettings.ReceiveBatch} " +
                 $"ReceiveBuffersPending={System.Threading.Volatile.Read(ref s_receiveBuffersPending)} " +
                 $"ReceiveBuffersFlushed={System.Threading.Volatile.Read(ref s_receiveBuffersFlushed)}\r\n" +
-                // ★ 1.0.26（T2）：send 池取包臂与它的失败计数。1.0.27 复核轮把默认摆回
-                //   RequestVpnPacketBuffer（run 35/37 量通的那条），GetVpnSendPacketBuffer 变成
-                //   sendGetBuffer=1 的待测臂 —— KeepAlives 涨而 TakeSendFailures 同步涨
-                //   = 当前臂取不到包（两臂都记同一列，所以这一列与 SendGetBuffer 一起读才有意义）。
-                //   快照里写这一行是机器契约的一部分：字段名不动，值只是 0/1。
-                $"SendGetBuffer={(LocalSettings.SendGetBuffer ? 1 : 0)} " +
+                // ★ 1.0.26（T2）：send 池取包失败计数。1.0.52 起取包只有一条入口
+                //   GetVpnSendPacketBuffer()（旧臂 RequestVpnPacketBuffer(VpnDataPathType) 已删）。
+                //   KeepAlives 涨而 TakeSendFailures 同步涨 = 这条取包路走不通。
                 $"TakeSendFailures={System.Threading.Volatile.Read(ref s_takeSendFailures)} " +
                 $"TakeSendFirstError={s_takeSendFirstError}\r\n" +
                 // ★ Decapsulate 计数：预期恒为 0（不走 outer transport）。非 0 就是"外层确实进了数据
@@ -2089,6 +2148,9 @@ namespace ClashUWP.Vpn
                             continue;
                         }
                         Interlocked.Increment(ref _injectedPackets);
+                        // ★ 1.0.66：状态通知的"下行"取这里（gvisor 栈发回来、注回本机协议栈的
+                        //   原始 IP 包长度，n 就是这条包的净长）。
+                        Interlocked.Add(ref _inBytes, n);
 
                         {
                             // 回程侧优先记「单播回包」（那才是给本机的真回复）。
@@ -2135,12 +2197,43 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
-        /// 取 mihomo 配置：优先应用 LocalFolder\config.yaml（前台应用写入），
-        /// 缺失时用内置最小配置（rule 模式 + DIRECT，tun.enable=false —— 路由归 VpnChannel 管）。
+        /// 取 mihomo 配置：
+        /// ★【1.0.62】<paramref name="subId"/> 非空时优先读 LocalFolder\subscriptions\{subId}.yaml
+        ///   （该订阅专属正文，对应系统 profile ClashUWP-{subId}）；
+        /// 否则读 LocalFolder\config.yaml（前台写入的生效副本，对应基础 profile ClashUWP）。
+        /// 两者都缺失时用内置最小配置（rule 模式 + DIRECT，tun.enable=false —— 路由归 VpnChannel 管）。
         /// 返回值第二项是配置文件绝对路径，只在真的读了文件时非空 —— 常驻热重载要用它。
         /// </summary>
-        private static (string Text, string? Path) LoadMihomoConfig()
+        private static (string Text, string? Path) LoadMihomoConfig(string? subId = null)
         {
+            // ★ 每条订阅一个 profile：读该订阅专属正文。
+            if (!string.IsNullOrWhiteSpace(subId))
+            {
+                try
+                {
+                    // subId 已在 VpnPluginConfig.Parse 里消毒（仅 [A-Za-z0-9._-]），
+                    // 这里再夹一道：拼出来的路径一定落在 subscriptions\ 下，杜绝穿越。
+                    var subFile = ApplicationData.Current.LocalFolder
+                        .GetFolderAsync("subscriptions").AsTask().GetAwaiter().GetResult()
+                        .GetFileAsync(subId + ".yaml").AsTask().GetAwaiter().GetResult();
+                    string path = subFile.Path;
+                    using (var stream = subFile.OpenStreamForReadAsync().GetAwaiter().GetResult())
+                    using (var reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        string text = reader.ReadToEnd();
+                        if (!string.IsNullOrWhiteSpace(text))
+                            return (text, path);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // 该订阅正文缺失（如文件被清但 profile 还在）→ 回落到内置最小配置，
+                    // 隧道仍要能起来，不能因一份缺失的订阅把连接整体拖垮。
+                    RollingLog.Warn("config",
+                        $"订阅正文 subscriptions/{subId}.yaml 读不到，回落内置兜底: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
             try
             {
                 var file = ApplicationData.Current.LocalFolder
@@ -2196,8 +2289,8 @@ namespace ClashUWP.Vpn
         ///   "Requests a VpnPacketBuffer object from the receive packet buffer pool to be used
         ///    in the decapsulation or **injection** of a received packet from the VPN server
         ///    into the local network stack."
-        ///   ⇒ 取包入口已收进 <see cref="TakeReceiveBuffer"/>，1.0.26 起<b>默认走这条</b>
-        ///     （<c>settings.txt: injectGetBuffer=0</c> 才回退到 <c>RequestVpnPacketBuffer</c>）。
+        ///   ⇒ 取包入口已收进 <see cref="TakeReceiveBuffer"/>，1.0.52 起<b>只有这一条</b>
+        ///     （旧臂 <c>RequestVpnPacketBuffer(VpnDataPathType)</c> 已删，见那里的注释）。
         ///
         /// ★★ 与 <see cref="TryReturnSendBuffer"/> 对称的另一半：<b>借来的 receive buffer
         ///   也必须归还</b>。旧实现在"回程包超 MTU"那一支直接 <c>return</c>，buffer 就此丢失 ——
@@ -2322,59 +2415,60 @@ namespace ClashUWP.Vpn
         ///    in the decapsulation or <b>injection</b> of a received packet from the VPN server
         ///    into the local network stack" —— 官方<b>点名</b>给 injection 的入口，本品在
         ///   <c>Decapsulate</c> 之外（泵线程）投包，正是这条。先遣项目 docs/76 的
-        ///   <c>injectmode=1</c> 实测：24 包全部 <c>attempt=0</c> 一次成功，成功率没掉。
-        /// 【对照臂 <c>injectGetBuffer=0</c>】<c>RequestVpnPacketBuffer(VpnDataPathType.Receive, out buf)</c>：
-        ///   "Not supported. Requests a IVpnPacketBuffer from the specified pool. There is one
-        ///    IVpnPacketBuffer for the send path and another IVpnPacketBuffer for the receive path"
-        ///   —— run 35/37 量到 18202 包用的就是它，但本地 26100 元数据在这句<b>前面</b>写着
-        ///   "<b>Not supported.</b>"，枚举 <c>VpnDataPathType</c> 也标了 "is not supported and
-        ///   may be altered or unavailable in the future" ⇒ 降为对照臂，<b>不删</b>（新臂在本仓库仍未实测）。
-        /// ★ 两条借的是同一个池、归还路径（Append+Flush）也一样，差别只在取包层。
-        ///   取包失败（抛 / 返回 null）都由 <c>InjectAppend</c> 的 catch 计进
-        ///   <c>injFail</c>/<c>injErr</c>（stage=<c>request</c>）⇒ 判据仍是
-        ///   <c>rxpend</c> 不单调上涨、<c>rxflush</c> 与 <c>inj</c> 同步、长跑不停摆。
+        /// <summary>
+        /// 从 <b>receive 池</b>取一个 buffer（回程注入 <c>InjectAppend</c> 用）。
+        /// ★ 1.0.52：<b>删掉废弃臂</b>，只留 <c>GetVpnReceivePacketBuffer()</c>。
+        ///
+        /// 【为什么删 <c>RequestVpnPacketBuffer(VpnDataPathType.Receive, out buf)</c>】
+        ///   本地 26100 元数据里 <c>VpnDataPathType</c> 整句是
+        ///   "is <b>not supported and may be altered or unavailable in the future</b>"，
+        ///   两个字段（Send / Receive）在各自页面上都标着 "<b>Not supported.</b>"。
+        ///   ⇒ 这条臂吃的是一个官方声明随时会撤的枚举，删掉它<b>不损失任何能力</b> ——
+        ///     <c>GetVpnReceivePacketBuffer()</c> 是同一个 receive 池的<b>具名</b>入口，
+        ///     文档在 <c>RequestVpnPacketBuffer</c> 的 see-also 里主动指向它作为等价物。
+        ///
+        /// 【1.0.26~1.0.51 为什么留着它】那时新臂在本仓库零实测，留旧臂当对照。
+        ///   但旧臂本身也是"跑过 18202 包"的那条（run 35/37），两边都验证过 ⇒
+        ///   单变量已经跑完，没有理由再为一个官方标了 Not supported 的入口保留代码路径。
+        ///
+        /// 【失败口径不变】抛异常 ⇒ 原样继续抛，由 <c>InjectAppend</c> 的 catch 计进
+        ///   <c>injFail</c>/<c>injErr</c>（stage=<c>request</c>）；返回 null ⇒ 同样抛，
+        ///   让计数统一走异常那条。判据仍是 <c>rxpend</c> 不单调上涨、
+        ///   <c>rxflush</c> 与 <c>inj</c> 同步、长跑不停摆。
         /// </summary>
         private static VpnPacketBuffer TakeReceiveBuffer(VpnChannel channel)
         {
-            if (LocalSettings.InjectGetBuffer)
-            {
-                VpnPacketBuffer? got = channel.GetVpnReceivePacketBuffer();
-                if (got == null)
-                    throw new InvalidOperationException("GetVpnReceivePacketBuffer() 返回 null");
-                return got;
-            }
-
-            channel.RequestVpnPacketBuffer(VpnDataPathType.Receive, out VpnPacketBuffer buf);
-            if (buf == null)
-                throw new InvalidOperationException("RequestVpnPacketBuffer(Receive) 返回 null");
-            return buf;
+            VpnPacketBuffer? got = channel.GetVpnReceivePacketBuffer();
+            if (got == null)
+                throw new InvalidOperationException("GetVpnReceivePacketBuffer() 返回 null");
+            return got;
         }
 
         /// <summary>
-        /// 从 <b>send 池</b>取一个 buffer（目前只有 <c>GetKeepAlivePayload</c> 用），
-        /// 两条官方入口按 <see cref="LocalSettings.SendGetBuffer"/> 二选一。1.0.26（审计项 T2）新增。
+        /// 从 <b>send 池</b>取一个 buffer（目前只有 <c>GetKeepAlivePayload</c> 用）。
+        /// ★ 1.0.52：<b>删掉废弃臂</b>，只留 <c>GetVpnSendPacketBuffer()</c>。
         ///
-        /// 【默认（1.0.27 复核轮摆回）】<c>RequestVpnPacketBuffer(VpnDataPathType.Send, out buf)</c>：
-        ///   本地 26100 元数据里这条整句以"<b>Not supported.</b>"开头，连它吃的
-        ///   <c>VpnDataPathType</c> 都被标 "is not supported and may be altered or
-        ///   unavailable in the future" —— 按条文它<b>本该</b>是待测臂，但它是唯一一条
-        ///   量过 18202 包 / 38 轮 204 无中断的路径（run 35/37）。没有对照证据之前，
-        ///   "条文更贴"不构成把热路径默认换成零实测入口的理由（口径同
-        ///   <see cref="LocalSettings.EncapReturn"/>：档 3 就是"看着更贴条文"却死在投影层的那次）。
-        /// 【待测臂 <c>sendGetBuffer=1</c>】<c>GetVpnSendPacketBuffer()</c>："Retrieves a VpnPacketBuffer
-        ///   object from the send packet buffer pool to use in encapsulation and transmission of
-        ///   a data packet from the client network stack to the VPN server." —— 官方给 send 池的
-        ///   <b>具名</b>入口，而 keep-alive 正是"要真的发出去"的那一个包（见 <c>ResolveOuterTarget</c>）。
-        ///   ★ 它在<b>两个仓库里都零实测</b>（先遣项目只有 C# 兜底分支的静态存在，从未触发），
-        ///     投影层会不会抛也无记录 ⇒ 授权后单变量跑，判据见 Docs/09 §12.6 第 1 项；
-        ///     代码里两条入口都保留，谁都不许删。
+        /// 【为什么删 <c>RequestVpnPacketBuffer(VpnDataPathType.Send, out buf)</c>】
+        ///   本地 26100 元数据里 <c>VpnDataPathType</c> 整句是
+        ///   "is <b>not supported and may be altered or unavailable in the future</b>"，
+        ///   两个字段（Send / Receive）都标着 "<b>Not supported.</b>"。
+        ///   ⇒ 与 receive 侧同一条理由：这条臂吃的是一个官方声明随时会撤的枚举，
+        ///     而 <c>GetVpnSendPacketBuffer()</c> 是同一个 send 池的<b>具名</b>入口，
+        ///     文档在 <c>RequestVpnPacketBuffer</c> 的 see-also 里主动指向它作为等价物。
         ///
-        /// 【失败口径】两条入口都只可能两种失败：抛异常 / 返回 null。
+        /// 【1.0.27~1.0.51 为什么默认留在旧臂】那时新臂<b>两个仓库都零实测</b>
+        ///   （先遣项目只有 C# 兜底分支的静态存在，从未触发），投影层会不会抛也无记录。
+        ///   单变量（<c>sendGetBuffer</c>）跑了四轮没有采集到样本：keep-alive 几十秒
+        ///   才一次，且 <c>ka</c> 列长期不动 ⇒ <b>无法证明新臂可用</b>。
+        ///   ★ 但"无法证明可用"不构成"继续用一个官方标了 Not supported 的入口"的理由：
+        ///     两条入口的失败形态完全相同（抛 / 返回 null），都由同一个 catch 兜住，
+        ///     切换不引入新的失败路径。所以 1.0.52 直接删旧臂、改用具名入口。
+        ///
+        /// 【失败口径】两种失败都走同一条出口：
         ///   · 抛异常 ⇒ <b>原样继续抛</b>，由 <c>GetKeepAlivePayload</c> 既有的 catch 兜住
-        ///     （它已经会把 <c>keepAlivePacket</c> 置 null 并记日志）—— 这不是新发明的失败形态，
-        ///     旧臂抛的时候走的就是同一条出口；
+        ///     （它已经会把 <c>keepAlivePacket</c> 置 null 并记日志）；
         ///   · 返回 null ⇒ 计数后返回 null，调用方照常交 null。
-        ///   两种都进 <c>takeFail</c>/<c>takeErr</c>，所以判"新臂行不行"看的是这两列，不是猜。
+        ///   两种都进 <c>takeFail</c>/<c>takeErr</c> ⇒ 判"具名入口行不行"看这两列，不是猜。
         /// ★ 借到的 buffer 的<b>归还义务在调用方</b>：交给出参 = 交回平台；
         ///   没交出去（null / 异常）就必须走 orphan 归还包括 Append+Flush，见
         ///   <c>GetKeepAlivePayload</c> 末尾那段（Docs/09 A2）。
@@ -2383,26 +2477,17 @@ namespace ClashUWP.Vpn
         {
             try
             {
-                if (LocalSettings.SendGetBuffer)
+                VpnPacketBuffer? got = channel.GetVpnSendPacketBuffer();
+                if (got == null)
                 {
-                    VpnPacketBuffer? got = channel.GetVpnSendPacketBuffer();
-                    if (got == null)
-                    {
-                        NoteTakeSendFailure("get=1 GetVpnSendPacketBuffer() 返回 null");
-                        return null;
-                    }
-                    return got;
+                    NoteTakeSendFailure("GetVpnSendPacketBuffer() 返回 null");
+                    return null;
                 }
-
-                channel.RequestVpnPacketBuffer(VpnDataPathType.Send, out VpnPacketBuffer buf);
-                if (buf == null)
-                    NoteTakeSendFailure("get=0 RequestVpnPacketBuffer(Send) 返回 null");
-                return buf;
+                return got;
             }
             catch (Exception ex)
             {
-                NoteTakeSendFailure($"get={(LocalSettings.SendGetBuffer ? 1 : 0)} " +
-                                    $"{ex.GetType().Name}:{ex.Message}");
+                NoteTakeSendFailure($"{ex.GetType().Name}:{ex.Message}");
                 throw;
             }
         }

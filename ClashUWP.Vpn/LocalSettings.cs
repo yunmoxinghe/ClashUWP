@@ -279,78 +279,6 @@ namespace ClashUWP.Vpn
         internal static int ReceiveBatch = 0;
 
         /// <summary>
-        /// 回程注入取 receive buffer 用哪一条官方 API。
-        /// ★★ 1.0.26 起默认 <b>true = <c>GetVpnReceivePacketBuffer()</c></b>；
-        ///   <c>injectGetBuffer=0</c> 回退到 <c>RequestVpnPacketBuffer(Receive)</c>（对照臂，不许删）。
-        ///
-        /// 【切默认为什么的正式口径（本地 26100 元数据逐字，非网页）】
-        ///   · <c>GetVpnReceivePacketBuffer()</c>："Requests a VpnPacketBuffer object from the
-        ///     receive packet buffer pool <b>to be used in the decapsulation or injection of a
-        ///     received packet from the VPN server into the local network stack</b>"
-        ///     —— 官方<b>点名</b>给 injection 场景的入口，而本品的注入正是 injection；
-        ///   · <c>RequestVpnPacketBuffer(VpnDataPathType, out VpnPacketBuffer)</c>：整句开头是
-        ///     "<b>Not supported.</b> Requests a **IVpnPacketBuffer** from the specified pool..."；
-        ///   · 连它吃的枚举都被判了：<c>VpnDataPathType</c> =
-        ///     "**VpnDataPathType** is not supported and may be altered or unavailable in the future."
-        ///   ⇒ 默认留在"被标记 Not supported"的那条上，是在为一个已经量过的成功形状继续押注
-        ///     一个官方声明随时会撤的入口。
-        ///
-        /// 【先遣项目证据（为什么这次敢切默认）】docs/76 的 <c>injectmode</c> A/B：
-        ///   <c>injectmode=1</c> = 回程泵线程 + <c>GetVpnReceivePacketBuffer()</c>，
-        ///   24 个包全部 <c>attempt=0</c> 一次成功，成功率没掉 —— 同一条取包路在先遣项目里
-        ///   是<b>跑通过数据面的</b>，不是纸面推断。
-        ///
-        /// ★ 两条借的是同一个 receive 池、归还路径（Append+Flush）也完全一样，差别只在取包层，
-        ///   所以判据不变：<c>rxpend</c>（在借未还）不单调上涨、<c>rxflush</c> 与 <c>inj</c> 同步、
-        ///   长跑越过 7188 不停摆。
-        /// ★ <b>本臂自身在本仓库仍是未实测</b>（1.0.26 这轮是纯代码轮，不碰隧道）：
-        ///   切默认是"按条文 + 按先遣项目实测"的判断，不是本仓库的实测结论。
-        ///   一旦实测发现 <c>Get</c> 抛/返回 null，取包失败会现形为
-        ///   <c>injFail</c>/<c>takeFail</c> 计数 —— 回落写 <c>injectGetBuffer=0</c> 即可，
-        ///   代码里两条入口都保留。
-        /// </summary>
-        internal static bool InjectGetBuffer = true;
-
-        /// <summary>
-        /// keep-alive 取 send buffer 用哪一条官方 API。
-        /// ★ 1.0.27 起默认 <b>false = <c>RequestVpnPacketBuffer(Send)</c></b>（run 35/37 量通过的形状）；
-        ///   <c>sendGetBuffer=1</c> 才走 <c>GetVpnSendPacketBuffer()</c>（待测臂）。
-        ///   1.0.26（审计项 T2）新增时曾把默认定为 true，下一节写明为什么又翻回来。
-        ///
-        /// 【条文（本地 26100 元数据逐字）】
-        ///   · <c>GetVpnSendPacketBuffer()</c>："Retrieves a VpnPacketBuffer object from the send
-        ///     packet buffer pool to use in encapsulation and transmission of a data packet from
-        ///     the client network stack to the VPN server." —— 它是官方给 send 池的<b>具名</b>入口；
-        ///   · 现在这条默认路径用的 <c>RequestVpnPacketBuffer</c> 与枚举 <c>VpnDataPathType</c>
-        ///     都被标了 "Not supported"（原文见 <see cref="InjectGetBuffer"/>），
-        ///     而本品的 send 借包<b>只有 keep-alive 一处</b>（<c>Encapsulate</c> 的包是平台交进来的，
-        ///     不是我们借的）⇒ 切换的面很小，值得按条文摆正。
-        ///
-        /// ★★ <b>必须先承认的未验证项</b>：先遣项目对 <c>GetVpnSendPacketBuffer</c>
-        ///   <b>没有任何实测数据</b>（docs 里唯一的真实调用是 C# 兜底分支，该路径从未触发），
-        ///   投影层会不会抛也<b>无记录</b>。这跟 receive 侧不一样（那边有 injectmode=1 的实测）。
-        ///   所以本臂自带失败计数：<c>takeFail</c>（取包失败次数 + 首个原因进 plugin.log）。
-        ///
-        /// 【失败形状为什么可以接受】取不到 buffer 时本方法交 <c>keepAlivePacket=null</c> ——
-        ///   这与 <c>RequestVpnPacketBuffer</c> 抛异常时走的是<b>同一条</b>既有出口
-        ///   （<c>GetKeepAlivePayload</c> 的 catch 已经这么写），不是新发明的失败形态。
-        ///   真出问题按 <c>ka</c>/<c>takeFail</c> 两列对账，开启写 <c>sendGetBuffer=1</c>。
-        ///
-        /// ★★★ 【1.0.27 为什么把默认翻回 false】上一条 T2 提交把默认定成了 true，被复核点破：
-        ///   本仓库的既有口径写在 <see cref="EncapReturn"/> 那一族注释里 ——
-        ///   <b>"没有实测证据前不改默认"</b>（这条口径的来源很硬：档 3 就是"看着更贴条文"的
-        ///   <c>foreach</c> 形态，run 34 里以 <c>InvalidCastException</c> 死在投影层，
-        ///   整条数据面从第 11 秒静默停摆）。而 send 侧的证据量比 receive 侧<b>少一档</b>：
-        ///   receive 那边有先遣项目 docs/76 的 <c>injectmode=1</c>（24 包全部 <c>attempt=0</c>）
-        ///   可以背书，send 这边连一条真实触发记录都没有（上面第 329-331 行就是本轮自己写的）。
-        ///   ⇒ keep-alive 是热路径上唯一"由我们主动向 send 池借包"的动作，把它的默认臂换成
-        ///     零实测入口，等于让用户的第一次连接去当实验。条文优先适用于<b>有对照证据</b>的臂。
-        ///   ★ 代码没删、开关还在：<c>sendGetBuffer=1</c> 就是那条臂，实测授权后单变量跑
-        ///     （判据见 Docs/09 §12.6 第 1 项）。
-        /// </summary>
-        internal static bool SendGetBuffer = false;
-
-        /// <summary>
         /// 插件侧会话看门狗（默认<b>开</b>）。
         ///
         /// 【为什么必须放在插件里，而不是前台哨兵】run 30 的两次致命失败都出在
@@ -394,6 +322,30 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal static bool SessionWatchdog = true;
 
+        /// <summary>
+        /// ★【1.0.66】是否在通知中心常驻一条"实时上下行"状态通知。默认<b>开</b>。
+        ///
+        /// 【对齐的是谁】安卓那份的 <c>dynamicNotification</c>
+        /// （<c>.local/ref/ServiceStore.kt:64</c>：<c>boolean(..., defaultValue = true)</c>，
+        /// 关掉就退回 <c>StaticNotificationModule</c> 那条"只说在跑、不带速率"的常驻通知）。
+        /// 我们这一版没有做"静态那条"的降级形态，<c>0</c> 就是<b>完全不发通知</b> ——
+        /// 因为 Windows 侧这条通知的一切代价与风险都来自它本身（划掉会不会补发、
+        /// 插件进程发通知算不算越界），关掉就是关掉，不保留半条。
+        ///
+        /// 【为什么留这个开关（而不是写死）】
+        ///   ① 发通知这件事发生在<b>vpnClient 后台任务进程</b>里，
+        ///      "这个进程到底有没有包身份、通知会不会被设置压掉"是<b>未实测</b>的
+        ///      （<see cref="StatusToast"/> 会把 <c>CreateToastNotifier()</c> 的结果与
+        ///      <c>Setting</c> 都记进 <c>channel=toast</c> 日志）。真出问题时一行
+        ///      <c>statusToast=0</c> 就能退回，不用重装。
+        ///   ② 它是<b>每秒一次</b>的平台调用（文案变了才真调），与数据面无关，
+        ///      属于"可以随时摘掉、不影响隧道"的那一类 —— 开关要留在能摘的位置。
+        ///
+        /// 【关掉之后】会话结束时的 <c>Stop()</c> 会试图撤掉已经挂着的那条（若有），
+        /// 不留孤儿通知。
+        /// </summary>
+        internal static bool StatusToast = true;
+
         internal static void Load()
         {
             // 先恢复默认，避免上一次连接的值残留到本次
@@ -409,17 +361,13 @@ namespace ClashUWP.Vpn
             //   否则 settings.txt 缺失/解析失败时会掉回另一条数据面路径。
             EncapReturn = 2;
             ReceiveBatch = 0;
-            // ★ 1.0.26（T2）→1.0.27 修订：两条取包入口的默认臂<b>不对称</b>，各自写清依据 ——
-            //   · receive：切到具名入口 <c>GetVpnReceivePacketBuffer()</c>，因为先遣项目
-            //     docs/76 的 <c>injectmode=1</c> 有 24 包全成功的实测；
-            //   · send：<b>保持</b> run 35/37 量通过的 <c>RequestVpnPacketBuffer(Send)</c>，
-            //     因为 <c>GetVpnSendPacketBuffer()</c> 在本仓库与先遣仓库<b>都零实测</b>
-            //     （口径："没有实测证据前不改默认"，理由全文见 <see cref="SendGetBuffer"/>）。
-            //   ★ 这两行必须与字段初始值逐字一致（:408 的约定）：settings.txt 缺失时
-            //     掉回另一条取包路径，比换臂更难归因。
-            InjectGetBuffer = true;
-            SendGetBuffer = false;
+            // ★ 1.0.52：删掉 injectGetBuffer / sendGetBuffer 两个开关及其旧臂 ——
+            //   旧臂吃的 VpnDataPathType 被官方标 "not supported and may be altered or
+            //   unavailable in the future"，而 GetVpnReceive/GetVpnSendPacketBuffer()
+            //   是同一个池的具名入口（RequestVpnPacketBuffer 的 see-also 主动指向它们）。
+            //   现在两条取包路径都只有具名入口，没有可切的臂。
             SessionWatchdog = true;
+            StatusToast = true;
             FakeIp = true;
             FailFast = true;
             Source = "默认值";
@@ -451,9 +399,8 @@ namespace ClashUWP.Vpn
                 IncludeMode = ReadString(map, "includeMode", IncludeMode);
                 EncapReturn = ReadInt(map, "encapReturn", EncapReturn, 0, 5);
                 ReceiveBatch = ReadInt(map, "receiveBatch", ReceiveBatch, 0, 64);
-                InjectGetBuffer = ReadBool(map, "injectGetBuffer", InjectGetBuffer);
-                SendGetBuffer = ReadBool(map, "sendGetBuffer", SendGetBuffer);
                 SessionWatchdog = ReadBool(map, "sessionWatchdog", SessionWatchdog);
+                StatusToast = ReadBool(map, "statusToast", StatusToast);
                 FakeIp = ReadBool(map, "fakeIp", FakeIp);
                 FailFast = ReadBool(map, "failFast", FailFast);
                 Source = "settings.txt";
@@ -470,13 +417,12 @@ namespace ClashUWP.Vpn
             //   同时记 log=...：日志自己丢了多少行，决定这行以下还能不能信。
             RollingLog.Info("settings",
                 $"src={Source} encapReturn={EncapReturn} receiveBatch={ReceiveBatch} " +
-                $"injectGetBuffer={(InjectGetBuffer ? 1 : 0)} " +
-                $"sendGetBuffer={(SendGetBuffer ? 1 : 0)} " +
                 $"dnsInTunnel={(DnsIntoTunnel ? 1 : 0)} " +
                 $"residentBridge={(ResidentBridge ? 1 : 0)} nodeExclusions={(NodeExclusions ? 1 : 0)} " +
                 $"selfSplit={SelfSplitTunnel} outer={OuterTarget}:{OuterPort} includeMode={IncludeMode} " +
                 $"fakeIp={(FakeIp ? 1 : 0)} failFast={(FailFast ? 1 : 0)} " +
-                $"watchdog={(SessionWatchdog ? 1 : 0)} {RollingLog.Diag()}");
+                $"watchdog={(SessionWatchdog ? 1 : 0)} statusToast={(StatusToast ? 1 : 0)} " +
+                $"{RollingLog.Diag()}");
         }
 
         /// <summary>读字符串开关（空值一律回落 fallback —— 空 HostName 会让 ConnectAsync 抛）。</summary>

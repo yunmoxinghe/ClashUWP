@@ -70,6 +70,20 @@ namespace ClashUWP.Vpn
         };
 
         /// <summary>
+        /// ★【1.0.62 · 每条订阅一个系统 profile】订阅 id。
+        ///
+        /// 空串 = 基础 profile（<c>ClashUWP</c>，插件按旧逻辑读 <c>config.yaml</c> 那一份生效副本）；
+        /// 非空 = 该订阅对应的系统 VPN profile（<c>ClashUWP-{id}</c>），插件改读
+        /// <c>subscriptions/{id}.yaml</c> 这一份<b>该订阅专属</b>的正文，
+        /// 从而让 Windows 快速设置 VPN 面板里点哪个 profile 就连哪个订阅。
+        ///
+        /// 这个值由前台写进 <c>VpnPlugInProfile.CustomConfiguration</c> 的 XML，
+        /// 插件在 <c>Connect</c> 里通过 <c>VpnChannel.Configuration.CustomField</c> 读回
+        /// （名字不对称：写叫 CustomConfiguration、读叫 CustomField，见 ClashVpnPlugin 步 3 注释）。
+        /// </summary>
+        public string SubId { get; set; } = "";
+
+        /// <summary>
         /// 解析前台下发的 CustomConfiguration。解析不出来就退回默认值，不抛 ——
         /// 插件侧抛异常会让 <c>Connect</c> 直接失败，用户只看到"连不上"。
         /// </summary>
@@ -125,6 +139,20 @@ var dns = Elements(root, "dns");
                 foreach (string e in excludes) config.ExcludeRoutes.Add(e);
             }
 
+            // ★【1.0.62】<subId>：订阅 id。只保留安全字符（[A-Za-z0-9._-]），
+            //   插件会用它拼 subscriptions/{subId}.yaml 的路径，必须挡掉路径穿越。
+            //   （值由我们自己生成的 CustomConfiguration 下发，本就是可信来源；
+            //     这里再做一层消毒是纵深防御，避免畸形 XML 把插件引到意外文件。）
+            string? rawSub = Element(root, "subId");
+            if (!string.IsNullOrWhiteSpace(rawSub))
+            {
+                var sb2 = new StringBuilder();
+                foreach (char c in rawSub)
+                    if (char.IsLetterOrDigit(c) || c == '.' || c == '_' || c == '-')
+                        sb2.Append(c);
+                config.SubId = sb2.ToString();
+            }
+
             // 兜底夹紧：mtu < maxFrame 是官方明文约束，配置写反了也不能让它违规。
             if (config.Mtu >= config.MaxFrame)
                 config.Mtu = config.MaxFrame - 1;
@@ -143,6 +171,8 @@ var dns = Elements(root, "dns");
             foreach (string dns in DnsServers) sb.Append($"<dns>{dns}</dns>");
             foreach (string route in IncludeRoutes) sb.Append($"<route>{route}</route>");
             foreach (string route in ExcludeRoutes) sb.Append($"<excludeRoute>{route}</excludeRoute>");
+            if (SubId.Length > 0)
+                sb.Append($"<subId>{SubId}</subId>");
             sb.Append("</clash>");
             return sb.ToString();
         }

@@ -1,0 +1,546 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+using Windows.Data.Xml.Dom;
+using Windows.Storage;
+using Windows.UI.Notifications;
+
+namespace ClashUWP.Vpn
+{
+    /// <summary>
+    /// ★【1.0.66】插件进程内的<b>状态通知</b>（对齐安卓 <c>DynamicNotificationModule</c>）——
+    /// 隧道连上之后，通知中心常驻一条「实时上下行」，原位刷新，不出横幅、不响。
+    ///
+    /// 【为什么放插件进程】
+    ///   字节计数（encap / inject）就在插件进程里，而插件进程<b>在会话期间一定活着</b>
+    ///   （包在它这里转发，平台为了转发保活它）。前台 UWP 进程会被挂起/节流/关闭 ——
+    ///   放前台就等于"app 一关，状态通知不再刷新"。理由与
+    ///   <see cref="PhysicalNetworkWatchdog"/> 搬进插件那一次完全相同（见它的类注释）。
+    ///
+    /// 【为什么是"静默常驻 toast + 原位 Update"这个形态】
+    ///   Windows 给 UWP 包<b>没有</b>托盘：<c>Microsoft.UI.Windowing.TrayIcon</c> 明确不支持 UWP、
+    ///   <c>Shell_NotifyIcon</c> 要 HWND（Win32 only）、Live Tile 在 Win11 已废、
+    ///   任务栏进度 <c>ITaskbarList4</c> 也要 Win32。于是"实时上下行"能落的只有通知中心那一条 ——
+    ///   点开通知中心就看，和安卓的 UX 一致（用户已认可这个取舍）。
+    ///
+    /// 【与安卓逐条对齐（源码存档 <c>.local/ref/cmfa_notif/DynamicNotificationModule.kt</c>）】
+    ///   · <c>setOngoing(true)</c>（不可划掉的常驻通知）
+    ///       → <b>Windows 没有这个语义</b>：toast 用户可以随手划掉，也没有前台服务那种锁。
+    ///         做不到就退一步："划掉之后补发（限流）+ 发一条普通通知教用户去设置里彻底关掉"，
+    ///         这正是本次要实现的第二个动作。
+    ///   · <c>setOnlyAlertOnce(true)</c> + <c>IMPORTANCE_LOW</c> 通道（不响、不弹横幅）
+    ///       → <c>ToastNotification.SuppressPopup = true</c> + XML 里 <c>&lt;audio silent='true'/&gt;</c>。
+    ///         官方口径（App notification progress bar and data binding 的 replace/update 对照表）：
+    ///         "<i>Can reappear as a popup if SuppressPopup is false (or set to true to silently
+    ///         send it to Notification Center)</i>"。
+    ///   · <c>notify(R.id.nf_clash_status, …)</c>（同 id 覆盖，不新增条目）
+    ///       → 固定 <c>Tag</c>+<c>Group</c>，之后只走
+    ///         <c>ToastNotifier.Update(NotificationData, tag, group)</c>：官方同一张表里 Update 那列是
+    ///         "<i>Leaves the notification in place within Notification Center</i>"、
+    ///         "<i>Won't reappear as a popup; the notification's data is silently updated within
+    ///         Notification Center</i>" —— 原位刷新；重新 <c>Show</c>（replace）会把条目顶到最上面。
+    ///   · <c>ticker(SECONDS.toMillis(1))</c>（每秒一拍）
+    ///       → 同样 1 s 一拍，但<b>只在文案真的变了</b>才调 Update（空闲时速率 0、累计不动 ⇒ 不敲平台）。
+    ///   · <c>isInteractive</c> / <c>SCREEN_ON|OFF</c> 门（屏灭就不刷）
+    ///       → <b>UWP 侧没有等价物</b>（查过：没有"通知中心当前是否可见"的只读入口，
+    ///         <c>GetNotificationHistory</c> 在 26100 投影里也不存在）。用"变了才刷"替代，
+    ///         目的相同：不做无意义的每秒平台调用。
+    ///   · <c>contentTitle</c>=当前 profile / <c>contentText</c>=↑↓速率 / <c>subText</c>=累计
+    ///       → 三行 <c>&lt;text&gt;</c>：标题（含订阅 id）、速率、累计。
+    ///         ★ 标题里<b>不放</b>存活秒数：那一行每秒都在变，会把"变了才刷"变成"每秒必刷"；
+    ///           安卓的 subText 也只放累计，秒数不是这台设备上的有效信息。
+    ///   · 数据源 <c>Clash.queryTrafficNow()</c> / <c>queryTrafficTotal()</c>
+    ///       → <b>口径不同，必须明说</b>：这里用插件自己的包字节计数（<c>_outBytes</c>/<c>_inBytes</c>），
+    ///         量的是<b>隧道 L3 收进来的原始 IP 包</b>与<b>注回本机的原始 IP 包</b>，
+    ///         不含隧道封装开销，也不等于内核 REST <c>GET /traffic</c>（那条是代理连接的好速度）。
+    ///         选它的理由：零额外 IO、零依赖、热路径只多两次 <c>Interlocked.Add</c>；
+    ///         而 <c>/traffic</c> 是 WebSocket，插件侧要另起一条 HTTP 客户端并在 AppContainer
+    ///         里回环，成本与风险都不对应这个需求。
+    ///
+    /// 【★ 被划掉之后怎么办（安卓不需要写、我们必须写的那一段）】
+    ///   安卓不用处理"用户删通知"：<c>setOngoing(true)</c> 压根没有划掉按钮，前台服务通知归系统管。
+    ///   Windows 的 toast 随手就能划掉，所以两个信号都接：
+    ///     ① <c>ToastNotification.Dismissed</c> —— 官方定义 "<i>Occurs when a toast notification
+    ///        leaves the screen, either by expiring or being explicitly dismissed by the user.
+    ///        Apps that are running subscribe to this event.</i>"，原因在
+    ///        <c>ToastDismissedEventArgs.Reason</c>（<c>UserCanceled</c> / <c>ApplicationHidden</c> /
+    ///        <c>TimedOut</c>）。那句"Apps that are running"是关键限制：
+    ///        <b>进程还在才有事件</b> ⇒ 它只是快通道，不能当唯一依据。
+    ///     ② <c>Update()</c> 的返回值 —— 官方对照表写明 "<i>If the user dismissed the notification,
+    ///        the update will fail</i>"，且 <c>NotificationUpdateResult</c> 专门有
+    ///        <c>NotificationNotFound</c> 这一档。这条<b>不依赖进程活着</b>，是可靠判据。
+    ///   任一命中 ⇒ 用同一 tag 静默补发一条，并（每天最多一次、每会话最多一次）发一条
+    ///   <b>会出横幅的普通通知</b>，把用户送到 设置 → 系统 → 通知，告诉他怎么彻底关掉横幅：
+    ///   因为只要隧道还在跑，这条状态通知就会一直被补回来 —— 想清静只有从设置入手。
+    ///   限流两条：<c>MaxReRaise</c> 次之后这个会话就放手（划 4 次还在来是骚扰）；
+    ///   引导通知记在 <c>LocalState\toast-guide.txt</c>，同一天不重发。
+    ///
+    /// 【纪律】这里<b>不碰隧道、不碰网络、不碰内核</b>：只读计数、只发通知。
+    ///   会话结束（<c>Disconnect</c>）时 <see cref="Stop"/> 会把常驻那条撤掉（<c>Hide</c>），
+    ///   不留"通知显示已连接、隧道其实没了"的假状态。
+    /// </summary>
+    internal static class StatusToast
+    {
+        /// <summary>常驻状态通知的 tag / group：对应安卓那个固定的 <c>R.id.nf_clash_status</c>。</summary>
+        private const string TagStatus = "clash-status";
+        private const string GroupStatus = "clash";
+
+        /// <summary>引导通知另用一条 tag：不覆盖常驻那条，也不被它覆盖。</summary>
+        private const string TagGuide = "clash-guide";
+
+        /// <summary>一拍 1 s，与安卓 <c>ticker(TimeUnit.SECONDS.toMillis(1))</c> 同频。</summary>
+        private const int IntervalMs = 1000;
+
+        /// <summary>一个会话内最多补发几次；超过就撤掉循环，这个会话不再刷状态通知。</summary>
+        private const int MaxReRaise = 3;
+
+        // 绑定名：XML 里写成 {key}，NotificationData.Values 用同名（官方绑定的就是这套占位）。
+        private const string KeyTitle = "statusTitle";
+        private const string KeyRate = "statusRate";
+        private const string KeyTotal = "statusTotal";
+
+        private static CancellationTokenSource? _cts;
+
+        // ── 会话内状态（每次 Start 全部重置）──
+        private static ToastNotifier? _notifier;
+        private static ToastNotification? _shown;   // 当前认为挂在通知中心里的那条
+        private static string _title = "";
+        private static string _lastRate = "";
+        private static string _lastTotal = "";
+        private static uint _sequence;
+        private static int _reRaised;
+        private static int _dismissCount;
+        private static int _guideSentThisSession;
+        private static bool _gaveUp;
+
+        // Dismissed 事件在<b>平台回调线程</b>上触发，动手的却是循环线程（只有一个线程改 _shown）。
+        // 所以回调只立牌子：先写原因，再 Volatile.Write 置位 —— 与本仓其它跨线程标记同一口径。
+        private static string _dismissWhy = "";
+        private static int _dismissPending;
+
+        /// <summary>连续引发失败次数；到 <see cref="MaxShowFailures"/> 就整条循环退出，不再每秒重试。</summary>
+        private static int _showFailCount;
+
+        /// <summary>连续失败几次就放弃（<c>CreateToastNotifier</c> 成功但 Show 一直失败，
+        /// 通常是系统里这个应用的通知被关掉了 —— 每秒重试只会把日志刷满）。</summary>
+        private const int MaxShowFailures = 5;
+
+        /// <summary>
+        /// ★ 一把锁，锁住"动通知"这件事（Show / Update / Hide）。
+        /// 对手是 <see cref="Stop"/>：它跑在<b>平台回调线程</b>（Disconnect 收尾），
+        /// 而这个循环跑在自己的线程池线程上。两边同时动手的形状是：
+        /// 收尾把通知撤了，循环下一秒读到 <c>NotificationNotFound</c>（平台说"划掉了"）
+        /// ⇒ 于是<b>把通知又发回来</b> —— 会话早就结束，通知中心里却挂着一条"隧道运行中"。
+        /// 那正是本类自己最反对的谎报，所以这一段必须锁住，并在动手前核对
+        /// "我还是不是当前这一轮循环"（见 <c>ReferenceEquals(_cts, own)</c>）。
+        /// 每秒一次、每次都是短临界区，锁不争性能。
+        /// </summary>
+        private static readonly object _gate = new object();
+
+        /// <summary>起（可重复调用，重复即"重新武装"；<c>statusToast=0</c> 时什么都不做）。</summary>
+        internal static void Start(VpnPluginConfig config, ClashVpnPlugin plugin)
+        {
+            Stop("重新武装");
+
+            if (!LocalSettings.StatusToast)
+            {
+                RollingLog.Info("toast", "跳过：statusToast=0");
+                return;
+            }
+
+            string profile = config.SubId.Length == 0 ? "默认配置" : config.SubId;
+
+            var cts = new CancellationTokenSource();
+            _cts = cts;
+            // _notifier / _shown 不用在这里清：上面的 Stop 已经在锁里清过了，
+            // 这里再裸写一次反而给旧循环留一个"读到半新半旧状态"的口子。
+            _title = $"ClashUWP · 隧道运行中（{profile}）";
+            _lastRate = "";
+            _lastTotal = "";
+            _sequence = 0;
+            _reRaised = 0;
+            _dismissCount = 0;
+            _guideSentThisSession = 0;
+            _gaveUp = false;
+            _showFailCount = 0;
+            _dismissWhy = "";
+            Volatile.Write(ref _dismissPending, 0);
+
+            _ = Task.Run(() => LoopAsync(cts.Token, cts, plugin));
+        }
+
+        /// <summary>停（会话结束 / 用户断开时调）：撤掉常驻通知并停循环。</summary>
+        internal static void Stop(string why)
+        {
+            var cts = _cts;
+            if (cts != null)
+            {
+                _cts = null;
+                try { cts.Cancel(); } catch { /* 取消本身不抛 */ }
+                try { cts.Dispose(); } catch { }
+            }
+
+            try
+            {
+                // ★ 锁住"撤"这件事，并在锁里把 _notifier/_shown 一起清空：
+                //   循环那边动手前会核对"我还是不是当前这一轮"（_cts 已被上面置 null），
+                //   所以撤完之后不会再有一条被补发回来。理由见 _gate 的注释。
+                lock (_gate)
+                {
+                    var n = _notifier;
+                    if (n != null)
+                    {
+                        Hide(n);
+                        RollingLog.Info("toast", $"已撤下状态通知（{why}）");
+                    }
+                    _notifier = null;
+                    _shown = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                // 撤不掉只是通知中心里留一条旧条目，不值得把 Disconnect 的收尾流程带崩。
+                RollingLog.Warn("toast", $"撤下失败（{why}）err={ex.GetType().Name}: {ex.Message}");
+                _notifier = null;
+                _shown = null;
+            }
+        }
+
+        private static async Task LoopAsync(CancellationToken token, CancellationTokenSource own,
+                                           ClashVpnPlugin plugin)
+        {
+            ToastNotifier notifier;
+            try
+            {
+                // 无参重载 = "for the current app"。插件进程到底有没有包身份，
+                // 这一句成不成 + 下面读到的 Setting 就是判据（失败只让通知这件事没，不动隧道）。
+                notifier = ToastNotificationManager.CreateToastNotifier();
+                lock (_gate)
+                {
+                    // 建好之前这一刻都可能已经被 Stop/新一轮 Start 摘走（连接刚成就断是实测形态），
+                    // 所以赋值也要在锁里核对身份，别把一个已经结束的会话的发送器留下。
+                    if (!ReferenceEquals(_cts, own)) return;
+                    _notifier = notifier;
+                }
+                RollingLog.Info("toast",
+                    $"启动：每 {IntervalMs}ms 原位刷新 tag={TagStatus} setting={notifier.Setting} " +
+                    $"补发上限={MaxReRaise} 引导通知=每天一次");
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Warn("toast",
+                    $"CreateToastNotifier 失败，本会话不发通知 err={ex.GetType().Name}: {ex.Message}");
+                return;
+            }
+
+            long lastUp = 0, lastDown = 0;
+            bool first = true;
+
+            while (!token.IsCancellationRequested)
+            {
+                try { await Task.Delay(IntervalMs, token); }
+                catch (TaskCanceledException) { return; }
+
+                plugin.ReadTrafficBytes(out long up, out long down);
+
+                double upRate = 0, downRate = 0;
+                if (first)
+                {
+                    // 第一拍只取基线：没有"上一拍"，算出来的速率没意义。
+                    // 但这一拍就把通知挂上 —— "连上了"这件事要立刻可见，不用等第二秒。
+                    first = false;
+                    lastUp = up;
+                    lastDown = down;
+                }
+                else
+                {
+                    upRate = (up - lastUp) * 1000.0 / IntervalMs;
+                    downRate = (down - lastDown) * 1000.0 / IntervalMs;
+                    lastUp = up;
+                    lastDown = down;
+                    if (upRate < 0) upRate = 0;     // 计数每会话归零，理论上不会负；防御一口
+                    if (downRate < 0) downRate = 0;
+                }
+
+                string rate = $"↑ {Format(upRate, "/s")}　↓ {Format(downRate, "/s")}";
+                string total = $"累计 ↑ {Format(up, "")}　↓ {Format(down, "")}";
+
+                // ★ 动手的整段都在 _gate 里，并先核对"我还是不是当前这一轮循环"：
+                //   Stop（平台回调线程）刚撤过通知的话，这里再 Show/Update 就等于
+                //   在会话结束之后把"隧道运行中"发回去。见 _gate 的注释。
+                lock (_gate)
+                {
+                    if (!ReferenceEquals(_cts, own)) return;
+
+                    // 快通道：Dismissed 回调只立牌子，动手在这里（保证只有一个线程改 _shown）。
+                    if (Interlocked.Exchange(ref _dismissPending, 0) == 1)
+                        HandleDismissed(notifier, _dismissWhy, rate, total);
+
+                    if (_gaveUp)
+                    {
+                        // 两种放手：用户持续划掉（HandleDismissed 设的）/ 连续引发失败（ShowSilent 设的）。
+                        // 具体原因前一行日志里已经写过，这里只交代"这条循环到此为止"。
+                        RollingLog.Info("toast", "本会话不再刷状态通知（原因见上一行 toast 日志）");
+                        return;
+                    }
+
+                    if (_shown == null)
+                    {
+                        ShowSilent(notifier, rate, total);
+                        continue;
+                    }
+
+                    // 安卓那条 ticker 每秒无脑 notify；这里改成"变了才敲平台"，
+                    // 空闲（速率 0、累计不动）时一次调用都不发。
+                    if (rate == _lastRate && total == _lastTotal) continue;
+
+                    try
+                    {
+                        NotificationUpdateResult result =
+                            notifier.Update(BuildData(rate, total), TagStatus, GroupStatus);
+                        if (result == NotificationUpdateResult.Succeeded)
+                        {
+                            _lastRate = rate;
+                            _lastTotal = total;
+                            continue;
+                        }
+
+                        // ★ 可靠判据（官方：用户划掉之后 update 会失败；这里读到的就是
+                        //   NotificationNotFound / Failed）。它不依赖进程活着，所以 Dismissed
+                        //   事件丢了也能靠这一条把"通知已经不在了"发现出来。
+                        HandleDismissed(notifier, "update:" + result, rate, total);
+                    }
+                    catch (Exception ex)
+                    {
+                        RollingLog.Warn("toast",
+                            $"刷新异常，本拍放弃 err={ex.GetType().Name}: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 处理"通知已经不在通知中心"：静默补发（限流）+ 引导通知（会话一次 / 一天一次）。
+        /// 只在循环线程上调用（两个入口 —— Dismissed 牌子、Update 返回值 —— 都汇到这里）。
+        /// </summary>
+        private static void HandleDismissed(ToastNotifier notifier, string why, string rate, string total)
+        {
+            int which = Interlocked.Increment(ref _dismissCount);
+            _shown = null;   // 平台说它不在了 ⇒ 我们也不再当它在（后续 Show 会重建并重新挂事件）
+            RollingLog.Info("toast", $"状态通知已消失（第 {which} 次，{why}）");
+
+            if (_reRaised >= MaxReRaise)
+            {
+                _gaveUp = true;
+                return;
+            }
+            _reRaised++;
+            ShowSilent(notifier, rate, total);
+
+            if (Interlocked.Exchange(ref _guideSentThisSession, 1) == 0 && TryClaimGuideToday())
+            {
+                try
+                {
+                    ShowGuide(notifier);
+                    RollingLog.Info("toast", "已发引导通知（普通横幅 +「打开通知设置」按钮）");
+                }
+                catch (Exception ex)
+                {
+                    RollingLog.Warn("toast",
+                        $"引导通知发不出 err={ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>静默引发常驻那条：SuppressPopup + silent audio ⇒ 只进通知中心，不出横幅。</summary>
+        private static void ShowSilent(ToastNotifier notifier, string rate, string total)
+        {
+            try
+            {
+                XmlDocument doc = new XmlDocument();
+                doc.LoadXml(StatusXml());
+                ToastNotification toast = new ToastNotification(doc)
+                {
+                    Tag = TagStatus,
+                    Group = GroupStatus,
+                    SuppressPopup = true,
+                    Data = BuildData(rate, total)
+                };
+                toast.Dismissed += OnToastDismissed;
+                toast.Failed += OnToastFailed;
+
+                notifier.Show(toast);
+                _shown = toast;
+                // 记下这一拍渲染的内容 —— "变了才刷"的比较基准必须包含 Show 带进去的那一份初值，
+                // 否则下一拍会拿旧基准做一次没意义的 Update。
+                _lastRate = rate;
+                _lastTotal = total;
+                _showFailCount = 0;
+            }
+            catch (Exception ex)
+            {
+                // 连续失败到上限就不再重试：多半是系统里本应用的通知被关掉了，
+                // 每秒一次只会把 plugin.log 刷满同一句话（热路径禁记的那条纪律同样适用在这里）。
+                if (++_showFailCount >= MaxShowFailures)
+                {
+                    _gaveUp = true;
+                    RollingLog.Warn("toast",
+                        $"连续 {MaxShowFailures} 次引发失败，本会话不再重试 err={ex.GetType().Name}: {ex.Message}");
+                    return;
+                }
+                RollingLog.Warn("toast", $"引发失败 err={ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>引导那条：普通通知（<b>不</b>压横幅，用户要看得见才会照做）。</summary>
+        private static void ShowGuide(ToastNotifier notifier)
+        {
+            XmlDocument doc = new XmlDocument();
+            doc.LoadXml(GuideXml());
+            ToastNotification toast = new ToastNotification(doc)
+            {
+                Tag = TagGuide,
+                Group = GroupStatus,
+                SuppressPopup = false
+            };
+            notifier.Show(toast);
+        }
+
+        private static void OnToastDismissed(ToastNotification sender, ToastDismissedEventArgs args)
+        {
+            string why;
+            try { why = args.Reason.ToString(); }
+            catch { why = "?"; }
+            _dismissWhy = "dismissed:" + why;
+            Volatile.Write(ref _dismissPending, 1);
+        }
+
+        private static void OnToastFailed(ToastNotification sender, ToastFailedEventArgs args)
+        {
+            // Show 之后平台自己报错（多半是通知被策略/设置压掉了）。
+            RollingLog.Warn("toast", $"平台引发失败 err={args.ErrorCode}");
+        }
+
+        private static void Hide(ToastNotifier notifier)
+        {
+            var toast = _shown;
+            if (toast != null)
+            {
+                notifier.Hide(toast);
+                return;
+            }
+            // 极端时序（刚 Show 就 Stop，或 Show 失败过）：Hide 只认 tag+group，
+            // 造一条同 tag/group 的空壳去撤即可，内容无所谓。
+            XmlDocument doc = new XmlDocument();
+            doc.LoadXml(StatusXml());
+            ToastNotification stub = new ToastNotification(doc)
+            {
+                Tag = TagStatus,
+                Group = GroupStatus
+            };
+            notifier.Hide(stub);
+        }
+
+        /// <summary>
+        /// 抢"今天这一次"引导名额：<c>LocalState\toast-guide.txt</c> 记最近一次的日期。
+        /// 读写失败时<b>当作没抢到</b> —— 宁可少发一条，也不要每次划掉都弹一次横幅。
+        /// </summary>
+        private static bool TryClaimGuideToday()
+        {
+            string today = DateTime.Now.ToString("yyyy-MM-dd");
+            try
+            {
+                string last = "";
+                try
+                {
+                    StorageFile file = ApplicationData.Current.LocalFolder
+                        .GetFileAsync("toast-guide.txt").AsTask().GetAwaiter().GetResult();
+                    last = FileIO.ReadTextAsync(file).AsTask().GetAwaiter().GetResult().Trim();
+                }
+                catch { /* 还没这个文件 = 从没发过 */ }
+
+                if (string.Equals(last, today, StringComparison.Ordinal)) return false;
+
+                StorageFile target = ApplicationData.Current.LocalFolder
+                    .CreateFileAsync("toast-guide.txt", CreationCollisionOption.ReplaceExisting)
+                    .AsTask().GetAwaiter().GetResult();
+                FileIO.WriteTextAsync(target, today).AsTask().GetAwaiter().GetResult();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Warn("toast", $"引导名额记账失败，本次不发 err={ex.GetType().Name}");
+                return false;
+            }
+        }
+
+        private static NotificationData BuildData(string rate, string total)
+        {
+            NotificationData data = new NotificationData();
+            data.Values[KeyTitle] = _title;
+            data.Values[KeyRate] = rate;
+            data.Values[KeyTotal] = total;
+            // 官方："<i>When multiple NotificationData objects are received, the system displays
+            // the NotificationData with the greatest non-zero number.</i>" ⇒ 必须单调递增，
+            // 否则慢一拍到达的更新会把新值盖掉。
+            data.SequenceNumber = ++_sequence;
+            return data;
+        }
+
+        /// <summary>
+        /// 常驻那条的 XML：三行<b>全部是 <c>{key}</c> 占位</b>，之后只靠 Update 换值。
+        /// ★ 官方「支持数据绑定的元素」清单只有两条：进度栏的所有属性、<b>顶层 text 元素的 Text</b>；
+        ///   绑定写法是把 <c>{绑定名}</c> 直接写进内容（WindowsAppSDK 文档里那句
+        ///   "<i>Binds to {progressTitle} in xml payload</i>" 说的就是这个占位形式，
+        ///   <c>NotificationData</c> 的 key 用同名）。
+        /// ★ 这里<b>不放</b> <c>&lt;progress&gt;</c>：一是官方标注它只支持桌面端 toast；
+        ///   二是上下行速率不是"完成度"，硬造一个参考速率只会误导；
+        ///   三行文字才是与安卓 <c>contentTitle / contentText / subText</c> 一一对应的形态。
+        ///   <c>&lt;audio silent='true'/&gt;</c> 是第二重保险：万一横幅因为别的原因出现，也不响。
+        /// </summary>
+        private static string StatusXml() =>
+            "<toast>" +
+              "<visual>" +
+                "<binding template='ToastGeneric'>" +
+                  $"<text>{{{KeyTitle}}}</text>" +
+                  $"<text>{{{KeyRate}}}</text>" +
+                  $"<text>{{{KeyTotal}}}</text>" +
+                "</binding>" +
+              "</visual>" +
+              "<audio silent='true'/>" +
+            "</toast>";
+
+        /// <summary>
+        /// 引导那条的 XML：正文写清"隧道不受影响 + 怎么彻底关掉横幅"，
+        /// 并给一个 <c>activationType='protocol'</c> 按钮直达 <c>ms-settings:notifications</c>。
+        /// ★ 做不到"一键关闭" —— 系统不给应用自助改自己通知设置的权限，只能把人送到设置页。
+        /// </summary>
+        private static string GuideXml() =>
+            "<toast>" +
+              "<visual>" +
+                "<binding template='ToastGeneric'>" +
+                  "<text>ClashUWP：状态通知被划掉了</text>" +
+                  "<text>隧道仍在正常工作，划掉通知不影响它。这条状态通知显示实时上下行，" +
+                  "被划掉后还会自动补发几次。</text>" +
+                  "<text>想彻底清静：设置 → 系统 → 通知 → 找到 ClashUWP → 关闭横幅，" +
+                  "或直接关掉这个应用的通知。</text>" +
+                "</binding>" +
+              "</visual>" +
+              "<actions>" +
+                "<action content='打开通知设置' activationType='protocol' arguments='ms-settings:notifications'/>" +
+              "</actions>" +
+            "</toast>";
+
+        /// <summary>字节数格式化：<c>suffix="/s"</c> 时是速率，空串时是累计。</summary>
+        private static string Format(double bytes, string suffix)
+        {
+            if (bytes < 1024) return $"{bytes:F0} B{suffix}";
+            double kb = bytes / 1024.0;
+            if (kb < 1024) return $"{kb:F1} KB{suffix}";
+            double mb = kb / 1024.0;
+            if (mb < 1024) return $"{mb:F2} MB{suffix}";
+            return $"{mb / 1024.0:F2} GB{suffix}";
+        }
+    }
+}

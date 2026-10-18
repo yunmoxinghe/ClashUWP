@@ -6,6 +6,7 @@ using Microsoft.UI.Reactor.Core;
 
 using ClashUWP.Backend;
 using ClashUWP.Backend.Mihomo;
+using ClashUWP.Vpn;
 using static Microsoft.UI.Reactor.Factories;
 
 namespace ClashUWP.Frontend
@@ -51,6 +52,18 @@ namespace ClashUWP.Frontend
         // ---- 选节点（G2 的 UI 化）----
         private Action<string> _setSelectedGroup = _ => { };
 
+        // ---- 订阅元信息（G1 的展示部分）----
+        private SubscriptionView.Info _subInfo = SubscriptionView.Info.Missing();
+        private Action<SubscriptionView.Info> _setSubInfo = _ => { };
+
+        // ---- 订阅管理（G1：拉取 / 切换 / 更新）----
+        private string _subUrl = "";
+        private Action<string> _setSubUrl = _ => { };
+        private List<SubscriptionManager.Profile> _subProfiles = new();
+        private Action<List<SubscriptionManager.Profile>> _setSubProfiles = _ => { };
+        private SubscriptionManager.ActiveInfo _subActive = new("", "");
+        private Action<SubscriptionManager.ActiveInfo> _setSubActive = _ => { };
+
         public override Element Render()
         {
             var (count, setCount) = UseState(0);
@@ -61,6 +74,10 @@ namespace ClashUWP.Frontend
             var (logText, setLogText) = UseState("");
             var (logOpen, setLogOpen) = UseState(false);
             var (selectedGroup, setSelectedGroup) = UseState("");
+            var (subInfo, setSubInfo) = UseState(SubscriptionView.Info.Missing());
+            var (subUrl, setSubUrl) = UseState("");
+            var (subProfiles, setSubProfiles) = UseState(new List<SubscriptionManager.Profile>());
+            var (subActive, setSubActive) = UseState(new SubscriptionManager.ActiveInfo("", ""));
 
             _setVpnStatus = setVpnStatus;
             _setActionHint = setActionHint;
@@ -68,6 +85,19 @@ namespace ClashUWP.Frontend
             _setLogText = setLogText;
             _setLogOpen = setLogOpen;
             _setSelectedGroup = setSelectedGroup;
+            _setSubInfo = setSubInfo;
+            _setSubUrl = setSubUrl;
+            _setSubProfiles = setSubProfiles;
+            _setSubActive = setSubActive;
+
+            // ★【1.0.63】值镜像：字段（_subUrl/_subActive）是给"渲染之外"的代码用的
+            //   （轮询回填读 _subActive.Id、拉取按钮读 _subUrl），而 UseState 的值只活在
+            //   本次渲染的局部变量里 —— 只赋 setter 不赋值的话，字段永远是初始值：
+            //   · _subActive 恒为 ("","") ⇒ 轮询判定"连的订阅≠生效"永真，
+            //     每 3 秒重复回填一次 config.yaml（1.0.62 实测日志连续刷 profile-sub-adopt）；
+            //   · _subUrl 恒为 "" ⇒「拉取并启用」永远报"订阅 URL 不能为空"。
+            _subUrl = subUrl;
+            _subActive = subActive;
 
             // 取证与调试通道的装配交给后端，前端只负责在首次渲染时点一次火。
             Diagnostics.StartOnce();
@@ -85,6 +115,30 @@ namespace ClashUWP.Frontend
                         {
                             var s = await KernelView.LoadAsync();
                             _setSnap(s);
+                            // ★ 同时刷新 VPN 连接状态：系统快速设置发起的连接绕过了我们的
+                            //   按钮，前台没有回调，只能靠轮询反映真实 ConnectionStatus。
+                            string status = await VpnSession.StatusAsync();
+                            _setVpnStatus(status);
+
+                            // ★★【1.0.62】快速面板切订阅的「账要跟上」：
+                            //   连的是某条订阅 profile 且与当前生效的不是同一份 ⇒ 回填。
+                            //   隧道本身早就在跑那份配置（插件 Connect 自己读的文件），
+                            //   这里补的只是 config.yaml + 生效 id 这份书本账。
+                            //   幂等：回填后两值相等，下一轮直接跳过（不会每 3 秒重复写）。
+                            string connectedSub = await VpnSession.ConnectedSubAsync();
+                            if (connectedSub.Length > 0 && connectedSub != _subActive.Id)
+                            {
+                                var adopt = await SubscriptionManager.AdoptAsync(connectedSub);
+                                if (adopt.Ok)
+                                {
+                                    _setActionHint(adopt.Message);
+                                    await RefreshSubscriptionsAsync();
+                                }
+                                else
+                                {
+                                    RollingLog.Warn("profile-sub-adopt", adopt.Message);
+                                }
+                            }
                         }
                         catch { /* 一次失败不该停掉轮询 */ }
                         try { await Task.Delay(3000, cts.Token); }
@@ -97,6 +151,44 @@ namespace ClashUWP.Frontend
             // 选中的组若不在当前快照里（换订阅/组消失），回落到第一个。
             string activeGroup = ResolveGroup(snap, selectedGroup);
 
+            // ★★ 协议激活带入的订阅 URL（"一键导入"）—— <b>每次渲染都查，不在 UseEffect 里</b>。
+            //   【1.0.57 踩过的坑】这段原本写在 UseEffect（空依赖）里，结果协议冷启动时：
+            //     补建外壳 → 订阅 → 解析 URL → 写 PendingSubscriptionUrl，
+            //     而 UseEffect 在<b>外壳建好的那一刻</b>就跑了 ⇒ 那时 pending 还是空，
+            //     URL 永远填不进输入框（1.0.58 实测：TextBox 只显示 placeholder）。
+            //   ⇒ 改成渲染时直读。取一次就清空，所以不会重复填。
+            //   ★ 用户点「拉取并启用」才真正发请求（安全边界见 App.HandleActivation）。
+            {
+                string pending = System.Threading.Volatile.Read(ref App.PendingSubscriptionUrl);
+                if (pending.Length > 0)
+                {
+                    System.Threading.Volatile.Write(ref App.PendingSubscriptionUrl, "");
+                    _setSubUrl(pending);
+                    _setActionHint("已从浏览器导入订阅链接，确认后点「拉取并启用」");
+                }
+            }
+
+            // ★ 订阅元信息<b>不</b>进 3 秒轮询：config.yaml 是手工放置的，不会自己变；
+            //   而每次轮询都读一遍 36 KB 文件纯属浪费。只在挂载时读一次 + 手动刷新按钮读。
+            UseEffect(() =>
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        _setSubInfo(await SubscriptionView.LoadAsync());
+                        _setSubProfiles(await SubscriptionManager.ListAsync());
+                        _setSubActive(await SubscriptionManager.GetActiveAsync());
+                        // ★【1.0.62】启动对账：老版本拉过的订阅还没有系统 profile，
+                        //   不补注册的话快速设置面板里就是空的（详见 SyncSystemProfilesAsync）。
+                        //   放在读列表之后：有列表才有得补；失败只进日志，不挡 UI。
+                        string sync = await SubscriptionManager.SyncSystemProfilesAsync();
+                        RollingLog.Info("profile-sub-sync", sync);
+                    }
+                    catch { /* 读不到就显示"不存在"，不让 UI 白屏 */ }
+                });
+            }, Array.Empty<object>());
+
             return ScrollViewer(
                 VStack(
                     TextBlock($"ClashUWP —— Reactor.Uwp 已接管（{count}）"),
@@ -107,7 +199,7 @@ namespace ClashUWP.Frontend
                     TextBlock("═══ VPN 控制 ═══"),
                     HStack(
                         Button("建/重建 profile", () => _ = RunAsync(_setActionHint, "重建中…", VpnSession.RecreateAsync)),
-                        Button("连接 VPN", () => _ = RunAsync(_setVpnStatus, "连接中…", VpnSession.ConnectAsync)),
+                        Button("连接 VPN", () => _ = RunAsync(_setVpnStatus, "连接中…", () => VpnSession.ConnectAsync())),
                         Button("断开 VPN", () => _ = RunAsync(_setVpnStatus, "断开中…", VpnSession.DisconnectAsync))),
 
                     // ================= 内核运行态（G8）=================
@@ -119,6 +211,17 @@ namespace ClashUWP.Frontend
                         Button("mode rule", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("rule"))),
                         Button("mode global", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("global"))),
                         Button("mode direct", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("direct")))),
+
+                    // ================= 订阅（G1）=================
+                    TextBlock("═══ 订阅 ═══"),
+                    SubscriptionPanel(subInfo, subProfiles, subActive),
+                    HStack(
+                        TextBox(subUrl, v => _setSubUrl(v), "https://… 订阅链接"),
+                        Button("拉取并启用", () => _ = FetchSubscriptionAsync())),
+                    HStack(
+                        Button("更新当前订阅", () => _ = UpdateSubscriptionAsync()),
+                        Button("重新加载配置", () => _ = ReloadConfigAsync()),
+                        Button("刷新列表", () => _ = RefreshSubscriptionsAsync())),
 
                     // ================= 选节点（G2）=================
                     TextBlock("═══ 选节点 ═══"),
@@ -214,6 +317,118 @@ namespace ClashUWP.Frontend
             }
             if (items.Count == 0) items.Add(TextBlock("(该组没有成员)"));
             return VStack(items.ToArray());
+        }
+
+        /// <summary>
+        /// 订阅区块：当前生效那份的元信息 + profile 列表（可点选切换）。
+        /// ★ 这是 G1 的 UI 部分；后端 <see cref="SubscriptionManager"/> 提供拉取/切换/更新/删除。
+        ///   「删除」刻意不放 UI —— 误删订阅比"想删删不掉"更糟，留 CLI 的 subdel。
+        /// </summary>
+        private Element SubscriptionPanel(SubscriptionView.Info info,
+                                         List<SubscriptionManager.Profile> profiles,
+                                         SubscriptionManager.ActiveInfo active)
+        {
+            var items = new List<Element>();
+
+            // ① 当前生效那份的元信息（读 config.yaml，也就是内核实际在跑的那份）
+            if (info.Found)
+            {
+                string protos = info.Protocols.Count == 0
+                    ? "(无)"
+                    : string.Join("　", ToList(info.Protocols, p => $"{p.Key}×{p.Value}"));
+
+                items.Add(TextBlock(
+                    $"生效中：{info.NodeCount} 节点 · {info.RuleCount} 规则 · " +
+                    $"{info.GroupCount} 组 · {info.SizeBytes / 1024.0:F1} KB"));
+                items.Add(TextBlock($"协议：{protos}"));
+                if (active.Url.Length > 0)
+                    items.Add(TextBlock($"来源：{active.Url}"));
+            }
+            else
+            {
+                items.Add(TextBlock($"（{info.Error}）"));
+            }
+
+            // ② profile 列表：点一条就切过去
+            if (profiles.Count > 0)
+            {
+                items.Add(TextBlock($"── 已存 {profiles.Count} 份 ──"));
+                foreach (var p in profiles)
+                {
+                    bool isActive = string.Equals(p.Id, active.Id, StringComparison.OrdinalIgnoreCase);
+                    string id = p.Id;
+                    items.Add(Button(
+                        $"{(isActive ? "▶ " : "  ")}{id}  {p.NodeCount}节点/{p.RuleCount}规则  " +
+                        $"{p.SizeBytes / 1024.0:F1}KB  {p.FetchedAt:MM-dd HH:mm}",
+                        () => _ = UseSubscriptionAsync(id)));
+                }
+            }
+
+            return VStack(items.ToArray());
+        }
+
+        private async Task FetchSubscriptionAsync()
+        {
+            if (_subUrl.Trim().Length == 0)
+            {
+                _setActionHint("先填订阅链接");
+                return;
+            }
+            _setActionHint("拉取中…");
+            var r = await SubscriptionManager.FetchAsync(_subUrl, activate: true);
+            _setActionHint(r.Message);
+            await RefreshSubscriptionsAsync();
+        }
+
+        private async Task UpdateSubscriptionAsync()
+        {
+            _setActionHint("更新中…");
+            var r = await SubscriptionManager.UpdateActiveAsync();
+            _setActionHint(r.Message);
+            await RefreshSubscriptionsAsync();
+        }
+
+        private async Task UseSubscriptionAsync(string id)
+        {
+            _setActionHint($"切换到 {id}…");
+            // ★ UX 对齐 Verge：点一下即原地热重载（连接中），返回信息里已含重载结果。
+            var r = await SubscriptionManager.ActivateAsync(id);
+            _setActionHint(r.Message);
+            await RefreshSubscriptionsAsync();
+        }
+
+        /// <summary>
+        /// 手动热重载：生成内核实际读取的那份配置并 PUT /configs（不碰隧道）。
+        /// 用于"改了东西想立刻让内核重读"或"连接后想让已落盘的新订阅生效"。
+        /// </summary>
+        private async Task ReloadConfigAsync()
+        {
+            _setActionHint("重载中…");
+            var r = await SubscriptionManager.ReloadActiveConfigAsync();
+            _setActionHint(r.Message);
+            await RefreshSubscriptionsAsync();
+        }
+
+        private async Task RefreshSubscriptionsAsync()
+        {
+            try
+            {
+                _setSubInfo(await SubscriptionView.LoadAsync());
+                _setSubProfiles(await SubscriptionManager.ListAsync());
+                _setSubActive(await SubscriptionManager.GetActiveAsync());
+            }
+            catch (Exception ex)
+            {
+                _setActionHint($"刷新订阅失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>把只读列表投影成字符串列表（UI 的 TextBlock 只吃字符串）。</summary>
+        private static List<string> ToList<T>(IReadOnlyList<T> src, Func<T, string> project)
+        {
+            var list = new List<string>(src.Count);
+            foreach (T item in src) list.Add(project(item));
+            return list;
         }
 
         /// <summary>活动连接：目标 / 链路 / 上下行。</summary>

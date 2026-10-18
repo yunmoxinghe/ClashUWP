@@ -1,0 +1,550 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+
+using Windows.Storage;
+
+using ClashUWP.Backend.Mihomo;
+using ClashUWP.Vpn;
+
+namespace ClashUWP.Backend
+{
+    /// <summary>
+    /// 【后端 · 订阅管理器】G1 缺口的第一块落地：从 URL 拉订阅、落盘、更新、多 profile。
+    ///
+    /// 【★ 为什么必须做这个】
+    ///   在此之前 <c>LocalState\config.yaml</c> <b>只能靠手工放进去</b>（10-16 06:00 那份就是）。
+    ///   插件侧 <c>ClashVpnPlugin.LoadMihomoConfig</c> 会读它，但<b>没有任何代码路径能产生或更新它</b>
+    ///   ⇒ 用户想换订阅只能连桌面手动拷文件。这是 Docs/12 §5 的 G1，第一号缺口。
+    ///
+    /// 【存储形态（刻意从简）】
+    ///   · 订阅 URL 存在 <c>LocalState\settings.txt</c> 的 <c>subUrl=</c> 一行（与既有开关同一文件、
+    ///     同一"键=值"行式格式，<see cref="AppSettings"/> 那套解析直接复用）；
+    ///   · 拉下来的正文写 <c>LocalState\subscriptions\{profileId}.yaml</c>；
+    ///   · <b>当前生效的那份</b>另存一份到 <c>LocalState\config.yaml</c> —— 因为插件侧
+    ///     <c>LoadMihomoConfig</c> 只认这个固定文件名（见那里的注释），改它要动组件侧，
+    ///     而组件侧改名涉及热重载/指纹一整套，这一轮不碰。
+    ///
+    /// 【★ 为什么用"复制"而不是"让插件读 subscriptions\{id}.yaml"】
+    ///   单变量原则：这一轮只加"能换订阅"，不改插件侧任何行为。
+    ///   插件侧读什么文件、怎么算指纹、怎么热重载，全都是已实测立住的（Docs/08/09/12），
+    ///   动它就要重跑一整轮数据面验证。复制一份是零风险的接法。
+    ///
+    /// 【★ 拉取必须走系统代理（与 MihomoController 相反）】
+    ///   <c>MihomoController</c> 那边 <c>UseProxy=false</c> 是硬约束（否则请求被自己下发的代理劫走）。
+    ///   这边<b>正相反</b>：订阅 URL 是公网地址，而隧道还没建 / 或用户在墙内，
+    ///   走系统代理才是能拉到的那条路。两边的差异写在各自注释里，别"统一"掉。
+    ///
+    /// 【★ 多 profile 是"多个文件"，不是"多个对象"】
+    ///   刻意不做数据库/索引/JSON 清单：profile 数量是个位数，目录列一遍就够。
+    ///   加一层持久化结构等于给"删文件"和"列表"两件事引入同步问题。
+    /// </summary>
+    internal static class SubscriptionManager
+    {
+        /// <summary>订阅正文存放目录（相对 LocalFolder）。</summary>
+        internal const string DirName = "subscriptions";
+
+        /// <summary>插件侧认的那个固定文件名（见 <c>ClashVpnPlugin.LoadMihomoConfig</c>）。</summary>
+        internal const string ActiveName = "config.yaml";
+
+        /// <summary>settings.txt 里存订阅 URL 的键。</summary>
+        internal const string UrlKey = "subUrl";
+
+        /// <summary>settings.txt 里存"当前 profile id"的键。</summary>
+        internal const string ActiveKey = "subActive";
+
+        internal sealed record Result(bool Ok, string Message, string? ProfileId = null);
+
+        internal sealed record Profile(
+            string Id,
+            string Url,
+            DateTime FetchedAt,
+            long SizeBytes,
+            int NodeCount,
+            int RuleCount);
+
+        // ── 拉取 ──────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// 拉一个订阅 URL，落成一份 profile，并（可选）立即设为生效。
+        /// ★ 返回的 Message 是<b>给人看的原文</b>，失败时带 HTTP 状态码或异常类型 ——
+        ///   UI 与 CLI 都直接显示它，不再包一层。
+        /// </summary>
+        internal static async Task<Result> FetchAsync(string url, bool activate)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+                return new Result(false, "订阅 URL 不能为空");
+
+            url = url.Trim();
+            if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ||
+                (uri.Scheme != "http" && uri.Scheme != "https"))
+                return new Result(false, $"不是合法的 http/https URL: {url}");
+
+            string text;
+            try
+            {
+                using var http = new HttpClient(
+                    new HttpClientHandler { UseProxy = true, AllowAutoRedirect = true });
+                http.Timeout = TimeSpan.FromSeconds(30);
+
+                // ★ 带 UA：部分机场对无 UA 的请求直接 403。
+                using var req = new HttpRequestMessage(HttpMethod.Get, uri);
+                // ★【1.0.62 实测】部分机场还按 UA 里的产品标识返回不同格式：
+                //   starlink.aliyundeepsearch.sbs 对 "ClashUWP/1.0" 返回 base64（v2ray 正文，
+                //   被下面的形态校验判成"不像 Clash 订阅"），带 "Clash.meta/1.16.0" 才回 YAML；
+                //   同 URL 单变量实测：ClashUWP/1.0→base64、Clash.meta/1.16.0→YAML、
+                //   组合 "ClashUWP/1.0 Clash.meta/1.16.0"→YAML。故保留自身标识并附一个
+                //   通用 Clash 产品标识（本内核就是 mihomo/Clash.meta 系，不算冒充）。
+                req.Headers.TryAddWithoutValidation("User-Agent", "ClashUWP/1.0 Clash.meta/1.16.0");
+                using var resp = await http.SendAsync(req);
+                int code = (int)resp.StatusCode;
+                if (!resp.IsSuccessStatusCode)
+                    return new Result(false, $"拉取失败 HTTP {code}（{uri.Host}）");
+
+                text = await resp.Content.ReadAsStringAsync();
+            }
+            catch (Exception ex)
+            {
+                return new Result(false, $"拉取异常: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            if (string.IsNullOrWhiteSpace(text))
+                return new Result(false, "订阅内容为空");
+
+            // ★ 最基本的形态校验：至少得有 proxies 或 proxies-providers 之一。
+            //   不做完整 YAML 校验（那会把"机场换了格式"误判成"拉取失败"），
+            //   只挡掉"拉到的是登录页/错误页"这种最常见的坑。
+            if (!text.Contains("proxies") && !text.Contains("proxies-providers"))
+                return new Result(false, "内容不像 Clash 订阅（找不到 proxies/proxies-providers）");
+
+            string id = MakeId(url);
+            try
+            {
+                await EnsureDirAsync();
+                string path = PathFor(id);
+                await WriteAllTextAsync(path, text);
+
+                await SetUrlAsync(id, url);
+                // ★【1.0.62】为该订阅注册一个独立的系统 VPN profile（快速设置面板原生列出、
+                //   点哪个连哪个）。无论是否立即启用都注册 —— 拉过的订阅都应在快速设置里可切。
+                await VpnProfileSetup.EnsureSubscriptionProfileAsync(id, HostOf(url));
+                var info = SubscriptionView.Parse(text, text.Length, DateTime.Now);
+                if (activate)
+                {
+                    await SetActiveAsync(id);
+                    // ★ UX 对齐 Verge：拉取并启用后原地热重载，不必断重连。
+                    var reload = await ReloadActiveConfigAsync();
+                    return new Result(true,
+                        $"已拉取 {info.NodeCount} 节点 / {info.RuleCount} 规则（{info.SizeBytes / 1024.0:F1} KB）　{reload.Message}",
+                        id);
+                }
+                return new Result(true,
+                    $"已拉取 {info.NodeCount} 节点 / {info.RuleCount} 规则（{info.SizeBytes / 1024.0:F1} KB）（未启用）",
+                    id);
+            }
+            catch (Exception ex)
+            {
+                return new Result(false, $"落盘失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // ── 切换 / 更新 ───────────────────────────────────────────────────
+
+        /// <summary>
+        /// 把某份 profile 设为生效 = 复制到 <c>config.yaml</c>。
+        /// ★ 不重启内核：内核是常驻的，改了文件它不知道（这正是 1.0.49 加 <c>reload</c>
+        ///   命令的原因）。所以这里只负责"文件就位"，由调用方决定要不要 reload。
+        /// </summary>
+        internal static async Task<Result> ActivateAsync(string id)
+        {
+            string src = PathFor(id);
+            if (!await ExistsAsync(src))
+                return new Result(false, $"profile 不存在: {id}");
+
+            try
+            {
+                string text = await ReadAllTextAsync(src);
+                await WriteAllTextAsync(ActiveName, text);
+                await SetActiveAsync(id);
+                var info = SubscriptionView.Parse(text, text.Length, DateTime.Now);
+                // ★ UX 对齐 Verge：切到即原地热重载（连接中），未连接时保证文件就位、下次连接生效。
+                var reload = await ReloadActiveConfigAsync();
+                // ★【1.0.62】该订阅的 profile 已在 fetch 时注册；这里确保显示名与生效态一致（幂等）。
+                var (_, url) = await GetActiveAsync();
+                var reg = await VpnProfileSetup.EnsureSubscriptionProfileAsync(id, HostOf(url));
+                return new Result(true,
+                    $"已切到 {id}：{info.NodeCount} 节点 / {info.RuleCount} 规则　{reload.Message}　{reg}", id);
+            }
+            catch (Exception ex)
+            {
+                return new Result(false, $"切换失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>按当前生效 profile 的 URL 重新拉一次（"更新订阅"）。</summary>
+        internal static async Task<Result> UpdateActiveAsync()
+        {
+            var (id, url) = await GetActiveAsync();
+            if (id.Length == 0 || url.Length == 0)
+                return new Result(false, "尚未设置订阅 URL（先 fetch 一次）");
+            return await FetchAsync(url, activate: true);
+        }
+
+        // ── 启动对账 / 快速面板回填（1.0.62）───────────────────────────────
+
+        /// <summary>
+        /// ★【1.0.62】给<b>已经拉过、但还没有系统 profile</b>的订阅补注册。
+        ///
+        /// 【为什么必须有这一步】系统 profile 只在 <see cref="FetchAsync"/>/
+        /// <see cref="ActivateAsync"/> 时注册，而订阅往往是<b>升级前</b>就拉好的
+        /// （1.0.59 就能 fetch）。不补这一下，升级到 1.0.62 后快速设置面板里
+        /// 依然是空的 —— 功能等于没上线。
+        /// 【幂等且便宜】已有系统 profile 的只读回查（<c>HasSubscriptionProfileAsync</c>），
+        /// 不重复 Add；结果进日志，每次启动一眼能看出补了几条、有没有失败。
+        /// 【不碰隧道】只写系统 profile 列表，不连接、不改 config.yaml。
+        /// </summary>
+        internal static async Task<string> SyncSystemProfilesAsync()
+        {
+            try
+            {
+                var list = await ListAsync();
+                int added = 0, present = 0;
+                foreach (var p in list)
+                {
+                    if (await VpnProfileSetup.HasSubscriptionProfileAsync(p.Id)) { present++; continue; }
+                    var reg = await VpnProfileSetup.EnsureSubscriptionProfileAsync(p.Id, HostOf(p.Url));
+                    if (reg.Contains("注册=Ok")) added++;
+                    RollingLog.Info("profile-sub-sync", reg);
+                }
+                string msg = $"启动对账：订阅 {list.Count} 份，系统profile 已就位 {present}，新补 {added}";
+                if (list.Count > 0) RollingLog.Info("profile-sub-sync", msg);
+                return msg;
+            }
+            catch (Exception ex)
+            {
+                // 对账失败不该影响启动（面板少几条，fetch/activate 时还会再补）。
+                RollingLog.Warn("profile-sub-sync", $"失败: {ex.GetType().Name}: {ex.Message}");
+                return $"启动对账失败: {ex.GetType().Name}: {ex.Message}";
+            }
+        }
+
+        /// <summary>
+        /// ★【1.0.62】<b>快速面板切了订阅</b> → 前台把账跟上。
+        ///
+        /// 【触发方】MainComponent 的 3 秒轮询发现「已连接的那条 profile 带的 subId ≠ 当前生效 id」。
+        /// 隧道里跑的已经是那份订阅（插件自己读的 subscriptions\{id}.yaml），
+        /// 这里只补<b>书本账</b>：正文复制到 config.yaml + 记住生效 id，
+        /// 否则 UI 的「生效中」「更新当前订阅」「重新加载配置」全都还冲着旧订阅。
+        ///
+        /// 【★ 刻意不做的事】
+        ///   · 不热重载：内核跑的就是这份配置，再 PUT 一遍是无谓动作；
+        ///   · 不调 EnsureSubscriptionProfileAsync：profile 此刻正连着，
+        ///     对活动连接对象再 Add 一次没有实测背书，绝不在线上做。
+        /// </summary>
+        internal static async Task<Result> AdoptAsync(string id)
+        {
+            string src = PathFor(id);
+            if (!await ExistsAsync(src))
+                return new Result(false, $"订阅正文缺失，无法跟进: {id}");
+
+            try
+            {
+                string text = await ReadAllTextAsync(src);
+                var before = await GetActiveAsync();
+                // ★【1.0.63】幂等短路：已生效就是这份 ⇒ 不再重复写（SetActive 是追加式，
+                //   每 3 秒追一行 settings.txt 纯属噪音；且 config.yaml 被内核短暂占着时
+                //   1.0.62 实测会刷 COMException 失败行）。写之前已 set 过才可能到这，
+                //   所以跳过是安全的。
+                if (string.Equals(before.Id, id, StringComparison.OrdinalIgnoreCase))
+                    return new Result(true, $"生效订阅已是 {id}，无需回填", id);
+                await WriteAllTextAsync(ActiveName, text);
+                await SetActiveAsync(id);
+                RollingLog.Info("profile-sub-adopt",
+                    $"快速面板连接的订阅 {id} 与生效 {before.Id} 不同，已回填 config.yaml 并记为生效");
+                return new Result(true, $"已跟进快速面板的切换 → {id}");
+            }
+            catch (Exception ex)
+            {
+                return new Result(false, $"回填失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // ── 切/更新后原地热重载（UX 对齐 Verge）──────────────────────────
+
+        /// <summary>
+        /// 【UX 对齐 Verge】切/更新订阅后，生成内核实际读取的那份配置并热重载，
+        /// 让新订阅<b>原地生效、不必断重连</b>。
+        /// ★ 内核未连接时只保证文件就位（下次 Connect 自动加载），返回明确的"未连接"提示，
+        ///   不会把"没热重载"伪装成失败。
+        /// ★ 改写逻辑全部在 Vpn 组件内（<see cref="ClashUWP.Vpn.SubscriptionReload"/>），
+        ///   本方法只负责"拿路径 → PUT /configs"，不重复实现 transform。
+        /// </summary>
+        internal static async Task<Result> ReloadActiveConfigAsync()
+        {
+            try
+            {
+                string? path = ClashUWP.Vpn.SubscriptionReload.RegenerateEffectiveFile();
+                if (string.IsNullOrEmpty(path))
+                    return new Result(false, "没有可重载的生效配置（config.yaml 不存在）");
+
+                // 先探内核是否在跑：在跑才热重载，否则只保证文件就位（下次连接生效）。
+                if (!await IsKernelUpAsync())
+                    return new Result(true, "新订阅已落盘（内核未连接，下次连接自动加载）");
+
+                string reload = await MihomoController.RunReloadAsync(path);
+                return new Result(true, "已热重载内核: " + reload);
+            }
+            catch (Exception ex)
+            {
+                return new Result(false, $"热重载失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>内核 REST（127.0.0.1:9090）是否可达；2 秒超时，任何异常都算"没在跑"。</summary>
+        private static async Task<bool> IsKernelUpAsync()
+        {
+            try
+            {
+                using var http = MihomoController.NewLoopbackClient(2);
+                using var resp = await http.GetAsync("http://127.0.0.1:9090/version");
+                return resp.IsSuccessStatusCode;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>删一份 profile。★ 不许删当前生效的那份（删了 config.yaml 还在，会不同步）。</summary>
+        internal static async Task<Result> DeleteAsync(string id)
+        {
+            var (activeId, _) = await GetActiveAsync();
+            if (string.Equals(id, activeId, StringComparison.OrdinalIgnoreCase))
+                return new Result(false, "不能删当前生效的订阅（先切到别的）");
+
+            string path = PathFor(id);
+            if (!await ExistsAsync(path))
+                return new Result(false, $"profile 不存在: {id}");
+
+            try
+            {
+                var file = await GetFileAsync(path);
+                if (file != null) await file.DeleteAsync();
+                await ClearUrlAsync(id);
+                // ★【1.0.62】顺手清掉该订阅在快速设置里的 profile，避免留幽灵条目。
+                var reg = await VpnProfileSetup.RemoveSubscriptionProfileAsync(id);
+                return new Result(true, $"已删除 {id}（{reg}）");
+            }
+            catch (Exception ex)
+            {
+                return new Result(false, $"删除失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // ── 列表 ──────────────────────────────────────────────────────────
+
+        internal sealed record ActiveInfo(string Id, string Url);
+
+        /// <summary>当前生效的 profile id 与它的 URL。</summary>
+        internal static async Task<ActiveInfo> GetActiveAsync()
+        {
+            var kv = await ReadSettingsAsync();
+            string id = kv.TryGetValue(ActiveKey, out string? a) ? a : "";
+            string url = id.Length > 0 && kv.TryGetValue(UrlKey + ":" + id, out string? u) ? u : "";
+            return new ActiveInfo(id, url);
+        }
+
+        /// <summary>
+        /// 列出所有 profile（按拉取时间倒序）。
+        /// ★ 时间戳取<b>文件 mtime</b>，不另存元数据 —— 少一份要同步的状态。
+        /// </summary>
+        internal static async Task<List<Profile>> ListAsync()
+        {
+            var result = new List<Profile>();
+            var kv = await ReadSettingsAsync();
+
+            StorageFolder? dir = await GetFolderAsync(DirName);
+            if (dir == null) return result;
+
+            IReadOnlyList<StorageFile> files;
+            try { files = await dir.GetFilesAsync(); }
+            catch { return result; }
+
+            foreach (StorageFile f in files)
+            {
+                string id = Path.GetFileNameWithoutExtension(f.Name);
+                string url = kv.TryGetValue(UrlKey + ":" + id, out string? u) ? u : "";
+
+                long size = 0;
+                DateTime mtime = DateTime.MinValue;
+                int nodes = 0, rules = 0;
+                try
+                {
+                    var props = await f.GetBasicPropertiesAsync();
+                    size = (long)props.Size;
+                    mtime = props.DateModified.DateTime;
+
+                    // ★ 元信息靠现成的 SubscriptionView，不再写第二套解析。
+                    string text = await FileIO.ReadTextAsync(f);
+                    var info = SubscriptionView.Parse(text, size, mtime);
+                    nodes = info.NodeCount;
+                    rules = info.RuleCount;
+                }
+                catch
+                {
+                    // 读不了一份也不能让整份列表失败，那份就显示成 0 节点。
+                }
+
+                result.Add(new Profile(id, url, mtime, size, nodes, rules));
+            }
+
+            result.Sort((a, b) => b.FetchedAt.CompareTo(a.FetchedAt));
+            return result;
+        }
+
+        // ── settings.txt 读写（与 AppSettings 同一文件、同一格式）───────────
+
+        /// <summary>
+        /// 读 settings.txt 的"键=值"行。★ 只读我们这两个键，别的键原样留着 ——
+        /// 这个文件同时被 <c>LocalSettings</c>（组件侧）和 <c>AppSettings</c>（前台）用，
+        /// 谁都不能把它整个覆写掉。
+        /// </summary>
+        private static async Task<Dictionary<string, string>> ReadSettingsAsync()
+        {
+            var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+            try
+            {
+                StorageFile? f = await LocalState.TryGetFileAsync("settings.txt");
+                if (f == null) return dict;
+                string text = await LocalState.ReadTextAsync(f);
+                foreach (string line in text.Replace("\r\n", "\n").Split('\n'))
+                {
+                    string t = line.Trim();
+                    if (t.Length == 0 || t.StartsWith("#")) continue;
+                    int eq = t.IndexOf('=');
+                    if (eq <= 0) continue;
+                    dict[t.Substring(0, eq).Trim()] = t.Substring(eq + 1).Trim();
+                }
+            }
+            catch { /* 读不到就当没有，不影响调用方做别的事 */ }
+            return dict;
+        }
+
+        /// <summary>
+        /// 往 settings.txt 追一行 <c>key=value</c>。
+        /// ★ 追加而不是重写：那两位（LocalSettings/AppSettings）各写各的键，
+        ///   重写必然发生"后写的把先写的冲掉"。追加的代价是同键会出现多行 ——
+        ///   读取时<b>后一行胜出</b>（<see cref="ReadSettingsAsync"/> 的循环天然如此），
+        ///   所以语义上等价于"更新"。
+        /// </summary>
+        private static async Task AppendSettingAsync(string key, string value)
+        {
+            try
+            {
+                await LocalState.AppendTextAsync("settings.txt", $"{key}={value}\n");
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"写 settings.txt 失败: {ex.Message}", ex);
+            }
+        }
+
+        private static Task SetUrlAsync(string id, string url) => AppendSettingAsync($"{UrlKey}:{id}", url);
+        private static Task SetActiveAsync(string id) => AppendSettingAsync(ActiveKey, id);
+        private static Task ClearUrlAsync(string id) => Task.CompletedTask;   // URL 留着无害，删文件即可
+
+        /// <summary>读某份 profile 的 URL（settings.txt 的 <c>subUrl:{id}</c> 行）。</summary>
+        private static async Task<string> GetUrlAsync(string id)
+        {
+            var kv = await ReadSettingsAsync();
+            return kv.TryGetValue(UrlKey + ":" + id, out string? u) ? u : "";
+        }
+
+        /// <summary>从 URL 取 host 作为快速设置里 profile 的显示名（比 id 可读）。</summary>
+        private static string HostOf(string url)
+        {
+            if (Uri.TryCreate(url, UriKind.Absolute, out Uri? u))
+                return u.Host;
+            return "";
+        }
+
+        // ── 文件小工具 ────────────────────────────────────────────────────
+
+        /// <summary>由 URL 派生一个稳定的 profile id（同 URL 永远同 id）。</summary>
+        private static string MakeId(string url)
+        {
+            // ★ 不用哈希：可读性优先（用户在列表里看到的是 host+短路径，不是 GUID）。
+            //   冲突（同 host 同 path 不同 query）的概率低到可以忽略，且真冲突了
+            //   表现为"更新了同一份"，不是数据丢失。
+            string raw = "";
+            if (Uri.TryCreate(url, UriKind.Absolute, out Uri? u))
+            {
+                raw = u.Host;
+                string p = u.AbsolutePath.Trim('/');
+                if (p.Length > 0) raw += "-" + p.Replace('/', '-');
+            }
+            // Windows 文件名禁用字符一律换成 '_'，再收敛长度。
+            string clean = new string(raw.Select(ch =>
+                Path.GetInvalidFileNameChars().Contains(ch) ? '_' : ch).ToArray());
+            if (clean.Length > 60) clean = clean.Substring(0, 60);
+            return clean.Length == 0 ? "profile" : clean;
+        }
+
+        private static string PathFor(string id) => $"{DirName}/{id}.yaml";
+
+        private static async Task EnsureDirAsync()
+        {
+            await ApplicationData.Current.LocalFolder
+                .CreateFolderAsync(DirName, CreationCollisionOption.OpenIfExists)
+                .AsTask();
+        }
+
+        private static async Task<bool> ExistsAsync(string relativePath)
+            => await LocalState.TryGetFileByRelativePathAsync(relativePath) != null;
+
+        private static async Task<StorageFile?> GetFileAsync(string relativePath)
+            => await LocalState.TryGetFileByRelativePathAsync(relativePath);
+
+        private static async Task<StorageFolder?> GetFolderAsync(string name)
+            => await ApplicationData.Current.LocalFolder.TryGetItemAsync(name) as StorageFolder;
+
+        private static async Task WriteAllTextAsync(string relativePath, string text)
+        {
+            StorageFolder folder = ApplicationData.Current.LocalFolder;
+            if (relativePath.Contains('/'))
+            {
+                folder = await folder.GetFolderAsync(relativePath.Substring(0, relativePath.LastIndexOf('/')));
+            }
+            StorageFile file = await folder.CreateFileAsync(
+                Path.GetFileName(relativePath), CreationCollisionOption.ReplaceExisting);
+            await FileIO.WriteTextAsync(file, text);
+        }
+
+        private static async Task<string> ReadAllTextAsync(string relativePath)
+        {
+            StorageFile? f = await LocalState.TryGetFileByRelativePathAsync(relativePath);
+            return f == null ? "" : await FileIO.ReadTextAsync(f);
+        }
+
+        /// <summary>给人看的一行摘要（UI 与 debug 命令共用）。</summary>
+        internal static string OneLine(List<Profile> profiles, ActiveInfo active)
+        {
+            if (profiles.Count == 0)
+                return "（还没有订阅：用 fetch <URL> 拉一个）";
+
+            var sb = new StringBuilder();
+            sb.Append($"共 {profiles.Count} 份，生效={active.Id}({(active.Url.Length == 0 ? "无URL" : active.Url)})");
+            foreach (var p in profiles)
+            {
+                bool isActive = string.Equals(p.Id, active.Id, StringComparison.OrdinalIgnoreCase);
+                sb.Append($"\n{(isActive ? "▶" : " ")} {p.Id}  {p.NodeCount}节点/{p.RuleCount}规则  " +
+                          $"{p.SizeBytes / 1024.0:F1}KB  {p.FetchedAt:MM-dd HH:mm}");
+            }
+            return sb.ToString();
+        }
+    }
+}

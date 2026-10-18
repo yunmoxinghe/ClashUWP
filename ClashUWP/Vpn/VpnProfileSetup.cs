@@ -232,7 +232,12 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
-        /// 「连接 VPN」按钮。<b>只连接，不建 profile</b> —— 与官方 sample 的分工一致。
+        /// 「连接 VPN」按钮 / 快速设置点某条订阅。<b>只连接，不建 profile</b> —— 与官方 sample 的分工一致。
+        ///
+        /// ★【1.0.62】<paramref name="subId"/> 非空时连<b>该订阅专属</b>的 profile
+        ///   （<c>ClashUWP · xxx</c>，CustomConfiguration 带 subId）；为空时连基础 profile
+        ///   <c>ClashUWP</c>（读 config.yaml 生效副本）。两条路都走系统
+        ///   <c>ConnectProfileAsync</c> → 平台 → <c>IVpnPlugIn.Connect</c>。
         ///
         /// ★ <c>ConnectProfileAsync</c> 返回 <c>Ok</c> 只代表「平台接受了这个请求」，
         ///   不代表隧道真的建立。之前调用方把 Ok 当成已连接，于是连接失败时
@@ -241,11 +246,17 @@ namespace ClashUWP.Vpn
         ///   实际上压根没有隧道。这种假绿灯会把整轮排障带到错误的方向上，
         ///   所以这里必须轮询到 profile 的真实状态再返回。
         /// </summary>
-        public static async Task<string> ConnectAsync()
+        public static async Task<string> ConnectAsync(string? subId = null)
         {
-            VpnPlugInProfile? target = await FindOurProfileAsync();
+            Func<Task<VpnPlugInProfile?>> finder = subId == null
+                ? (Func<Task<VpnPlugInProfile?>>)FindOurProfileAsync
+                : () => FindProfileBySubIdAsync(subId);
+
+            VpnPlugInProfile? target = await finder();
             if (target == null)
-                return "找不到我们的 profile，请先点「建/重建 profile」";
+                return subId == null
+                    ? "找不到我们的 profile，请先点「建/重建 profile」"
+                    : $"找不到订阅 profile（subId={subId}），请先拉取并启用该订阅";
 
             var sb = new StringBuilder();
             sb.Append($"[{target.ProfileName}] 发起前状态={target.ConnectionStatus}, ");
@@ -259,7 +270,7 @@ namespace ClashUWP.Vpn
             for (int i = 0; i < 20; i++)
             {
                 await Task.Delay(1000);
-                VpnPlugInProfile? fresh = await FindOurProfileAsync();
+                VpnPlugInProfile? fresh = await finder();
                 if (fresh == null) { now = "Profile缺失"; break; }
                 now = fresh.ConnectionStatus.ToString();
                 if (now != "Connecting" && now != "Waiting") break;
@@ -270,16 +281,165 @@ namespace ClashUWP.Vpn
             return sb.ToString();
         }
 
+        /// <summary>
+        /// ★【1.0.62】为一条订阅注册/更新一个独立的系统 VPN profile，
+        /// 让 Windows 快速设置 VPN 面板里<b>原生列出该订阅</b>、点哪个连哪个。
+        ///
+        /// profile 名 = <c>"ClashUWP · {displayName}"</c>，<c>CustomConfiguration</c> 带
+        /// &lt;subId&gt;（插件 Connect 据此读 <c>subscriptions/{subId}.yaml</c>）。
+        /// <see cref="RequireVpnClientAppUI"/>=true ⇒ 出现在系统 VPN UI（含快速设置）；
+        /// <see cref="AlwaysOn"/>=false ⇒ 不自动连，避免调试时甩不掉。
+        /// <b>幂等</b>：已存在则更新 CustomConfiguration（订阅正文可能变了）。
+        /// </summary>
+        public static async Task<string> EnsureSubscriptionProfileAsync(string subId, string? displayName = null)
+        {
+            if (string.IsNullOrWhiteSpace(subId))
+                return "EnsureSubscriptionProfile: subId 为空，跳过";
+
+            string name = "ClashUWP · " + (string.IsNullOrWhiteSpace(displayName) ? subId : displayName);
+
+            VpnPlugInProfile? existing = await FindProfileBySubIdAsync(subId);
+            var pluginProfile = existing ?? new VpnPlugInProfile
+            {
+                VpnPluginPackageFamilyName = PackageFamilyName,
+                RequireVpnClientAppUI = true,
+                AlwaysOn = false,
+            };
+            pluginProfile.ProfileName = name;
+            pluginProfile.CustomConfiguration = new VpnPluginConfig { SubId = subId }.ToXml();
+
+            string server = await ReadProfileServerOverrideAsync();
+            pluginProfile.ServerUris.Clear();
+            pluginProfile.ServerUris.Add(new Uri(server));
+
+            VpnManagementErrorStatus r = await Agent.AddProfileFromObjectAsync(pluginProfile);
+            string report = $"订阅profile[{name}] subId={subId} 注册={r}";
+            RollingLog.Info("profile-sub", report);
+            return report;
+        }
+
+        /// <summary>★【1.0.62】按 subId 找我们的订阅 profile：遍历同 PFN 的 profile，解析 CustomConfiguration 里的 subId。</summary>
+        private static async Task<VpnPlugInProfile?> FindProfileBySubIdAsync(string subId)
+        {
+            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            foreach (IVpnProfile p in profiles)
+            {
+                if (p is VpnPlugInProfile pp && pp.VpnPluginPackageFamilyName == PackageFamilyName)
+                {
+                    if (VpnPluginConfig.Parse(pp.CustomConfiguration).SubId == subId)
+                        return pp;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// ★【1.0.62】该订阅的系统 profile 是否<b>已就位</b>（纯读，不写）。
+        /// 启动对账用：老版本拉过的订阅没有系统 profile，升级后要补注册；
+        /// 但补注册不该每次启动都对已就位的 profile 再 Add 一遍 ——
+        /// AddProfileFromObjectAsync 对已存在对象的返回语义没有实测背书，
+        /// 能不调就不调（要改配置走 <see cref="EnsureSubscriptionProfileAsync"/> 那条显式路径）。
+        /// </summary>
+        public static async Task<bool> HasSubscriptionProfileAsync(string subId)
+            => !string.IsNullOrWhiteSpace(subId) && await FindProfileBySubIdAsync(subId) != null;
+
+        /// <summary>
+        /// ★【1.0.62】删一条订阅的 profile（订阅被删除时清理，避免快速设置里留幽灵条目）。
+        /// 走 <see cref="GracefulTeardown"/> 那道断网闸：会话收不干净就<b>拒绝删除</b>，
+        /// 绝不拿网卡赌一次（与 DeleteOurProfileAsync 同一纪律）。
+        /// </summary>
+        public static async Task<string> RemoveSubscriptionProfileAsync(string subId)
+        {
+            VpnPlugInProfile? p = await FindProfileBySubIdAsync(subId);
+            if (p == null)
+                return $"订阅profile 不存在(subId={subId})，无需删除";
+
+            (bool ok, string report) = await GracefulTeardown.EnsureTornDownAsync(p);
+            if (!ok)
+                return $"订阅profile 会话未收干净，拒绝删除（{report}）";
+            await Agent.DeleteProfileAsync(p);
+            string r = $"订阅profile 已删除(subId={subId})";
+            RollingLog.Info("profile-sub", r);
+            return r;
+        }
+
+        /// <summary>
+        /// ★【1.0.62】找"当前已连接"的那条我们的 profile（基础或某条订阅），
+        /// 供断开/状态兜底用。排除探测 profile（ClashUWP-Probe / ClashUWP-Dataface）。
+        /// 没连着的就回基础 profile。
+        /// </summary>
+        private static async Task<VpnPlugInProfile?> FindConnectedProfileAsync()
+        {
+            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            VpnPlugInProfile? baseProfile = null;
+            foreach (IVpnProfile p in profiles)
+            {
+                if (p is VpnPlugInProfile pp && pp.VpnPluginPackageFamilyName == PackageFamilyName)
+                {
+                    if (pp.ProfileName == "ClashUWP-Probe" || pp.ProfileName == "ClashUWP-Dataface")
+                        continue;
+                    if (pp.ProfileName == ProfileName) baseProfile = pp;
+                    if (pp.ConnectionStatus.ToString() == "Connected")
+                        return pp;
+                }
+            }
+            return baseProfile;
+        }
+
         /// <summary>我们 profile 的当前连接状态文本；profile 不存在返回 "Profile缺失"。</summary>
         public static async Task<string> OurStatusAsync()
         {
-            VpnPlugInProfile? p = await FindOurProfileAsync();
+            VpnPlugInProfile? p = await FindConnectedProfileAsync();
             return p == null ? "Profile缺失" : p.ConnectionStatus.ToString();
+        }
+
+        /// <summary>
+        /// ★【1.0.62】当前<b>已连接</b>的那条 profile 携带的订阅 id。
+        /// 空串 = 没连着、或连的是基础 profile（ClashUWP，读 config.yaml）。
+        ///
+        /// 【为什么前台需要它】快速设置里点的连接不经我们的按钮，前台没有任何回调；
+        /// 3 秒轮询拿到的除了状态还得有<b>连的是哪条订阅</b>，否则用户在快速面板切了订阅，
+        /// app 的「生效中 / 更新当前订阅」还停在旧那份（bookkeeping 与隧道分叉）。
+        /// 【刻意只在 Connected 时给值】Connecting/Waiting 期间就改生效态，
+        /// 会把"尝试连接"当成"已切换"。
+        /// </summary>
+        public static async Task<string> ConnectedSubIdAsync()
+        {
+            VpnPlugInProfile? p = await FindConnectedProfileAsync();
+            if (p == null || p.ConnectionStatus.ToString() != "Connected")
+                return "";
+            return VpnPluginConfig.Parse(p.CustomConfiguration).SubId;
+        }
+
+        /// <summary>
+        /// ★【1.0.62】列出<b>我们这个包</b>的全部 VPN profile（名称 / 订阅 id / 是否进系统 UI / 状态）。
+        /// 纯读，用于核验「快速设置 VPN 面板里会出现哪几条」——
+        /// <see cref="VpnPlugInProfile.RequireVpnClientAppUI"/>=True 就是官方说的
+        /// "appears in the system's VPN connection UI"，这是不点 UI 也能拿到的判据。
+        /// 探测残留（Probe/Dataface）一并列出但打标记 —— 它们同属本包，藏起来反而骗自己。
+        /// </summary>
+        public static async Task<string> ListOurProfilesAsync()
+        {
+            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            var sb = new StringBuilder();
+            int n = 0;
+            foreach (IVpnProfile p in profiles)
+            {
+                if (p is not VpnPlugInProfile pp || pp.VpnPluginPackageFamilyName != PackageFamilyName)
+                    continue;
+                n++;
+                string subId = VpnPluginConfig.Parse(pp.CustomConfiguration).SubId;
+                bool probe = pp.ProfileName is "ClashUWP-Probe" or "ClashUWP-Dataface";
+                sb.Append($"\n{(probe ? "[探测残留] " : "")}{pp.ProfileName} | " +
+                          $"subId={(subId.Length == 0 ? "(基础)" : subId)} | " +
+                          $"系统UI={pp.RequireVpnClientAppUI} | 状态={pp.ConnectionStatus}");
+            }
+            return n == 0 ? "本包名下没有任何 profile" : $"共 {n} 条：{sb}";
         }
 
         public static async Task<string> DisconnectAsync()
         {
-            VpnPlugInProfile? profile = await FindOurProfileAsync();
+            VpnPlugInProfile? profile = await FindConnectedProfileAsync();
             if (profile == null)
                 return "找不到我们的 profile";
 

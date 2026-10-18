@@ -30,12 +30,20 @@ namespace ClashUWP.Backend
         /// 连接主 profile（全路由）。
         /// ★ 先武装健康哨兵再连接：即使连接卡死/异常，哨兵的硬上限到点也必然断开，
         ///   网络绝不会被长期占死。
+        /// ★【1.0.62】<paramref name="subId"/> 非空时连<b>该订阅专属</b>的系统 profile ——
+        ///   与用户在快速设置里点那条订阅走的是<b>完全同一条</b>平台路径
+        ///   （ConnectProfileAsync → 平台 → IVpnPlugIn.Connect），差别只是发起者是我们。
+        ///   快速面板本身没法自动化点（系统 UI），这条入口就是它的自动化等价物：
+        ///   同一 profile、同一 CustomConfiguration、同一插件读配置逻辑。
+        ///   哨兵照常武装 —— 订阅 profile 同样是 0.0.0.0/0 全路由。
         /// </summary>
-        internal static async Task<string> ConnectAsync()
+        internal static async Task<string> ConnectAsync(string? subId = null)
         {
             HealthMonitor.Arm();
-            RollingLog.Info("session", "用户发起连接（已先武装健康哨兵）");
-            return await VpnProfileSetup.ConnectAsync();
+            RollingLog.Info("session", subId == null
+                ? "用户发起连接（已先武装健康哨兵）"
+                : $"用户发起订阅连接 subId={subId}（已先武装健康哨兵）");
+            return await VpnProfileSetup.ConnectAsync(subId);
         }
 
         /// <summary>断开主 profile（恢复网络的兜底手段），并解除哨兵。</summary>
@@ -45,5 +53,24 @@ namespace ClashUWP.Backend
             RollingLog.Info("session", "用户发起断开（已解除健康哨兵）");
             return await VpnProfileSetup.DisconnectAsync();
         }
+
+        /// <summary>
+        /// 只读当前 profile 的连接状态文本（"Connected"/"Disconnected"/"Connecting"…）。
+        ///
+        /// ★★★ 这是修复「快速面板（系统 VPN 快速设置）点了连接、app 里没反应 / 没回调」的关键：
+        /// 系统快速设置发起的连接走的是 <c>VpnManagementAgent.ConnectProfileAsync</c> → 平台
+        /// → <c>IVpnPlugIn.Connect</c>（vpnClient 后台任务），<b>前台 app 完全不参与、也不被激活</b>。
+        /// UWP 前台<b>没有</b>任何 VPN 连接状态变更事件（<c>VpnChannel.ActivityChange</c> 只在
+        /// 插件进程内有效，前台订阅不到；<c>VpnManagementAgent</c> 也没有 StatusChanged 事件），
+        /// 所以前台只能<b>主动轮询</b>这份状态来反映系统驱动的连接/断开。
+        /// 本方法就是那个轮询读数入口，由 MainComponent 的 3 秒循环调用。
+        /// </summary>
+        internal static Task<string> StatusAsync() => VpnProfileSetup.OurStatusAsync();
+
+        /// <summary>
+        /// 当前<b>已连接</b>的订阅 id（空串 = 没连着 / 连的是基础 profile）。
+        /// 由 MainComponent 的 3 秒轮询调用：快速面板切了订阅，前台要能自己跟上。
+        /// </summary>
+        internal static Task<string> ConnectedSubAsync() => VpnProfileSetup.ConnectedSubIdAsync();
     }
 }
