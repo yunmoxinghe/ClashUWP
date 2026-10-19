@@ -950,6 +950,22 @@ namespace ClashUWP.Vpn
         {
             try
             {
+                // ★【1.0.74 · P0】先设错误消息，再终止连接。
+                //   【官方】SetErrorMessage："These error messages will be displayed to the user
+                //     in both the VPN flyout and settings page when we fail to connect."
+                //   不调它 = 用户在系统 VPN 面板看不到任何失败原因，只看到"连接失败"。
+                //   必须在 TerminateConnection 之前调用（顺序不影响功能，但语义上先设消息再终止更清晰）。
+                try
+                {
+                    channel.SetErrorMessage(reason);
+                    LogSession($"evt=set-error-message msg={reason}");
+                }
+                catch (Exception exSet)
+                {
+                    // SetErrorMessage 失败不致命：至少还能终止连接
+                    LogSession($"evt=set-error-message-failed err={exSet.GetType().Name}: {exSet.Message}");
+                }
+
                 channel.TerminateConnection(reason);
                 LogSession($"evt=terminate-connection reason={reason}");
             }
@@ -2193,6 +2209,32 @@ namespace ClashUWP.Vpn
                     {
                         // NotifyStatus 失败不致命：隧道已能工作，只是系统可能不显示盾标
                         RollingLog.Warn("notify-status", $"NotifyStatus 调用失败: {notifyEx.Message}");
+                    }
+
+                    // ★【1.0.74 · P1】检查系统健康状态（Statement of Health）。
+                    //   【官方】SystemHealth："Gets the statement of health for the VPN connection."
+                    //   企业/MDM 场景下，平台会要求设备符合某些合规策略（如防火墙开启、杀毒软件运行），
+                    //   不符合时返回 Statement of Health blob，插件应把它发给服务器做二次校验。
+                    //   ClashUWP 是个人用户场景，不发也没关系，但读一下留日志有助于诊断：
+                    //   如果健康检查失败，可能是 MDM 策略阻止了连接。
+                    try
+                    {
+                        var health = channel.SystemHealth;
+                        if (health != null && health.StatementOfHealth != null)
+                        {
+                            uint blobLen = health.StatementOfHealth.Length;
+                            RollingLog.Info("system-health", $"系统健康检查返回 StatementOfHealth blob（{blobLen} 字节）");
+                            channel.LogDiagnosticMessage($"ClashUWP: SystemHealth 检查通过，blob 长度={blobLen}");
+                        }
+                        else
+                        {
+                            RollingLog.Info("system-health", "系统健康检查通过（无 StatementOfHealth，非 MDM 管理设备）");
+                        }
+                    }
+                    catch (Exception healthEx)
+                    {
+                        // SystemHealth 失败不致命：只是诊断信息，不影响连接本身
+                        RollingLog.Warn("system-health", $"SystemHealth 检查异常: {healthEx.GetType().Name}: {healthEx.Message}");
                     }
                 }
 
