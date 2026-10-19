@@ -19,6 +19,11 @@ dotnet run --project Tools\SubscriptionNameTest
 if errorlevel 1 goto :fail
 
 echo.
+echo === YAML line-shape guards: tolerance / counts / proxy classification / select split / no-outbound (1.0.75) ===
+dotnet run --project Tools\YamlShapeTest
+if errorlevel 1 goto :fail
+
+echo.
 echo ALL OFFLINE TESTS PASSED
 exit /b 0
 

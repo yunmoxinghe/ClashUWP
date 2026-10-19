@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    YAML 行式判据离线夹具（Docs/30 §3）。
+    ★ 不是产品工程、不在解决方案里：dotnet run 即可。
+      直接编译产品的 KernelConfig.cs / AppSplit.cs / DnsConfig.cs /
+      MihomoController.cs / KernelView.cs / SubscriptionView.cs，
+      被测代码与产品逐字同一份；WinRT 存储调用只用编译桩（Stubs.cs），
+      测试从不做 IO —— 测的全是"纯文本进、纯数据出"的那几条判据。
+    ★ 为什么这一份夹具值得存在：本轮修的四处（块写法 tolerance 锁不死、
+      订阅节点数虚高、组名带空格选不动、成员不分组/节点）都是
+      <b>行式解析与分类判据</b>，不需要设备、不需要内核、不碰网络，
+      离线就能钉死；而它们在没有夹具时被"实测一次算一次"地放过了好几版。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>YamlShapeTest</AssemblyName>
+    <NoWarn>$(NoWarn);CS8632;CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\ClashUWP.Vpn\KernelConfig.cs" Link="KernelConfig.cs" />
+    <Compile Include="..\..\ClashUWP.Vpn\AppSplit.cs" Link="AppSplit.cs" />
+    <Compile Include="..\..\ClashUWP.Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
+    <Compile Include="..\..\ClashUWP.Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
+    <Compile Include="..\..\ClashUWP.Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
+    <Compile Include="..\..\ClashUWP\Backend\Mihomo\MihomoController.cs" Link="MihomoController.cs" />
+    <Compile Include="..\..\ClashUWP\Backend\Mihomo\KernelView.cs" Link="KernelView.cs" />
+    <Compile Include="..\..\ClashUWP\Backend\Mihomo\SubscriptionView.cs" Link="SubscriptionView.cs" />
+  </ItemGroup>
+</Project>
