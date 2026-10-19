@@ -19,8 +19,13 @@ namespace ClashUWP.Backend.Mihomo
     ///     （内核给的是驼峰形态）；
     ///   · 延迟取<b>每个节点自己的顶层条目</b>的 <c>history[]</c> 末元素，
     ///     组上的 <c>history</c> 恒为 <c>[]</c>；
-    ///   · 没测过 = <c>-1</c>，<b>显示成"未测"</b>，不显示 0、也不显示"挂了"；
-    ///   · 内置策略名（DIRECT/REJECT/GLOBAL/PASS…）不是组，不列。
+    ///   · 没测过 = <c>-1</c>。★【1.0.75 对齐安卓】UI 这时<b>不显示延迟</b>，
+    ///     而不是显示"未测" —— CMFA 的判据是 <c>if (proxy.delay in 0..Short.MAX_VALUE)</c>
+    ///     才画那颗延迟胶囊，没测过就是没有；把"没有"写成两个字，在一整屏
+    ///     <c>lazy: true</c> 的订阅里只会变成噪音（<c>select</c> 组首连必然全员未测）。
+    ///     文本通道（debug <c>groups</c>）仍写 <c>delay=-</c>，那里要的是可复盘的明确性。
+    ///   · 内置策略名（DIRECT/REJECT/GLOBAL/PASS…）不是组，不列；
+    ///   · <b>成员要带分类</b>（组 / 内置策略 / 真节点），见 <see cref="Member"/>。
     ///
     /// 【为什么每条都自己 try/catch】UI 不能因为一次查询失败就整个白屏 ——
     ///   控制器没起是最常见的情形（内核没连上），那应当是"这一块显示未连接"，不是崩。
@@ -29,10 +34,45 @@ namespace ClashUWP.Backend.Mihomo
     {
         /// <summary>一个可切换的代理组。</summary>
         internal sealed record Group(string Name, string Type, string Now,
-                                    IReadOnlyList<Member> Members);
+                                    IReadOnlyList<Member> Members)
+        {
+            /// <summary>
+            /// 能不能手选：<b>只有 Selector 可以</b> —— 与安卓版一致
+            /// （CMFA 的 <c>PagerFragment</c> 里只有 <c>group.type == "Selector"</c> 才把
+            /// 点行动作接到 <c>patchSelector</c>，url-test / fallback / load-balance
+            /// 是只读页）。自动组的选择由内核测速/故障转移维护，手选会在下一轮被改回去，
+            /// 给一个"点了会自己变回去"的按钮不如说明白它是谁在选。
+            /// ★ 类型名认内核给的驼峰形态，两套写法都收（同 <c>IsSelectableGroupType</c>）。
+            /// </summary>
+            internal bool IsUserSelectable =>
+                Type is "Selector" or "select";
 
-        /// <summary>组里的一个成员（节点）。<see cref="DelayMs"/> 为 -1 表示<b>从没测过</b>。</summary>
-        internal sealed record Member(string Name, long DelayMs);
+            /// <summary>成员里<b>真节点</b>的个数（嵌套组与内置策略不算，安卓口径）。</summary>
+            internal int RealNodeCount
+            {
+                get
+                {
+                    int n = 0;
+                    foreach (Member m in Members)
+                        if (!m.IsGroup && !m.IsBuiltin) n++;
+                    return n;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 组里的一个成员。<see cref="DelayMs"/> 为 -1 表示<b>从没测过</b>。
+        ///
+        /// 【★ 为什么成员要带分类】安卓的分类是内核在 Go 里做好的
+        ///   （<c>convertProxies</c>：能转成 <c>outboundgroup.ProxyGroup</c> 的就是组），
+        ///   前端只负责呈现。我们以前把这层信息丢了 —— 成员表里"嵌套组 / 内置策略 /
+        ///   真节点"三样长得完全一样，还统一显示"未测"，于是"代理组成了节点"。
+        ///   现在把 <c>MihomoController.ReadProxiesTable</c> 的 <c>ByName</c> 带下来，
+        ///   UI 才能照安卓那样给每行一条副标题（组显示 <c>Selector(现值)</c>、
+        ///   节点显示协议类型），并且只对真节点显示延迟。
+        /// </summary>
+        internal sealed record Member(string Name, long DelayMs, string Type,
+                                     bool IsGroup, bool IsBuiltin, string Now);
 
         /// <summary>一条活动连接。</summary>
         internal sealed record Conn(string Target, string Chain, long Upload, long Download);
@@ -87,14 +127,22 @@ namespace ClashUWP.Backend.Mihomo
                     using var http = MihomoController.NewLoopbackClient(10);
                     string json = await http.GetStringAsync("http://127.0.0.1:9090/proxies");
                     using var doc = System.Text.Json.JsonDocument.Parse(json);
-                    var (gs, delay) = MihomoController.ReadProxiesTable(doc.RootElement);
+                    var (gs, delay, byName) = MihomoController.ReadProxiesTable(doc.RootElement);
                     foreach (var g in gs)
                     {
                         var members = new List<Member>(g.Members.Count);
                         foreach (string name in g.Members)
                         {
+                            // ★ 每个成员都去 ByName 查自己的分类；查不到就按"未知节点"处理
+                            //   （Type 空串、不是组、不是策略）—— 宁可少一条副标题，
+                            //   也不要把未知东西当成组藏起来。
+                            byName.TryGetValue(name, out MihomoController.ProxyInfo? info);
                             members.Add(new Member(name,
-                                delay.TryGetValue(name, out long d) ? d : -1L));
+                                delay.TryGetValue(name, out long d) ? d : -1L,
+                                info?.Type ?? "",
+                                info?.IsGroup ?? false,
+                                info?.IsBuiltin ?? false,
+                                info?.Now ?? ""));
                         }
                         groups.Add(new Group(g.Name, g.Type, g.Now, members));
                     }
@@ -153,20 +201,35 @@ namespace ClashUWP.Backend.Mihomo
             return string.Join(" > ", parts);
         }
 
-        /// <summary>连接的目标（host:port 或 host）。</summary>
+        /// <summary>
+        /// 连接的目标（<c>host:port</c>，没 host 才退 <c>IP:port</c>）。
+        ///
+        /// ★【1.0.75 修的一处静默失效】这里原先写的是 <c>GetStr(c, "metadata")</c> 再
+        ///   <c>JsonDocument.Parse</c> 那个字符串 —— 但 <c>metadata</c> 在
+        ///   <c>GET /connections</c> 的原文里是<b>对象</b>不是字符串（官方 API 文档口径），
+        ///   于是 <c>GetStr</c> 恒返回空串，整条"解析 metadata"的分支从来没进过，
+        ///   界面每个连接显示的是 UUID（<c>id</c>）而不是目标。<b>不报错、不崩溃</b>，
+        ///   所以一直没人发现 —— 这正是"UI 别解析文本、要看结构化字段"的又一例。
+        ///   现在按对象取字段，端口两种形态（数字 / 字符串）都读。
+        /// </summary>
         private static string ReadChainLabel(System.Text.Json.JsonElement c)
         {
-            string meta = GetStr(c, "metadata");
-            if (meta.Length > 0)
+            if (c.TryGetProperty("metadata", out var md) &&
+                md.ValueKind == System.Text.Json.JsonValueKind.Object)
             {
-                try
+                string host = GetStr(md, "host");
+                if (host.Length == 0) host = GetStr(md, "sniffHost");
+                if (host.Length == 0) host = GetStr(md, "destinationIP");
+                if (host.Length > 0)
                 {
-                    using var md = System.Text.Json.JsonDocument.Parse(meta);
-                    string host = GetStr(md.RootElement, "host");
-                    string port = GetStr(md.RootElement, "destinationPort");
-                    if (host.Length > 0) return port.Length > 0 ? $"{host}:{port}" : host;
+                    string port = GetStr(md, "destinationPort");
+                    if (port.Length == 0)
+                    {
+                        long p = ReadNum(md, "destinationPort");
+                        port = p > 0 ? p.ToString() : "";
+                    }
+                    return port.Length > 0 ? $"{host}:{port}" : host;
                 }
-                catch { /* 元数据不是 JSON 就退回下面那条 */ }
             }
             return GetStr(c, "id");
         }

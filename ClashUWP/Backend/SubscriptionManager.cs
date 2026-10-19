@@ -247,7 +247,18 @@ namespace ClashUWP.Backend
         ///   等于两条路都修不好。
         ///   现在每份订阅都过一遍幂等的 Ensure：一致 → 不动；不一致且已断开 → Update；
         ///   连接中 → 跳过并记日志。计数结果只落<b>一行</b>（调用方不再重复记）。
-        /// 【不碰隧道】只写系统 profile 列表，不连接、不改 config.yaml。
+        ///
+        /// ★【1.0.75 · 对账范围扩到"这个包的全部 profile"】上面那套只覆盖<b>订阅</b>，
+        ///   于是留下两个系统侧现象（用户报的"订阅显示不正常"）：
+        ///   ① <b>基础 profile 从不被对齐</b>：它还带着 1.0.72 之前写进去的
+        ///      <c>http://127.0.0.1</c> ServerUri，而 1.0.73 那次盾标修复只改了新建路径
+        ///      ⇒ 本机实测两条 profile 仍是 127.0.0.1:80，修复对它等于没发生。
+        ///      现在每轮先过 <see cref="VpnProfileSetup.EnsureBaseProfileResultAsync"/>。
+        ///   ② <b>幽灵条目不会被清掉</b>：删订阅时如果正连着，删除被收干净闸拒绝 ⇒
+        ///      正文没了、面板那条还在，点它连不上又划不掉。
+        ///      现在按本地清单 prune（<see cref="VpnProfileSetup.PruneOrphanProfilesAsync"/>，
+        ///      只碰带 subId 且已断开的，删除照旧过那道闸；清单为空时不 prune）。
+        /// 【不碰隧道】只写/删系统 profile 列表，不连接、不改 config.yaml。
         /// </summary>
         internal static async Task<string> SyncSystemProfilesAsync()
         {
@@ -255,6 +266,19 @@ namespace ClashUWP.Backend
             {
                 var list = await ListAsync();
                 int added = 0, updated = 0, present = 0, skipped = 0, failed = 0;
+
+                // ① 基础 profile 也进对账（它不在 list 里，以前没人管）
+                var bas = await VpnProfileSetup.EnsureBaseProfileResultAsync();
+                switch (bas.Action)
+                {
+                    case VpnProfileSetup.SubProfileAction.Added: added++; break;
+                    case VpnProfileSetup.SubProfileAction.Updated: updated++; break;
+                    case VpnProfileSetup.SubProfileAction.Unchanged: present++; break;
+                    case VpnProfileSetup.SubProfileAction.Skipped: skipped++; break;
+                    default: failed++; break;
+                }
+
+                // ② 每份订阅各过一遍幂等 Ensure
                 foreach (var p in list)
                 {
                     var reg = await VpnProfileSetup.EnsureSubscriptionProfileResultAsync(
@@ -268,8 +292,13 @@ namespace ClashUWP.Backend
                         default: failed++; break;
                     }
                 }
-                string msg = $"启动对账：订阅 {list.Count} 份，profile 新增 {added} / 更新 {updated} / " +
-                             $"已就位 {present} / 跳过 {skipped} / 失败 {failed}";
+                // ③ 面板里"本地已经没有"的 profile 清掉（只碰已断开的，闸照过）
+                string prune = await VpnProfileSetup.PruneOrphanProfilesAsync(
+                    list.Select(p => p.Id).ToList());
+
+                string msg = $"启动对账：订阅 {list.Count} 份 + 基础 profile 1 条，" +
+                             $"新增 {added} / 更新 {updated} / 已就位 {present} / " +
+                             $"跳过 {skipped} / 失败 {failed}；{prune}";
                 RollingLog.Info("profile-sub-sync", msg);
                 return msg;
             }
@@ -338,7 +367,14 @@ namespace ClashUWP.Backend
             {
                 string? path = ClashUWP.Vpn.SubscriptionReload.RegenerateEffectiveFile();
                 if (string.IsNullOrEmpty(path))
-                    return new Result(false, "没有可重载的生效配置（config.yaml 不存在）");
+                    // ★【1.0.75】null 有两种成因，都得说给用户听：
+                    //   组件侧"空壳不热重载"（改写结果零出站）也返回 null，
+                    //   只报"config.yaml 不存在"会指错方向 —— 静默或指错的失败
+                    //   在这个项目里一律算没修（口径同 1.0.35 的 splitNote 进日志）。
+                    //   具体是哪一种看 app.log 的 config 频道：那里有原话理由。
+                    return new Result(false,
+                        "没有可重载的生效配置：config.yaml 不存在，或它不含任何可用出站" +
+                        "（空壳不热重载，内核保持原有配置；理由见 日志 → config）");
 
                 // 先探内核是否在跑：在跑才热重载，否则只保证文件就位（下次连接生效）。
                 if (!await IsKernelUpAsync())

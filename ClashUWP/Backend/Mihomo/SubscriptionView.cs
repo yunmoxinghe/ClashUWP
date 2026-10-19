@@ -85,8 +85,11 @@ namespace ClashUWP.Backend.Mihomo
 
         /// <summary>
         /// 行式正则粗读。★ 只读数、不改文件、不缓存。
-        /// 订阅格式千差万别（flow style / block style / 带引号节点名），所以每条都用
-        /// <b>宽松匹配</b>：宁可少数几个节点，也不要因为格式变了就整个失败。
+        /// 订阅格式千差万别（flow style / block style / 带引号节点名），所以字段值用
+        /// <b>宽松匹配</b>：宁可少认一个协议名，也不要因为格式变了就整个失败。
+        /// ★ 但<b>"算不算一条条目"是严格的</b>【1.0.75】：只认同本段列表项缩进的
+        ///   <c>- </c> 行（见 <see cref="FirstItemColumn"/>）—— 宽松在"值"上没问题，
+        ///   宽松在"数"上就是虚高的节点数，而那个数用户是当结论看的。
         /// </summary>
         internal static Info Parse(string text, long size, DateTime mtime)
         {
@@ -101,6 +104,26 @@ namespace ClashUWP.Backend.Mihomo
             int proxiesEnd = proxiesStart < 0 ? lines.Length : FindNextTopLevel(lines, proxiesStart);
             if (proxiesStart >= 0)
             {
+                // ★【1.0.75 纠偏】"什么算一个节点"的判据从"<b>任何</b>以 - 开头的行"
+                //   改成"和<b>本段列表项同缩进</b>的 - 行"。
+                //   旧判据会把节点内部的<b>嵌套</b>列表当成新节点，例如：
+                //   <code>
+                //   proxies:
+                //     - name: A
+                //       type: vless
+                //       client-ips:
+                //         - 1.2.3.4      ← 旧写法：数成第二个节点
+                //     - name: B
+                //       type: ss
+                //   </code>
+                //   离线夹具实测：2 个节点被数成 4 个（协议分布同样虚高）。
+                //   订阅里带 multiplex / client-ips / fallback 这类子列表的节点不少，
+                //   所以界面上"节点数"一直是偏的 —— 而它正是用户判断"订阅拉全了没有"的数。
+                //   列表项在哪一列由<b>本段第一个 - 行</b>给出（缩进是订阅定的，不写死，
+                //   与 KernelConfig.ChildIndent 同一口径）。
+                int itemCol = FirstItemColumn(lines, proxiesStart + 1, proxiesEnd);
+                if (itemCol < 0) itemCol = 0;   // 整段没有 - 行：下面自然数不出东西
+
                 for (int i = proxiesStart + 1; i < proxiesEnd; i++)
                 {
                     string t = lines[i].Trim();
@@ -108,7 +131,8 @@ namespace ClashUWP.Backend.Mihomo
 
                     // flow style：- { name: x, type: vless, server: … }
                     // block style：- name: x（下一行才是 type）
-                    bool isEntry = t.StartsWith("- ") || t.StartsWith("-\t");
+                    bool isEntry = (t.StartsWith("- ") || t.StartsWith("-\t") || t == "-") &&
+                                   LeadingSpaces(lines[i]) == itemCol;
                     if (!isEntry) continue;
 
                     nodeCount++;
@@ -120,7 +144,9 @@ namespace ClashUWP.Backend.Mihomo
                         for (int j = i + 1; j < Math.Min(i + 8, proxiesEnd); j++)
                         {
                             string t2 = lines[j].Trim();
-                            if (t2.StartsWith("- ")) break;                    // 下一条目
+                            // ★ 只有"下一个<b>列表项</b>"才算出段；更深缩进的 - 行是本节点的子列表
+                            if ((t2.StartsWith("- ") || t2 == "-") && LeadingSpaces(lines[j]) <= itemCol)
+                                break;
                             var m2 = Regex.Match(t2, @"^type:\s*([A-Za-z0-9_+-]+)", RegexOptions.IgnoreCase);
                             if (m2.Success) { type = m2.Groups[1].Value; break; }
                         }
@@ -131,15 +157,29 @@ namespace ClashUWP.Backend.Mihomo
             }
 
             // ── rules 段：规则数 ──
+            // ★ 同 proxies：只数与本段列表项同缩进的 - 行（规则本身是标量，
+            //   但个别订阅的规则带子列表，旧写法会一并数进去）。
             int ruleCount = 0;
             int rulesStart = FindTopLevel(lines, "rules");
             int rulesEnd = rulesStart < 0 ? lines.Length : FindNextTopLevel(lines, rulesStart);
             if (rulesStart >= 0)
             {
-                for (int i = rulesStart + 1; i < rulesEnd; i++)
+                int ruleCol = FirstItemColumn(lines, rulesStart + 1, rulesEnd);
+                if (ruleCol >= 0)
                 {
-                    string t = lines[i].Trim();
-                    if (t.StartsWith("- ")) ruleCount++;
+                    for (int i = rulesStart + 1; i < rulesEnd; i++)
+                    {
+                        string t = lines[i].Trim();
+                        if (t.StartsWith("- ") && LeadingSpaces(lines[i]) == ruleCol) ruleCount++;
+                    }
+                }
+                else
+                {
+                    for (int i = rulesStart + 1; i < rulesEnd; i++)
+                    {
+                        string t = lines[i].Trim();
+                        if (t.StartsWith("- ")) ruleCount++;
+                    }
                 }
             }
 
@@ -149,9 +189,15 @@ namespace ClashUWP.Backend.Mihomo
             int groupsEnd = groupsStart < 0 ? lines.Length : FindNextTopLevel(lines, groupsStart);
             if (groupsStart >= 0)
             {
+                // ★ 组名行必须是<b>列表项</b>（`- name:` / `- { name:`），
+                //   而节点里也可能出现 `- name:` 之外的裸 `name:` 子键；
+                //   旧正则 `-\s*\{?\s*name:` 要求有 -，这条没问题，
+                //   但没有缩进判据 ⇒ 组内 use/proxies 成员行若写成 `- name:` 会被数成组。
+                int groupCol = FirstItemColumn(lines, groupsStart + 1, groupsEnd);
                 for (int i = groupsStart + 1; i < groupsEnd; i++)
                 {
-                    var m = Regex.Match(lines[i], @"-\s*\{?\s*name:\s*[""']?([^,""'\}]+)");
+                    if (groupCol >= 0 && LeadingSpaces(lines[i]) != groupCol) continue;
+                    var m = Regex.Match(lines[i], @"^\s*-\s*\{?\s*name:\s*[""']?([^,""'\}]+)");
                     if (m.Success)
                     {
                         string n = m.Groups[1].Value.Trim();
@@ -182,15 +228,54 @@ namespace ClashUWP.Backend.Mihomo
             return -1;
         }
 
+        /// <summary>
+        /// 本段的下一行<b>顶层键</b>（块尾，不含）。
+        /// ★【1.0.75】以 <c>-</c> 开头的零缩进行<b>不算</b>顶层键：
+        ///   <code>
+        ///   proxies:
+        ///   - name: a        ← 合法 YAML（块序列可以与父键同缩进），它是<b>本段的条目</b>
+        ///   </code>
+        ///   旧写法"第一个不缩进的行就是下一段"会在这里把块尾定在第一条条目上，
+        ///   于是这种写法的订阅<b>整段一个节点也数不出来</b>（离线夹具实测 node=0）。
+        ///   与 <c>KernelConfig.EndOfBlock</c> 同一判据（那条早就排除了 <c>-</c> 行）。
+        /// </summary>
         private static int FindNextTopLevel(string[] lines, int start)
         {
             for (int i = start + 1; i < lines.Length; i++)
             {
                 string l = lines[i];
                 if (l.Length == 0 || char.IsWhiteSpace(l[0])) continue;
+                string t = l.TrimStart();
+                if (t.StartsWith("- ") || t == "-" || t.StartsWith("-\t")) continue;
                 return i;
             }
             return lines.Length;
+        }
+
+        /// <summary>
+        /// 本段<b>列表项</b>所在的那一列（第一个非空、非注释、以 <c>-</c> 开头的行的缩进宽度）。
+        /// ★【1.0.75】节点数/规则数/组名都必须用它做缩进判据，理由见 <see cref="Parse"/> 里那条：
+        ///   "任何 - 开头的行"会把节点内部的子列表（<c>client-ips</c> / <c>mux</c> /
+        ///   组的 <c>use</c>、<c>proxies</c> 成员）误数成条目。找不到就返回 -1（空段）。
+        /// </summary>
+        private static int FirstItemColumn(string[] lines, int from, int to)
+        {
+            for (int i = from; i < to; i++)
+            {
+                string t = lines[i].Trim();
+                if (t.Length == 0 || t.StartsWith("#")) continue;
+                if (t.StartsWith("- ") || t == "-" || t.StartsWith("-\t"))
+                    return LeadingSpaces(lines[i]);
+            }
+            return -1;
+        }
+
+        /// <summary>行首空白宽度（空格与制表符都算；YAML 不允许制表符缩进，但订阅里见过，按宽度兜住）。</summary>
+        private static int LeadingSpaces(string line)
+        {
+            int n = 0;
+            while (n < line.Length && (line[n] == ' ' || line[n] == '\t')) n++;
+            return n;
         }
 
         /// <summary>给人看的一行摘要（UI 与 debug 命令共用）。</summary>

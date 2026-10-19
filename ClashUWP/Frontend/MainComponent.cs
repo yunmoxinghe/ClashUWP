@@ -352,7 +352,7 @@ namespace ClashUWP.Frontend
             //   （轮询挂在挂载时的那次渲染上，切页只换 content 子树。）
             Element body = page switch
             {
-                PageProxy => ProxyPage(snap, activeGroup, selectedGroup),
+                PageProxy => ProxyPage(snap, activeGroup, selectedGroup, actionHint),
                 PageSubscription => SubscriptionPage(subInfo, subProfiles, subActive, subUrl, actionHint),
                 PageSettings => SettingsPage(actionHint, logOpen, logText, material, setMaterial,
                         splitLines, splitNote, splitMsg, probeText, splitKind, splitIdentity, splitTarget,
@@ -448,9 +448,17 @@ namespace ClashUWP.Frontend
 
                 Section("活动连接", ConnectionList(snap)));
 
-        /// <summary>代理页：模式（rule/global/direct）+ 组 + 节点。都是纯内核 REST，不碰隧道。</summary>
-        private Element ProxyPage(KernelView.Snapshot snap, string activeGroup, string selectedGroup) =>
+        /// <summary>
+        /// 代理页：模式（rule/global/direct）+ 组 + 节点。都是纯内核 REST，不碰隧道。
+        /// ★【1.0.75】把 <c>actionHint</c> 也画上：这一页以前<b>不显示任何返回文本</b>，
+        ///   所以"点节点没反应"其实是后端在报错（组名拆错了），界面却一言不发。
+        ///   现在每次点选的结果（含失败原因、自动组的说明）都落在页顶。
+        /// </summary>
+        private Element ProxyPage(KernelView.Snapshot snap, string activeGroup,
+                                  string selectedGroup, string actionHint) =>
             Page(
+                actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty(),
+
                 Section("模式",
                     HStack(8,
                         Button("mode rule", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("rule"))),
@@ -654,17 +662,33 @@ namespace ClashUWP.Frontend
             {
                 string name = g.Name;
                 bool isActive = string.Equals(name, selected, StringComparison.Ordinal);
+                // ★ 括号里是<b>真节点</b>数，不是成员数（安卓口径：嵌套组与内置策略不算节点）。
+                //   这份订阅实测 11 个组里 9 个的"成员"全是别的组，用成员数当节点数
+                //   就是"代理组成为节点"在界面上的另一半；两个数不等时把成员数也带上，
+                //   让人一眼看出这是个套壳组。
+                int real = g.RealNodeCount;
+                string count = real == g.Members.Count
+                    ? $"（{real}）"
+                    : $"（节点 {real}/成员 {g.Members.Count}）";
                 buttons.Add(Button(
-                    (isActive ? "▶ " : "") + $"{name}（{g.Members.Count}）",
+                    (isActive ? "▶ " : "") + $"{name}{count}",
                     () => _setSelectedGroup(name)));
             }
             return HStack(buttons.ToArray());
         }
 
         /// <summary>
-        /// 成员表：点一下就切。
+        /// 成员表：Selector 组点一下就切；自动组只读。
         /// ★ 组名/节点名<b>原样透传</b>（中文、带 emoji、带前导空格）——
         ///   任何 trim / 规范化都会让内核找不到那个组。
+        /// ★【1.0.75 对齐安卓】三件事一起改：
+        ///   ① <b>每行带类型副标题</b>：嵌套组显示 <c>Selector(现值)</c>、内置策略与真节点
+        ///      显示协议类型（CMFA 的 <c>subTitle</c> 就是这个），
+        ///      这样"成员其实是个组"在界面上看得出来；
+        ///   ② <b>延迟只在测过的时候显示</b>（CMFA：<c>delay in 0..Short.MAX_VALUE</c> 才画胶囊），
+        ///      原先一律写"未测"，在 <c>lazy: true</c> 的订阅里等于整屏贴同一句废话；
+        ///   ③ <b>自动组不给点</b>（CMFA 只对 <c>type == "Selector"</c> 接点行动作）——
+        ///      url-test 手选会被下一轮测速改回去，那不是"选上了"，是"点了会自己变"。
         /// </summary>
         private Element MemberList(KernelView.Snapshot s, string groupName)
         {
@@ -676,17 +700,56 @@ namespace ClashUWP.Frontend
             if (g == null) return TextBlock("(组不存在)");
 
             var items = new List<Element>();
+            if (!g.IsUserSelectable)
+                items.Add(TextBlock(
+                    $"（该组类型是 {g.Type}：由内核测速/故障转移自己选，和安卓版一样不可手选。" +
+                    "下面列的是它的候选，现值标记只是当前赢家。）")
+                    .Foreground(Theme.SecondaryText));
+
             foreach (var m in g.Members)
             {
                 bool isNow = string.Equals(m.Name, g.Now, StringComparison.Ordinal);
-                string delay = m.DelayMs < 0 ? "未测" : $"{m.DelayMs}ms";
+                string label = $"{(isNow ? "▶ " : "  ")}{m.Name}";
+                string sub = MemberSubtitle(m);
+                if (sub.Length > 0) label += $"　{sub}";
+
+                if (!g.IsUserSelectable)
+                {
+                    Element row = TextBlock(label);
+                    if (!isNow) row = row.Foreground(Theme.SecondaryText);
+                    items.Add(row);
+                    continue;
+                }
+
                 string member = m.Name;
-                items.Add(Button(
-                    $"{(isNow ? "▶ " : "  ")}{m.Name}　{delay}",
-                    () => _ = SelectAsync(g.Name, member)));
+                items.Add(Button(label, () => _ = SelectAsync(g.Name, member)));
             }
             if (items.Count == 0) items.Add(TextBlock("(该组没有成员)"));
             return VStack(items.ToArray());
+        }
+
+        /// <summary>
+        /// 一行的副标题：分类（嵌套组 / 类型）+ 测过的延迟。
+        /// ★ 与安卓 <c>ProxyItemProvider</c> 同一呈现口径：先"这是什么"，再"多快"。
+        ///   嵌套组写成 <c>Selector(现值)</c>（CMFA 的 <c>subTitle</c> 形态），
+        ///   真节点写协议类型（<c>ss</c> / <c>trojan</c> / <c>AnyTLS</c>…），
+        ///   内置策略写它的类型（<c>Direct</c> / <c>Reject</c>…）。
+        /// </summary>
+        private static string MemberSubtitle(KernelView.Member m)
+        {
+            string kind;
+            if (m.IsGroup)
+                kind = $"{(m.Type.Length > 0 ? m.Type : "组")}" +
+                       (m.Now.Length > 0 ? $"({m.Now})" : "(未选)");
+            else if (m.IsBuiltin)
+                kind = m.Type.Length > 0 ? m.Type : "内置策略";
+            else
+                kind = m.Type;
+
+            // 延迟：没测过就<b>不写</b>（见 KernelView 顶部那条口径）。
+            string delay = m.DelayMs >= 0 ? $"{m.DelayMs}ms" : "";
+            if (kind.Length > 0 && delay.Length > 0) return $"{kind}　{delay}";
+            return kind.Length > 0 ? kind : delay;
         }
 
         /// <summary>
@@ -1033,15 +1096,18 @@ namespace ClashUWP.Frontend
 
         /// <summary>
         /// 切节点：<c>PUT /proxies/{组}</c>。
-        /// ★ 组名与节点名<b>原样拼接</b>，不 trim、不规范化 ——
-        ///   内核的组名/节点名带中文与前导空格，改了就不是同一个东西。
+        /// ★ 组名与节点名<b>各自成参</b>交给 <see cref="MihomoController.SelectAsync"/>，
+        ///   不 trim、不规范化，也<b>不拼成一行文本</b> ——
+        ///   1.0.74 及以前这里是 <c>RunSelectAsync($"{group} {member}")</c>，
+        ///   后端按"第一个空格"拆回去；可组名自己就有空格（订阅派生的），于是拆出来的是
+        ///   半截组名，<b>界面上绝大多数组点不动，而且看不见失败原因</b>。
         ///   成功后立刻刷一次快照，让"▶"标记跟上。
         /// </summary>
         private async Task SelectAsync(string group, string member)
         {
             try
             {
-                string result = await MihomoController.RunSelectAsync($"{group} {member}");
+                string result = await MihomoController.SelectAsync(group, member);
                 _setActionHint(result);
                 _setSnap(await KernelView.LoadAsync());
             }

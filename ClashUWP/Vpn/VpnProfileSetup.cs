@@ -232,9 +232,14 @@ namespace ClashUWP.Vpn
             // ★ server 地址可以在不重装包的前提下换（LocalState/profile-server.txt）。
             //   为什么要留这个口子：run 14 实测「节点 /32 排除路由被平台装到了环回接口
             //   ifIdx=1」，而平台要给排除路由挑接口，挑的依据最可疑的就是 profile 的
-            //   ServerUris —— 我们一直填的是 http://127.0.0.1，等于告诉平台
-            //   "VPN 服务器在环回上"。换掉它必须是单变量实验，所以默认值保持
-            //   127.0.0.1 不变，只在文件存在时覆盖，并且把用到的值原样写进返回值。
+            //   ServerUris —— 我们当时填的是 http://127.0.0.1，等于告诉平台
+            //   "VPN 服务器在环回上"。换掉它必须是单变量实验，所以那次只加了覆盖口子、
+            //   默认值仍留 127.0.0.1，并把用到的值原样写进返回值。
+            // ★【1.0.73】默认值已按盾标/NCSI 那条结论换成 <c>http://192.0.2.1</c>
+            //   （见 ReadProfileServerOverrideAsync），这个口子留作单变量取证用。
+            // ★【1.0.75】注意这条路径<b>只在建/重建时用得到默认值</b>：已存在的 profile
+            //   不会被 RecreateProfileAsync 之外的任何路径改写，所以"改了默认值但机器上
+            //   还是旧地址"要靠 <see cref="EnsureBaseProfileResultAsync"/> 的启动对账解决。
             string server = await ReadProfileServerOverrideAsync();
 
             VpnManagementErrorStatus add = await AddProfileAsync(config, server);
@@ -411,6 +416,165 @@ namespace ClashUWP.Vpn
                 RollingLog.Warn("profile-sub", failMsg);
                 return new SubProfileResult(SubProfileAction.Failed, failMsg);
             }
+        }
+
+        /// <summary>
+        /// ★【1.0.75】把<b>基础 profile</b>（<c>ClashUWP</c>，不带 subId、读 <c>config.yaml</c>）
+        /// 也纳入启动对账 —— 判据与 <see cref="EnsureSubscriptionProfileResultAsync"/> 逐字同一套。
+        ///
+        /// 【为什么这条必须存在】1.0.62 起的对账<b>只遍历订阅清单</b>
+        /// （<c>SubscriptionManager.ListAsync()</c>），基础 profile 从来不在名单里。
+        /// 后果实测在本机：1.0.73 把"新建 profile 的 ServerUri"从 <c>http://127.0.0.1</c>
+        /// 换成 <c>http://192.0.2.1</c>（NCSI/盾标那条修复），改的只是<b>新建</b>路径 ——
+        /// 已存在的那条没人碰，profile-dump 里两条 profile 的 ServerUris 仍是
+        /// <c>http://127.0.0.1</c> Port=80。也就是"代码改了、机器上还是旧的"，
+        /// 而前台所有连接走的恰恰就是这条基础 profile ⇒ 那次修复对它<b>等于没发生</b>。
+        /// 【为什么只在 Disconnected 才改】同订阅 profile 那条纪律：对活动会话改 profile
+        ///   没有实测背书，不在在线路径上做；断开后下一次启动对账自然对齐。
+        /// </summary>
+        internal static async Task<SubProfileResult> EnsureBaseProfileResultAsync()
+        {
+            try
+            {
+                string server = await ReadProfileServerOverrideAsync();
+                var serverUri = new Uri(server);
+                VpnPlugInProfile? existing = await FindOurProfileAsync();
+
+                if (existing == null)
+                {
+                    VpnManagementErrorStatus add = await AddProfileAsync(new VpnPluginConfig(), server);
+                    string addedMsg = $"基础profile[{ProfileName}] 新建={add}, server={server}";
+                    RollingLog.Info("profile-base", addedMsg);
+                    return new SubProfileResult(
+                        add == VpnManagementErrorStatus.Ok ? SubProfileAction.Added : SubProfileAction.Failed,
+                        addedMsg);
+                }
+
+                bool sameServer = existing.ServerUris.Count == 1 &&
+                                  existing.ServerUris[0].ToString() == serverUri.ToString();
+                // 基础 profile 的定义就是"不带 subId"（插件据此走 config.yaml）。
+                // ★ 用<b>解析后</b>的 SubId 比，不比 XML 原文：平台回读会重排空白与属性。
+                bool same = existing.ProfileName == ProfileName
+                            && existing.RequireVpnClientAppUI
+                            && VpnPluginConfig.Parse(existing.CustomConfiguration).SubId.Length == 0
+                            && sameServer;
+                if (same)
+                    return new SubProfileResult(SubProfileAction.Unchanged,
+                        $"基础profile[{ProfileName}] 已就位");
+
+                string status = existing.ConnectionStatus.ToString();
+                if (status != "Disconnected")
+                {
+                    string skipMsg = $"基础profile[{ProfileName}] 待更新但状态={status}，跳过（断开后再对账）";
+                    RollingLog.Info("profile-base", skipMsg);
+                    return new SubProfileResult(SubProfileAction.Skipped, skipMsg);
+                }
+
+                string why = !sameServer
+                    ? $"ServerUri={existing.ServerUris.Count}个→1个({serverUri})"
+                    : "名字/CustomConfiguration/UI可见性 对齐";
+                existing.ProfileName = ProfileName;
+                existing.RequireVpnClientAppUI = true;
+                existing.CustomConfiguration = new VpnPluginConfig().ToXml();
+                existing.ServerUris.Clear();
+                existing.ServerUris.Add(serverUri);
+
+                VpnManagementErrorStatus upd = await Agent.UpdateProfileFromObjectAsync(existing);
+                string updMsg = $"基础profile[{ProfileName}] 更新={upd}（{why}）";
+                RollingLog.Info("profile-base", updMsg);
+                return new SubProfileResult(
+                    upd == VpnManagementErrorStatus.Ok ? SubProfileAction.Updated : SubProfileAction.Failed,
+                    updMsg);
+            }
+            catch (Exception ex)
+            {
+                string failMsg = $"基础profile 同步异常: {ex.GetType().Name}: {ex.Message}";
+                RollingLog.Warn("profile-base", failMsg);
+                return new SubProfileResult(SubProfileAction.Failed, failMsg);
+            }
+        }
+
+        /// <summary>
+        /// ★【1.0.75】清掉<b>系统里有、本地订阅清单里没有</b>的 profile（幽灵条目）。
+        ///
+        /// 【为什么要】快速设置面板列的是<b>系统 profile 存储</b>里的东西，不是我们的
+        ///   <c>LocalState\subscriptions\</c>。两边只在"增/删/切"那一刻对齐过一次：
+        ///   删订阅时插件正连着 ⇒ <see cref="RemoveSubscriptionProfileAsync"/> 被
+        ///   收干净闸拒绝 ⇒ 正文没了、面板那条还在；换机/重装后 LocalState 空了、
+        ///   profile 还在（同一包族）。用户看到的"订阅显示不正常"就是这个 ——
+        ///   点它连不上（CustomConfiguration 指向不存在的文件），又划不掉。
+        /// 【纪律】
+        ///   · <b>只碰带 subId 的</b>：基础 profile（subId 空）与探测残留不在此列；
+        ///   · <b>只碰非活动</b>的：状态不是 Disconnected 一律跳过，绝不拆正在跑的隧道；
+        ///   · 删除必须过 <see cref="GracefulTeardown.EnsureTornDownAsync"/> 那道闸
+        ///     （与 <see cref="RemoveSubscriptionProfileAsync"/> 同一条纪律，
+        ///     拆不干净会留孤儿 NRPT + 幽灵路由 = 整机断网）；
+        ///   · keep 清单为空时<b>不 prune</b>：那更可能是"订阅还没拉/文件读失败"，
+        ///     此时把面板清空属于二次事故。
+        /// </summary>
+        internal static async Task<string> PruneOrphanProfilesAsync(
+            System.Collections.Generic.IReadOnlyList<string> keepSubIds)
+        {
+            if (keepSubIds == null || keepSubIds.Count == 0)
+                return "无订阅清单，prune 跳过（不误空面板）";
+
+            var keep = new HashSet<string>(keepSubIds, StringComparer.OrdinalIgnoreCase);
+            int removed = 0, skipped = 0;
+            var sb = new StringBuilder();
+
+            try
+            {
+                IReadOnlyList<IVpnProfile> all = await Agent.GetProfilesAsync();
+                foreach (IVpnProfile p in all)
+                {
+                    if (p is not VpnPlugInProfile pp) continue;
+                    if (pp.VpnPluginPackageFamilyName != PackageFamilyName) continue;
+
+                    string subId = VpnPluginConfig.Parse(pp.CustomConfiguration).SubId;
+                    if (subId.Length == 0) continue;          // 基础 profile / 探测残留
+                    if (keep.Contains(subId)) continue;        // 本地产物还在，留着
+
+                    string status = pp.ConnectionStatus.ToString();
+                    if (status != "Disconnected")
+                    {
+                        skipped++;
+                        sb.Append($"\n保留[{pp.ProfileName}] 状态={status}（活动会话不拆）");
+                        continue;
+                    }
+
+                    (bool ok, string report) = await GracefulTeardown.EnsureTornDownAsync(pp);
+                    if (!ok)
+                    {
+                        skipped++;
+                        sb.Append($"\n保留[{pp.ProfileName}] 会话未收干净（{report}）");
+                        RollingLog.Warn("profile-prune",
+                            $"幽灵 profile 拒绝删除 —— {pp.ProfileName}: {report}");
+                        continue;
+                    }
+
+                    VpnManagementErrorStatus del = await Agent.DeleteProfileAsync(pp);
+                    if (del == VpnManagementErrorStatus.Ok)
+                    {
+                        removed++;
+                        sb.Append($"\n删除[{pp.ProfileName}] subId={subId}");
+                    }
+                    else
+                    {
+                        skipped++;
+                        sb.Append($"\n删除失败[{pp.ProfileName}] ={del}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // prune 是清理动作，失败不影响对账其余部分（下次启动还会再试）。
+                RollingLog.Warn("profile-prune", $"异常: {ex.GetType().Name}: {ex.Message}");
+                return $"prune 异常: {ex.GetType().Name}: {ex.Message}";
+            }
+
+            string msg = $"prune 幽灵 profile：删 {removed} / 留 {skipped}";
+            RollingLog.Info("profile-prune", msg + sb.ToString());
+            return msg + (removed + skipped == 0 ? "" : sb.ToString());
         }
 
         /// <summary>★【1.0.62】按 subId 找我们的订阅 profile：遍历同 PFN 的 profile，解析 CustomConfiguration 里的 subId。</summary>

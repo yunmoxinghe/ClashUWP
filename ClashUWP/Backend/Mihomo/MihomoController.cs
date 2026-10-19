@@ -616,7 +616,28 @@ namespace ClashUWP.Backend.Mihomo
                                            System.Collections.Generic.List<string> Members);
 
         /// <summary>
-        /// 从 <c>GET /proxies</c> 的原文里一次拿全：可切换的组 + 每个节点最近一次测速。
+        /// <c>/proxies</c> 表里<b>每一个</b>条目的分类结果 —— 安卓版
+        /// <c>convertProxies</c> 那句
+        /// <c>_, isGroup := p.Adapter().(outboundgroup.ProxyGroup)</c> 在我们这边的等价物。
+        ///
+        /// 【★ 为什么必须在后端分，不能让 UI 猜】安卓的组/节点之分是<b>内核在 Go 里判好
+        ///   再交给前端</b>的（<c>Proxy{IsGroup}</c>），前端只做呈现。我们以前的
+        ///   <c>ReadProxiesTable</c> 只留下"是组的那些"，其余条目的 <c>type</c> 一律丢弃，
+        ///   于是 UI 拿到的成员表里"嵌套组 / 内置策略 / 真节点"长得完全一样 ——
+        ///   这就是"代理组成为节点"的根因（实测这份 iKuuu 订阅 11 个组里有 9 个
+        ///   一个真节点都没有，成员全是别的组，界面却把它们渲染成同一种可点行）。
+        /// 【判据】<c>IsGroup</c> = 该条目带 <c>all</c> 数组（实测真组都有、真节点都没有），
+        ///   这是<b>结构判据</b>，比"按类型名枚举"稳；内置策略（DIRECT/REJECT…）没有
+        ///   <c>all</c>，所以天然不是组，<c>IsBuiltin</c> 再单独标一份，
+        ///   让 UI 能给它们照安卓那样显示类型副标题（"Direct"/"Reject"），
+        ///   而不是像我们以前那样把它们整个从延迟表里藏掉。
+        /// </summary>
+        internal sealed record ProxyInfo(string Name, string Type, bool IsGroup,
+                                          string Now, bool IsBuiltin);
+
+        /// <summary>
+        /// 从 <c>GET /proxies</c> 的原文里一次拿全：可切换的组 + 每个节点最近一次测速 +
+        /// 每张条目的分类表（组/节点/内置策略）。
         ///
         /// 【★ 一次请求就够，实测口径】组的 <c>all</c> 在 <c>GET /proxies</c> 和
         ///   <c>GET /proxies/{组}</c> 里<b>都是字符串数组</b>（成员名），不会展开成对象 ——
@@ -630,15 +651,18 @@ namespace ClashUWP.Backend.Mihomo
         ///   只能有一份，两边各写一遍必然分叉。
         /// </summary>
         internal static (System.Collections.Generic.List<ProxyGroup> Groups,
-                        System.Collections.Generic.Dictionary<string, long> LastDelay)
+                        System.Collections.Generic.Dictionary<string, long> LastDelay,
+                        System.Collections.Generic.Dictionary<string, ProxyInfo> ByName)
             ReadProxiesTable(System.Text.Json.JsonElement root)
         {
             var groups = new System.Collections.Generic.List<ProxyGroup>();
             var delay = new System.Collections.Generic.Dictionary<string, long>(
                 System.StringComparer.Ordinal);
+            var byName = new System.Collections.Generic.Dictionary<string, ProxyInfo>(
+                System.StringComparer.Ordinal);
             if (!root.TryGetProperty("proxies", out var proxies) ||
                 proxies.ValueKind != System.Text.Json.JsonValueKind.Object)
-                return (groups, delay);
+                return (groups, delay, byName);
 
             foreach (var kv in proxies.EnumerateObject())
             {
@@ -646,19 +670,27 @@ namespace ClashUWP.Backend.Mihomo
                 long d = LastHistoryDelay(kv.Value);
                 if (d >= 0) delay[kv.Name] = d;
 
+                string type = GetString(kv.Value, "type");
+                string now = GetString(kv.Value, "now");
+                bool hasAll = kv.Value.TryGetProperty("all", out var allEl) &&
+                              allEl.ValueKind == System.Text.Json.JsonValueKind.Array;
+
                 bool builtin = false;
                 foreach (string b in BuiltinProxyNames)
                     if (string.Equals(b, kv.Name, System.StringComparison.Ordinal)) { builtin = true; break; }
-                if (builtin) continue;
 
-                string type = GetString(kv.Value, "type");
+                // ★ 分类表对<b>每一个</b>条目都要记（下面两个 continue 只挡"能不能当组来切"，
+                //   挡不住"UI 得知道这个成员是什么"）。
+                byName[kv.Name] = new ProxyInfo(kv.Name, type,
+                    IsGroup: hasAll && !builtin, now, builtin);
+
+                if (builtin) continue;
                 if (!IsSelectableGroupType(type)) continue;
 
                 var members = new System.Collections.Generic.List<string>();
-                if (kv.Value.TryGetProperty("all", out var all) &&
-                    all.ValueKind == System.Text.Json.JsonValueKind.Array)
+                if (hasAll)
                 {
-                    foreach (var m in all.EnumerateArray())
+                    foreach (var m in allEl.EnumerateArray())
                     {
                         // 实测是字符串；对象形态留一手（将来某版展开成对象也不至于读空）。
                         if (m.ValueKind == System.Text.Json.JsonValueKind.String)
@@ -674,9 +706,9 @@ namespace ClashUWP.Backend.Mihomo
                     }
                 }
 
-                groups.Add(new ProxyGroup(kv.Name, type, GetString(kv.Value, "now"), members));
+                groups.Add(new ProxyGroup(kv.Name, type, now, members));
             }
-            return (groups, delay);
+            return (groups, delay, byName);
         }
 
         /// <summary>读一个字符串字段；缺失/类型不对给空串（组名与节点名都必须原样，不做任何加工）。</summary>
@@ -725,16 +757,25 @@ namespace ClashUWP.Backend.Mihomo
                 var sb = new StringBuilder();
 
                 using var doc = System.Text.Json.JsonDocument.Parse(json);
-                var (groups, delay) = ReadProxiesTable(doc.RootElement);
+                var (groups, delay, byName) = ReadProxiesTable(doc.RootElement);
 
                 if (groups.Count == 0)
                     return "(内核里没有可切换的代理组：要么规则里没有组，要么订阅没加载。" +
                            "可先 debug conf 看 proxies 有没有落到内核。)";
 
-                sb.Append($"可切换组={groups.Count}（* = 当前选中；delay=- 表示该成员还没被测过，不等于挂了）");
+                sb.Append($"可切换组={groups.Count}（* = 当前选中；delay=- 表示该成员还没被测过，不等于挂了；" +
+                          "[组]=成员本身是嵌套组，[策略]=内置策略，二者都不是节点）");
                 foreach (var g in groups)
                 {
-                    sb.Append($"\n组={g.Name} 类型={g.Type} 成员={g.Members.Count} " +
+                    // ★ 成员数按<b>真节点</b>数（安卓口径：组不算进节点的堆里）。
+                    //   两个数都给，因为"这个组其实是套壳"正是排障要看的事。
+                    int realNodes = 0;
+                    foreach (string name in g.Members)
+                        if (!byName.TryGetValue(name, out var i) || (!i.IsGroup && !i.IsBuiltin))
+                            realNodes++;
+
+                    sb.Append($"\n组={g.Name} 类型={g.Type} 成员={g.Members.Count}" +
+                              $"（其中节点={realNodes}） " +
                               $"选中={(g.Now.Length == 0 ? "(空：未选中/未测速)" : g.Now)}");
                     if (g.Members.Count == 0)
                     {
@@ -747,7 +788,13 @@ namespace ClashUWP.Backend.Mihomo
                         if (shown++ >= 40) { sb.Append("\n    …（成员过多，只列前 40）"); break; }
                         string mark = string.Equals(name, g.Now, System.StringComparison.Ordinal)
                             ? "*" : " ";
-                        sb.Append($"\n   {mark} {name}");
+                        string kind = "";
+                        if (byName.TryGetValue(name, out var mi))
+                        {
+                            if (mi.IsGroup) kind = $" [组:{mi.Type}{(mi.Now.Length > 0 ? $"({mi.Now})" : "")}]";
+                            else if (mi.IsBuiltin) kind = " [策略]";
+                        }
+                        sb.Append($"\n   {mark} {name}{kind}");
                         sb.Append(delay.TryGetValue(name, out long d) ? $" delay={d}ms" : " delay=-");
                     }
                 }
@@ -763,8 +810,36 @@ namespace ClashUWP.Backend.Mihomo
         }
 
         /// <summary>
-        /// 切换节点（debug <c>select</c> 命令）：<c>PUT /proxies/{组}</c>，body
-        /// <c>{"name":"节点名"}</c>，成功回 204。
+        /// 切换节点（<b>UI 专用入口</b>）：<c>PUT /proxies/{组}</c>，body
+        /// <c>{"name":"节点名"}</c>，成功回 204。组名与节点名<b>各自成参</b>。
+        ///
+        /// 【★ 为什么不复用字符串入口】1.0.74 及以前，界面点节点走的是
+        ///   <c>RunSelectAsync($"{group} {member}")</c> —— 把两个名字拼成一个字符串，
+        ///   那边再用"第一个空格"拆回来。而订阅派生的组名<b>本身就有空格</b>
+        ///   （实测这份 iKuuu 订阅 11 个组里 10 个带空格），拆出来只剩组名的第一段，
+        ///   于是绝大多数组在界面上根本点不动，而代理页又不显示返回文本 ⇒ 全程静默失败。
+        ///   安卓版没有这个坑，因为它传的是 <c>(组, 节点)</c> 两个值（<c>patchSelector</c>）。
+        ///   ⇒ 这里对齐安卓：名字一旦被拼过就还原不回来，所以<b>不要拼</b>。
+        /// </summary>
+        internal static async Task<string> SelectAsync(string group, string node)
+        {
+            try
+            {
+                using var http = NewLoopbackClient(10);
+                var groups = await FetchGroupsAsync(http);
+                return await SelectCoreAsync(http, groups, group ?? "", node ?? "",
+                    fromDebugText: false);
+            }
+            catch (Exception ex)
+            {
+                ClashUWP.Vpn.RollingLog.Error("mihomo-select", ex);
+                return $"select 失败: {ex.GetType().Name}: {ex.Message}";
+            }
+        }
+
+        /// <summary>
+        /// 切换节点（debug <c>select</c> 命令）：参数是一整行文本，先按组名做前缀匹配
+        /// 还原出 <c>(组, 节点)</c>，再走 <see cref="SelectCoreAsync"/> —— 与 UI 同一条实现。
         ///
         /// 【★ 只有 PUT 生效】官方 v1.19.32 实测（Docs/12 §7）：同一条 URL
         ///   <c>PATCH</c> 回 <b>405</b>、<c>PUT</c> 回 <b>204</b>。记忆里"PATCH /proxies
@@ -774,9 +849,9 @@ namespace ClashUWP.Backend.Mihomo
         ///   没变化要省一整轮。组名与节点名都<b>区分大小写、精确匹配</b>。
         ///   成员表就取自同一次 <c>GET /proxies</c>（见 <see cref="ReadProxiesTable"/>），
         ///   不再为校验多打一个接口。
-        /// 【参数口径】第一个空格前是组名，其余全是节点名（节点名里可以有空格）。
-        ///   只给一段时当作节点名，并在"内核里只有一个可切换组"时自动补组名；
-        ///   多个组则报错列出组名，绝不猜。
+        /// 【参数口径】<b>拿本次的组名做最长前缀匹配</b>（不是"第一个空格"，理由见
+        ///   <see cref="SplitSelectArg"/>）；匹配不到才退回空格口径，好把"找不到组 X"
+        ///   连同候选组名回出来。只给一段时当作节点名，并在"内核里只有一个可切换组"时自动补组名。
         /// 【★ 持久化的真话】切完之后内核会把选择写进 <c>&lt;home&gt;/cache.db</c>
         ///   （实测：改选择 → 强杀进程 → 重启，<c>now</c> 仍是改后的值），
         ///   但我们的 home 现在是 <c>Package.Current.InstalledLocation</c>（只读），
@@ -792,106 +867,160 @@ namespace ClashUWP.Backend.Mihomo
 
             try
             {
-                int sp = arg.IndexOf(' ');
-                string group = sp < 0 ? "" : arg.Substring(0, sp).Trim();
-                string node = sp < 0 ? arg.Trim() : arg.Substring(sp + 1).Trim();
-                if (node.Length == 0)
-                    return $"select 参数里节点名为空: “{arg}”";
-
                 using var http = NewLoopbackClient(10);
-                System.Collections.Generic.List<ProxyGroup> groups;
-                using (var doc = System.Text.Json.JsonDocument.Parse(
-                           await http.GetStringAsync("http://127.0.0.1:9090/proxies")))
-                    groups = ReadProxiesTable(doc.RootElement).Groups;
-
-                if (groups.Count == 0)
-                    return "内核里没有可切换的代理组（先 groups / conf 确认订阅真的加载了）";
-
-                if (group.Length == 0)
-                {
-                    if (groups.Count > 1)
-                        return $"有 {groups.Count} 个组，必须指名：select <组名> <节点名>。组名：" +
-                               string.Join(" | ", GroupNames(groups));
-                    group = groups[0].Name;
-                }
-
-                ProxyGroup? target = null;
-                foreach (var g in groups)
-                    if (string.Equals(g.Name, group, System.StringComparison.Ordinal)) { target = g; break; }
-                if (target == null)
-                {
-                    // 用户可能把内置策略名当组名打进来（"select DIRECT xxx"）—— 值得单说一句，
-                    // 因为内置策略在 /proxies 表里和真组并排，看着就像组。
-                    bool builtin = false;
-                    foreach (string b in BuiltinProxyNames)
-                        if (string.Equals(b, group, System.StringComparison.Ordinal)) { builtin = true; break; }
-                    return $"找不到组 “{group}”（区分大小写，原样抄 groups 的输出）" +
-                           (builtin ? "：它是内核的内置策略，不是可切换的代理组。" : "") +
-                           "现有组：" + string.Join(" | ", GroupNames(groups));
-                }
-
-                bool ok = false;
-                foreach (string m in target.Members)
-                    if (string.Equals(m, node, System.StringComparison.Ordinal)) { ok = true; break; }
-                if (!ok)
-                {
-                    // 前 12 个成员原样回显，够抄了；全量给会把 debug-out.txt 撑爆。
-                    int n = target.Members.Count < 12 ? target.Members.Count : 12;
-                    return $"组 “{group}” 里没有节点 “{node}”（区分大小写、空格与 emoji 都算）。" +
-                           $"前 {n} 个成员：{string.Join(" | ", target.Members.GetRange(0, n))}" +
-                           (target.Members.Count > n ? " …（全量见 groups）" : "");
-                }
-
-                // 组名进 URL 一律 percent-encode。实测 PUT 吃原始 UTF-8（中文组名直接拼
-                // 也能 204），但那条"中文进路径就丢 query"的坑只发生在带 query 的
-                // /delay 上 —— 两种形态别赌，统一编码。节点名走 JSON body，不进 URL。
-                string url = "http://127.0.0.1:9090/proxies/" + Uri.EscapeDataString(group);
-                using var req = new System.Net.Http.HttpRequestMessage(
-                    System.Net.Http.HttpMethod.Put, url)
-                {
-                    Content = new System.Net.Http.StringContent(
-                        "{\"name\":\"" + JsonEscape(node) + "\"}", Encoding.UTF8, "application/json")
-                };
-                using var resp = await http.SendAsync(req);
-                string respBody = await resp.Content.ReadAsStringAsync();
-                if (respBody.Length > 200) respBody = respBody[..200] + "…";
-
-                // 回读 now：204 不等于"选上了"，只有这一格能证明。
-                string now = "(读不到)";
-                try
-                {
-                    using var d3 = System.Text.Json.JsonDocument.Parse(
-                        await http.GetStringAsync(url));
-                    now = GetString(d3.RootElement, "now");
-                    if (now.Length == 0) now = "(空)";
-                }
-                catch (Exception readEx)
-                {
-                    now = "(回读失败 " + readEx.GetType().Name + ")";
-                }
-
-                // 自动组（url-test / fallback / load-balance）的"选中"由内核自己维护：
-                // PUT 一个成员名会被接受，但下一轮测速/故障转移就把名字改回赢家。
-                // 必须当场说出来，否则"我明明选了它，怎么又回去了"会被读成 select 失败。
-                string groupNote = target.Type is "Selector" or "select"
-                    ? "" : $"\n※ 该组类型是 {target.Type}（自动组）：选择会立刻生效，" +
-                           "但测速/故障转移可能把它改回赢家 —— 不是 select 没成功。";
-
-                if (!resp.IsSuccessStatusCode)
-                    return $"PUT /proxies/{group} -> {(int)resp.StatusCode} {respBody}；现值 now={now}" + groupNote;
-
-                string verdict = string.Equals(now, node, System.StringComparison.Ordinal)
-                    ? "★ 已选中" : "⚠ 现值与请求不一致，别当成功";
-                return $"PUT /proxies/{group} -> {(int)resp.StatusCode}；now={now}（{verdict}）" +
-                       $"\n※ 选择由内核写进 <home>/cache.db 持久化，但当前 home 是只读的 " +
-                       $"InstalledLocation ⇒ 重启/重装后不保留（G10 修 home 之后才有持久化）。" +
-                       groupNote;
+                var groups = await FetchGroupsAsync(http);
+                var (group, node) = SplitSelectArg(arg.Trim(), groups);
+                return await SelectCoreAsync(http, groups, group, node, fromDebugText: true);
             }
             catch (Exception ex)
             {
                 ClashUWP.Vpn.RollingLog.Error("mihomo-select", ex);
                 return $"select 失败: {ex.GetType().Name}: {ex.Message}";
             }
+        }
+
+        /// <summary>取一次 <c>GET /proxies</c> 的组表（UI 与调试通道共用）。</summary>
+        private static async Task<System.Collections.Generic.List<ProxyGroup>> FetchGroupsAsync(
+            System.Net.Http.HttpClient http)
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(
+                await http.GetStringAsync("http://127.0.0.1:9090/proxies"));
+            return ReadProxiesTable(doc.RootElement).Groups;
+        }
+
+        /// <summary>
+        /// 把 <c>select</c> 的一行参数还原成 <c>(组名, 节点名)</c>。
+        ///
+        /// 【★ 判据是"组名做最长前缀匹配"，不是第一个空格】组名和节点名<b>都</b>可以带空格
+        ///   （订阅原文决定的，我们改不了），所以"遇到空格就切"只能碰对一种情况。
+        ///   而"哪个字符串是组名"这件事内核已经告诉过我们了 —— 就是本次
+        ///   <c>GET /proxies</c> 的组表，拿它来匹配是<b>有依据的判据</b>。
+        ///   取最长匹配：组名之间可能互为前缀（「美国 01」/「美国 01 直连」这类），
+        ///   短的先中会把长的切坏。
+        /// 【匹配不到时】退回老的空格口径，让 <see cref="SelectCoreAsync"/> 报
+        ///   "找不到组 X（现有组：…）"。这里不猜：把拼错的组名原样报出来，比自动改成
+        ///   "最像的那个组"有用 —— 自动改会把节点切到用户没打算切的组上。
+        /// ★ 参数是 Trim 过的（<c>DebugCommandLoop</c> 就 Trim 过），所以<b>首尾真空格</b>的
+        ///   节点名从这条路喂不进去 —— 那种成员用 UI 点（UI 走 <see cref="SelectAsync"/>，不拼串）。
+        /// </summary>
+        internal static (string Group, string Node) SplitSelectArg(
+            string arg, System.Collections.Generic.List<ProxyGroup> groups)
+        {
+            string best = "";
+            foreach (var g in groups)
+            {
+                if (g.Name.Length >= best.Length &&
+                    arg.Length > g.Name.Length + 1 &&
+                    arg.StartsWith(g.Name + " ", System.StringComparison.Ordinal))
+                    best = g.Name;
+            }
+            if (best.Length > 0)
+                return (best, arg.Substring(best.Length + 1).Trim());
+
+            int sp = arg.IndexOf(' ');
+            return sp < 0
+                ? ("", arg.Trim())
+                : (arg.Substring(0, sp).Trim(), arg.Substring(sp + 1).Trim());
+        }
+
+        /// <summary>
+        /// 校验 + <c>PUT /proxies/{组}</c> + 回读 <c>now</c>。两条入口共用这一条，
+        /// 保证"UI 点的"和"命令行打的"走同一份校验、同一种成功判据。
+        /// </summary>
+        /// <param name="fromDebugText">true = 参数来自一行文本（组名可能是猜的）；空节点名时报用法。</param>
+        private static async Task<string> SelectCoreAsync(
+            System.Net.Http.HttpClient http,
+            System.Collections.Generic.List<ProxyGroup> groups,
+            string group, string node, bool fromDebugText)
+        {
+            if (node.Length == 0)
+                return fromDebugText
+                    ? $"节点名为空。现有组：{string.Join(" | ", GroupNames(groups))}"
+                    : "select 需要参数：select <组名> <节点名>（只有一个组时可只写节点名）。" +
+                      "先用 groups 命令看确切的组名与节点名。";
+
+            if (groups.Count == 0)
+                return "内核里没有可切换的代理组（先 groups / conf 确认订阅真的加载了）";
+
+            if (group.Length == 0)
+            {
+                if (groups.Count > 1)
+                    return $"有 {groups.Count} 个组，必须指名：select <组名> <节点名>。组名：" +
+                           string.Join(" | ", GroupNames(groups));
+                group = groups[0].Name;
+            }
+
+            ProxyGroup? target = null;
+            foreach (var g in groups)
+                if (string.Equals(g.Name, group, System.StringComparison.Ordinal)) { target = g; break; }
+            if (target == null)
+            {
+                // 用户可能把内置策略名当组名打进来（"select DIRECT xxx"）—— 值得单说一句，
+                // 因为内置策略在 /proxies 表里和真组并排，看着就像组。
+                bool builtin = false;
+                foreach (string b in BuiltinProxyNames)
+                    if (string.Equals(b, group, System.StringComparison.Ordinal)) { builtin = true; break; }
+                return $"找不到组 “{group}”（区分大小写，原样抄 groups 的输出）" +
+                       (builtin ? "：它是内核的内置策略，不是可切换的代理组。" : "") +
+                       "现有组：" + string.Join(" | ", GroupNames(groups));
+            }
+
+            bool ok = false;
+            foreach (string m in target.Members)
+                if (string.Equals(m, node, System.StringComparison.Ordinal)) { ok = true; break; }
+            if (!ok)
+            {
+                // 前 12 个成员原样回显，够抄了；全量给会把 debug-out.txt 撑爆。
+                int n = target.Members.Count < 12 ? target.Members.Count : 12;
+                return $"组 “{group}” 里没有节点 “{node}”（区分大小写、空格与 emoji 都算）。" +
+                       $"前 {n} 个成员：{string.Join(" | ", target.Members.GetRange(0, n))}" +
+                       (target.Members.Count > n ? " …（全量见 groups）" : "");
+            }
+
+            // 组名进 URL 一律 percent-encode。实测 PUT 吃原始 UTF-8（中文组名直接拼
+            // 也能 204），但那条"中文进路径就丢 query"的坑只发生在带 query 的
+            // /delay 上 —— 两种形态别赌，统一编码。节点名走 JSON body，不进 URL。
+            string url = "http://127.0.0.1:9090/proxies/" + Uri.EscapeDataString(group);
+            using var req = new System.Net.Http.HttpRequestMessage(
+                System.Net.Http.HttpMethod.Put, url)
+            {
+                Content = new System.Net.Http.StringContent(
+                    "{\"name\":\"" + JsonEscape(node) + "\"}", Encoding.UTF8, "application/json")
+            };
+            using var resp = await http.SendAsync(req);
+            string respBody = await resp.Content.ReadAsStringAsync();
+            if (respBody.Length > 200) respBody = respBody[..200] + "…";
+
+            // 回读 now：204 不等于"选上了"，只有这一格能证明。
+            string now = "(读不到)";
+            try
+            {
+                using var d3 = System.Text.Json.JsonDocument.Parse(
+                    await http.GetStringAsync(url));
+                now = GetString(d3.RootElement, "now");
+                if (now.Length == 0) now = "(空)";
+            }
+            catch (Exception readEx)
+            {
+                now = "(回读失败 " + readEx.GetType().Name + ")";
+            }
+
+            // 自动组（url-test / fallback / load-balance）的"选中"由内核自己维护：
+            // PUT 一个成员名会被接受，但下一轮测速/故障转移就把名字改回赢家。
+            // 必须当场说出来，否则"我明明选了它，怎么又回去了"会被读成 select 失败。
+            string groupNote = target.Type is "Selector" or "select"
+                ? "" : $"\n※ 该组类型是 {target.Type}（自动组）：选择会立刻生效，" +
+                       "但测速/故障转移可能把它改回赢家 —— 不是 select 没成功。";
+
+            if (!resp.IsSuccessStatusCode)
+                return $"PUT /proxies/{group} -> {(int)resp.StatusCode} {respBody}；现值 now={now}" + groupNote;
+
+            string verdict = string.Equals(now, node, System.StringComparison.Ordinal)
+                ? "★ 已选中" : "⚠ 现值与请求不一致，别当成功";
+            return $"PUT /proxies/{group} -> {(int)resp.StatusCode}；now={now}（{verdict}）" +
+                   $"\n※ 选择由内核写进 <home>/cache.db 持久化，但当前 home 是只读的 " +
+                   $"InstalledLocation ⇒ 重启/重装后不保留（G10 修 home 之后才有持久化）。" +
+                   groupNote;
         }
 
         /// <summary>组名列表（报错时把候选原样回出来，供照抄）。</summary>

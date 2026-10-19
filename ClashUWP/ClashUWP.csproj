@@ -50,8 +50,7 @@
         2) 开了 IncludePublishItemsOutputGroup 后，ClashUWP.exe 入口桩由发布产物
            （ResolvedFileToPublish）正确提供，无需再手工补 apphost。 -->
     <AppxPackageSigningEnabled>true</AppxPackageSigningEnabled>
-    <PackageCertificateKeyFile>ClashUWP_TemporaryKey.pfx</PackageCertificateKeyFile>
-    <PackageCertificateThumbprint>EDF4E8E0A70864E1F82376012ADE32DAD509DE9F</PackageCertificateThumbprint>
+    <PackageCertificateKeyFile>D:\fluentapps\repos\DockedTools\DockedTools\Docked AI_StoreKey.pfx</PackageCertificateKeyFile>
     <!-- 让 `msbuild -t:Publish`（走 pubxml 的 RID/SelfContained 出 AOT 产物）之后
          追加生成签名 MSIX。等价 VS「创建应用包」在 Publish 阶段产出包。 -->
     <PublishAppxPackage>true</PublishAppxPackage>
@@ -61,6 +60,14 @@
          这里显式置 true，让 GetPackagingOutputs 走 __GetPublishItems 收集 AOT 原生文件，
          并触发 WinAppSdkRemoveLinkedFilesFromPayload 剔除托管运行时。 -->
     <IncludePublishItemsOutputGroup>true</IncludePublishItemsOutputGroup>
+    <GenerateTemporaryStoreCertificate>True</GenerateTemporaryStoreCertificate>
+    <GenerateAppInstallerFile>False</GenerateAppInstallerFile>
+    <AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
+    <AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
+    <GenerateTestArtifacts>False</GenerateTestArtifacts>
+    <AppxBundle>Auto</AppxBundle>
+    <AppxBundlePlatforms>x64</AppxBundlePlatforms>
+    <HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
   </PropertyGroup>
 
   <ItemGroup>
@@ -91,7 +98,7 @@
          TCP 直接 WSAEACCES 10013 / ICMP General failure，本地瞬败而非超时；
          V1 Start() 又静默不装 inclusion 路由）。1.0.6 的校验和补齐与采样一并保留。
          ★ 插件源码改了就必须重新 pack 并抬版本号，否则主工程吃的还是旧 nupkg。 -->
-    <PackageReference Include="ClashUWP.Vpn" Version="1.0.42" />
+    <PackageReference Include="ClashUWP.Vpn" Version="1.0.43" />
   </ItemGroup>
 
   <!--
