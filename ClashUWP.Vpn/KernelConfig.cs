@@ -8,7 +8,11 @@ using Windows.Storage;
 namespace ClashUWP.Vpn
 {
     /// <summary>
-    /// 「交给 mihomo 的那份 YAML」的就地改写器 —— 只动两个块：<c>dns:</c> 与 <c>tun:</c>。
+    /// 「交给 mihomo 的那份 YAML」的就地改写器。五件事，各自只认一个块：
+    ///   <c>dns:</c> 强制 fake-ip、<c>tun:</c> 关掉内核自己的网卡、
+    ///   <c>proxy-groups:</c> 把 url-test 的 tolerance 锁死（只测速不换节点）、
+    ///   <c>rules:</c> 在开头注入应用分流规则（<see cref="AppSplit"/>，1.0.35 / G9）、
+    ///   <c>dns:</c> 再叠一层用户覆盖（<see cref="DnsConfig"/>，1.0.69 / DNS 可配）。
     ///
     /// 【为什么必须在代码里改，而不是手改 LocalState\config.yaml】
     ///   2026-10-16 run 24 的结论链（Docs/08 §9）：
@@ -67,21 +71,35 @@ namespace ClashUWP.Vpn
         /// 把订阅/前台 YAML 改成"本插件能跑通数据面"的形态。
         /// 输入不是 YAML（比如内置兜底那份 JSON）时原样返回。任何异常原样返回 ——
         /// 改写失败最多退回到 redir-host 的老行为，绝不能让 Connect 抛在平台回调里。
+        ///
+        /// ★【1.0.35】不再有"只传文本"的重载：应用分流名单是这次改写的<b>输入之一</b>，
+        ///   漏传就等于"静默不注入"。<see cref="ClashVpnPlugin"/> 步 4.1 与
+        ///   <see cref="SubscriptionReload"/> 两条路必须都走这一个入口、
+        ///   产出<b>逐字相同</b>的那份 <c>config.kernel.yaml</c>
+        ///   （Docs/12 §9.4 的"单源"约定：少一条注入，热重载就会把名单覆盖回订阅原文）。
         /// </summary>
-        internal static string Transform(string yaml)
+        internal static string Transform(string yaml, AppSplit? split, out string splitNote)
         {
+            splitNote = "未处理";
             try
             {
                 if (string.IsNullOrWhiteSpace(yaml))
+                {
+                    splitNote = split == null || split.IsEmpty ? "无名单，配置未动" : "配置为空，名单忽略";
                     return yaml;
+                }
                 // 内置兜底配置是 JSON（首字符 '{'），不该用行式 YAML 解析器碰它。
                 if (yaml.TrimStart().StartsWith("{"))
+                {
+                    splitNote = split == null || split.IsEmpty ? "无名单，配置未动" : "兜底 JSON 不注入名单";
                     return yaml;
+                }
 
                 List<string> lines = new(yaml.Replace("\r\n", "\n").Split('\n'));
                 EnsureDnsBlock(lines);
                 EnsureTunBlock(lines);
                 LockUrlTestTolerance(lines);
+                InjectAppSplitRules(lines, split, out splitNote);
 
                 StringBuilder sb = new(lines.Count * 24);
                 for (int i = 0; i < lines.Count; i++)
@@ -94,6 +112,7 @@ namespace ClashUWP.Vpn
             }
             catch
             {
+                splitNote = "改写异常，退回原文";
                 return yaml;
             }
         }
@@ -355,6 +374,92 @@ namespace ClashUWP.Vpn
                 }
             }
         }
+
+        /// <summary>
+        /// ★【1.0.35 · G9 应用分流】把 <see cref="AppSplit"/> 名单转成
+        /// <c>PROCESS-NAME</c> / <c>PROCESS-PATH</c> 规则，<b>插到订阅 <c>rules:</c> 的最前面</b>。
+        ///
+        /// 【为什么插在开头】mihomo 是<b>第一条命中即停</b>（<c>tunnel/tunnel.go</c> 的
+        ///   <c>match()</c> 按顺序遍历 <c>Rules</c>），而订阅末尾恒有一条兜底
+        ///   （<c>MATCH</c> 或 <c>GEOIP/…</c> 序列）。插在末尾等于永远轮不到。
+        ///
+        /// 【为什么单引号包住整条规则】照抄订阅自己的写法（实测
+        ///   <c>.local/config.yaml:52</c> 是 <c>    - 'DOMAIN,xxx,DIRECT'</c>，四空格缩进 + 单引号）。
+        ///   单引号标量里 <c>\</c> 是字面量，不做转义处理 ⇒ Windows 路径
+        ///   <c>C:\Program Files\...\x.exe</c> 能原样进规则；
+        ///   而 <see cref="AppSplit.IsSafeToken"/> 已经挡掉了 <c>'</c>，不存在提前闭合引号的可能。
+        ///
+        /// 【缩进从订阅的第一条规则行取，不写死】订阅有两派写法（四空格 / 两空格），
+        ///   写死会把 YAML 改成另一个层级 —— 与 <see cref="EnsureDnsBlock"/> 里
+        ///   <c>ChildIndent</c> 同一个理由。
+        ///
+        /// ★【三种"不注入"都要把原因交回调用方】没有 <c>rules:</c> 块、
+        ///   <c>rules:</c> 是行内流式写法（<see cref="IsInlineBlock"/>）、块里一条子项都没有 ——
+        ///   前两种改下去就是拿 YAML 冒险（run 25 的 <c>yaml: line 576</c> 教训：
+        ///   改坏 YAML 的代价是"内核没起来但隧道照装"的整机黑洞），
+        ///   第三种说明这份配置本来就不完整。三档一律<b>宁可漏改</b>，
+        ///   但必须让 <c>note</c> 说明白，界面与日志里看得见"名单写了却没生效"。
+        /// </summary>
+        private static void InjectAppSplitRules(List<string> lines, AppSplit? split, out string note)
+        {
+            note = "无名单，rules 未动";
+            if (split == null || split.IsEmpty)
+                return;
+
+            int ruleCount = split.Rules.Count;
+            int badCount = split.Rejected.Count;
+
+            int start = FindTopLevelKey(lines, "rules");
+            if (start < 0)
+            {
+                note = DescribeSkip(ruleCount, badCount, "配置里没有 rules 块");
+                return;
+            }
+            if (IsInlineBlock(lines, start))
+            {
+                note = DescribeSkip(ruleCount, badCount, "rules 是行内流式写法，不动它");
+                return;
+            }
+
+            int end = EndOfBlock(lines, start);
+
+            int firstItem = -1;
+            for (int i = start + 1; i < end; i++)
+            {
+                if (lines[i].TrimStart().StartsWith("-"))
+                {
+                    firstItem = i;
+                    break;
+                }
+            }
+            if (firstItem < 0)
+            {
+                note = DescribeSkip(ruleCount, badCount, "rules 块里没有任何条目");
+                return;
+            }
+
+            string indent = LeadingSpaces(lines[firstItem]);
+            IList<string> rules = split.ToMihomoRules();
+
+            // 倒序插入同一个位置 = 正序排在订阅规则之前（List.Insert 会把已插入的下推）。
+            for (int k = rules.Count - 1; k >= 0; k--)
+                lines.Insert(start + 1, indent + "- '" + rules[k] + "'");
+
+            int nameCount = 0;
+            int pathCount = 0;
+            foreach (AppSplitRule r in split.Rules)
+            {
+                if (r.Kind == "path") pathCount++;
+                else nameCount++;
+            }
+
+            note = $"注入 {rules.Count} 条（PROCESS-NAME×{nameCount}, PROCESS-PATH×{pathCount}）" +
+                   (badCount > 0 ? $"，畸形 {badCount} 行已忽略" : "");
+        }
+
+        /// <summary>没注入时的原因句式，把"名单有几条、几行畸形"一起带上，界面直接显示。</summary>
+        private static string DescribeSkip(int ruleCount, int badCount, string reason) =>
+            $"{ruleCount} 条未注入：{reason}" + (badCount > 0 ? $"（另有畸形 {badCount} 行）" : "");
 
         /// <summary>
         /// 这一行是不是"行内流式"写法 —— 即 <c>dns: {a: 1, b: 2}</c> / <c>tun: {enable: true}</c>。

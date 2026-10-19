@@ -346,6 +346,57 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal static bool StatusToast = true;
 
+        /// <summary>
+        /// ★【1.0.35 · G5】会话边界清不清内核缓存、清到哪一层。默认 <b>0 = 不清</b>。
+        ///
+        /// 【这条对齐的是谁】安卓 <c>ClashRuntime.kt:31-32,50-53</c> 进出各一次
+        ///   <c>Clash.reset()</c> + <c>clearOverride(Session)</c>，
+        ///   <c>SuspendModule.kt:17,28,34</c> 还按亮灭屏 <c>suspendCore</c>。
+        ///   我们因为桥常驻（Docs/05 §2④ 为绕开"同进程第二次 Start 回不来"刻意选的），
+        ///   fake-ip 表 / DNS 缓存 / 在途连接登记表<b>跨会话全留着</b>（Docs/12 §2 G5）。
+        ///
+        /// 【三档，分界线画在"动不动 fake-ip 池"】
+        ///   0 = 什么都不清 = 本批改动之前的行为，逐字不变。
+        ///   1 = <c>POST /cache/dns/flush</c> + <c>DELETE /connections</c>。
+        ///       只清解析缓存与在途连接登记表，<b>不动 fake-ip 池</b>。
+        ///   2 = 在 1 的两步之外再加 <c>POST /cache/fakeip/flush</c>。
+        ///       ★ 这一档有自己的代价，必须写明白：mihomo 的 fake-ip 池是<b>落盘的</b>
+        ///         （<c>component/fakeip/cachefile.go</c>，就在 <c>cache.db</c> 里，
+        ///         而 cache.db 在 home —— home 是 G10/<see cref="KernelHome"/> 迁过来的），
+        ///         跨会话复用正是"同一个域名下次还拿到同一个假 IP"的来源；
+        ///         <c>Pool.FlushFakeIP()</c>（<c>component/fakeip/pool.go:110-117</c>）
+        ///         是<b>整池清空 + offset 归位</b>，可 Windows 侧 DNS 缓存里那些旧
+        ///         <c>198.18.x.x</c> 不会跟着失效 —— 应用拿着一个"池里已无记录"的假 IP 再连，
+        ///         内核就只能按 IP 匹配规则（域名规则全部失效），行为随之改变。
+        ///         ⇒ 所以 2 号不是"更彻底的 1 号"，是<b>另一件事</b>，要单独判读。
+        ///
+        /// ★【为什么默认 0 —— 两个都没验的前提】
+        ///   ① 控制器在<b>包内</b>是否真可达仍未确认（Docs/12 §8：宿主侧 netstat 看得见
+        ///      <c>127.0.0.1:9090 LISTENING</c>，但包外 curl 超时 = AppContainer 回环隔离）。
+        ///      热重载已经踩在同一个前提上，可它的成败只有返回码能说明；
+        ///      本开关同样只能靠返回码判断 ⇒ 在它被读回来之前不当产品默认
+        ///      （口径同 <see cref="ReceiveBatch"/> 的档 0：没有实测证据之前不改产品默认）。
+        ///   ② 三个端点都<b>不幂等于"无副作用"</b>：<c>DELETE /connections</c>
+        ///      （<c>hub/route/connections.go:81-87</c>）是遍历 <c>statistic.DefaultManager</c>
+        ///      逐个 <c>c.Close()</c> —— 在会话<b>进行中</b>调它就是把用户正在下的东西掐了。
+        ///      本实现只在会话<b>边界</b>调（连接建立后、会话收尾时），但"边界"仍是时序假设。
+        ///   ⇒ 拨档后判据在 plugin.log 的 <c>channel=session-reset</c> 那一行：
+        ///     每个端点都要回 <c>204</c>；出现 <c>connect=异常名</c> 就是前提 ① 不成立，
+        ///     这条功能整体退回"桥常驻、跨会话不清"的现状（Docs/12 G5 仍在）。
+        ///
+        /// 【真挂起（suspendCore）这条仍然没做，写明白】mihomo 的挂起入口是 golang bind 的
+        ///   <c>Clash.suspendCore(...)</c>，我们的桥 ABI 只有
+        ///   start/stop/put_packet/get_packet/last_error/bound_iface（<see cref="MihomoBridge"/>），
+        ///   REST 侧也没有对应端点 —— 要么改 Go 重编 <c>clash_bridge.dll</c>（本机无 Go 工具链，
+        ///   装工具链属于改用户机器，Docs/12 §5 第 12 项明确"未获同意不动"），
+        ///   要么用 <c>POST /restart</c>，而那个是<b>重新拉起进程</b>：在 in-proc 形态下
+        ///   等于把承载隧道的进程重启（<c>hub/route/restart.go</c> 走的是
+        ///   <c>os.Exit</c> + 重新 spawn），数据面与平台通道一起没。
+        ///   ★ 所以 <c>POST /restart</c> 在本项目里是<b>地雷</b>，任何代码与 debug-cmd 都不许碰。
+        ///   ⇒ 本批只做"重置"这一半，"挂起"保持缺口状态。
+        /// </summary>
+        internal static int SessionReset = 0;
+
         internal static void Load()
         {
             // 先恢复默认，避免上一次连接的值残留到本次
@@ -370,6 +421,8 @@ namespace ClashUWP.Vpn
             StatusToast = true;
             FakeIp = true;
             FailFast = true;
+            // ★ 默认 0 = 不清（理由见字段注释：两个未验前提）。字段初始值与这里必须一致。
+            SessionReset = 0;
             Source = "默认值";
 
             try
@@ -403,6 +456,7 @@ namespace ClashUWP.Vpn
                 StatusToast = ReadBool(map, "statusToast", StatusToast);
                 FakeIp = ReadBool(map, "fakeIp", FakeIp);
                 FailFast = ReadBool(map, "failFast", FailFast);
+                SessionReset = ReadInt(map, "sessionReset", SessionReset, 0, 2);
                 Source = "settings.txt";
             }
             catch
@@ -412,7 +466,7 @@ namespace ClashUWP.Vpn
 
             // ★ 这一行是发布版最值钱的日志：把<b>本次真正生效</b>的开关原样打出来。
             //   之前出过一次只有这里能抓到的事故 —— ReadInt 硬编码 0..2 上界，
-            //   settings.txt 写 encapReturn=4 却被静默落回 2，"实验臂看着切换了、
+            //   settings.txt 写 encapReturn=4 却被静默回落 2，"实验臂看着切换了、
             //   其实没切"。光看 settings.txt 永远发现不了，必须看读到什么。
             //   同时记 log=...：日志自己丢了多少行，决定这行以下还能不能信。
             RollingLog.Info("settings",
@@ -422,6 +476,7 @@ namespace ClashUWP.Vpn
                 $"selfSplit={SelfSplitTunnel} outer={OuterTarget}:{OuterPort} includeMode={IncludeMode} " +
                 $"fakeIp={(FakeIp ? 1 : 0)} failFast={(FailFast ? 1 : 0)} " +
                 $"watchdog={(SessionWatchdog ? 1 : 0)} statusToast={(StatusToast ? 1 : 0)} " +
+                $"sessionReset={SessionReset} " +
                 $"{RollingLog.Diag()}");
         }
 

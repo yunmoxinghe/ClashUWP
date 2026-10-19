@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
+using Microsoft.UI.Reactor;
 using Microsoft.UI.Reactor.Core;
 
 using ClashUWP.Backend;
@@ -35,9 +36,53 @@ namespace ClashUWP.Frontend
     ///
     /// 【纪律】连接/断开/重建这三下是碰隧道的，UI 上就是按钮，点了就是点了；
     ///   自动刷新<b>绝不会</b>去调它们。
+    ///
+    /// ★★【1.0.67 · 侧边栏 + 云母】这一版只动"怎么摆"，不动"有什么"：
+    ///   ① 根元素从 <c>ScrollViewer(VStack(…))</c> 换成 <c>NavigationView(…)</c>，
+    ///      左侧四页：<b>主页 / 代理 / 订阅 / 设置</b>（原先 11 个区块竖着排一条，
+    ///      找一个动作要滚半屏）；
+    ///   ② 根元素挂 <c>.Backdrop(BackdropKind.Mica)</c>。★ UWP 侧的云母不是 WinUI 3
+    ///      那条 <c>Window.SystemBackdrop</c>：框架在 <c>ReactorHost.ApplyBackdrop</c>
+    ///      里走 WinUI 2 的 <c>BackdropMaterial.ApplyToRootOrPageBackground(root, true)</c>
+    ///      并把 root 背景置空（反编译 alpha.13 的 <c>Reactor.uwp.dll</c> 核过这段，
+    ///      自家画廊 <c>samples/Reactor.Gallery/SampleShell.cs</c> 也是同一挂法），
+    ///      所以"有没有云母"要拿实机截图判，不能靠代码断言；
+    ///      设置页给了「云母 / 桌面亚克力 / 无」三档当场对比（<b>不落盘</b>，理由见
+    ///      <see cref="MaterialPicker"/>）。
+    ///   ③ <b>没有</b>铺卡片背景：WinUI 2.8 的资源键集合里没有 WinUI 3 那套 Fluent 颜色令牌
+    ///      （<c>CardBackgroundFillColorDefaultBrush</c> 一类），而框架的
+    ///      <c>ThemeResource.Brush()</c> 找不到键时返回<b>透明笔刷而不是抛</b>
+    ///      （<c>BackdropExtensions</c> 同族代码，反编译可见 <c>?? new SolidColorBrush(Colors.Transparent)</c>）
+    ///      ⇒ <c>.Background(Theme.CardBackground)</c> 在这里等于"画了个寂寞"，
+    ///      所以层级靠间距与小标题（<see cref="Section"/>），不靠假卡片。
+    ///   ④ 删掉 1.0.48 遗留的脚手架：<c>"Reactor.Uwp 已接管（N）"</c> 那行标题与
+    ///      <c>点一下</c> 计数器 —— 接管验证早就过了，留着只会挡在主页最上面。
     /// </summary>
     public sealed class MainComponent : Component
     {
+        // ==================== 外壳：侧边栏四项 ====================
+
+        // 索引即 MenuItems 的顺序，也是 NavigationView.SelectedIndex 的取值。
+        private const int PageHome = 0;
+        private const int PageProxy = 1;
+        private const int PageSubscription = 2;
+        private const int PageSettings = 3;
+
+        /// <summary>
+        /// 侧边栏条目。★ 图标是<b>原始字形码</b>（框架把它直接塞进 <c>FontIcon.Glyph</c>，
+        /// 见 <c>NavigationViewHandler.FillMenuGroup</c>），所以字形必须来自
+        /// Segoe MDL2 Assets 的真表：这四个码位是从官方 WinUI-Gallery 的
+        /// <c>WinUIGallery/Samples/Iconography/IconsData.json</c>（name→code 对照表）
+        /// 逐条查出来的，不是凭印象写的 —— 猜错的码位不会报错，只会画成另一个图标或豆腐块。
+        /// </summary>
+        private static readonly NavigationViewItemData[] MenuItems =
+        {
+            NavItem("主页", "\uE80F"),   // Home
+            NavItem("代理", "\uE774"),   // Globe
+            NavItem("订阅", "\uE896"),   // Download
+            NavItem("设置", "\uE713"),   // Setting
+        };
+
         // ---- 会话状态 ----
         private Action<string> _setVpnStatus = _ => { };
         private Action<string> _setActionHint = _ => { };
@@ -64,9 +109,28 @@ namespace ClashUWP.Frontend
         private SubscriptionManager.ActiveInfo _subActive = new("", "");
         private Action<SubscriptionManager.ActiveInfo> _setSubActive = _ => { };
 
+        // ---- 应用分流（G9）----
+        // ★ 状态里存的是<b>规范化后的名单行</b>（<c>kind|标识|去向</c>），不是 AppSplit 对象：
+        //   每次增删都换一个<b>新的 List</b> 交给 UseState ——  Reactor 的 UseState 靠
+        //   " setter 收到新值"重渲染，把同一个 List 原地改了再 set 回去，
+        //   很可能一次重渲染都不触发（引用相等）。这条与 <see cref="_subProfiles"/> 同一口径。
+        private Action<List<string>> _setSplitLines = _ => { };
+        private Action<string> _setSplitNote = _ => { };
+        private Action<string> _setSplitMsg = _ => { };
+        private Action<string> _setProbeText = _ => { };
+        private Action<string> _setSplitKind = _ => { };
+        private Action<string> _setSplitIdentity = _ => { };
+        private Action<string> _setSplitTarget = _ => { };
+        // 输入框的即时值：按钮是"渲染之外"的代码，只能读字段（见 1.0.63 的值镜像纪律）。
+        private string _splitKind = "name";
+        private string _splitIdentity = "";
+        private string _splitTarget = "DIRECT";
+
         public override Element Render()
         {
-            var (count, setCount) = UseState(0);
+            // ---- 外壳状态（【1.0.67】）----
+            var (page, setPage) = UseState(PageHome);
+            var (material, setMaterial) = UseState(0);   // 0=云母 1=桌面亚克力 2=无
 
             var (vpnStatus, setVpnStatus) = UseState("未连接");
             var (actionHint, setActionHint) = UseState("");
@@ -79,6 +143,15 @@ namespace ClashUWP.Frontend
             var (subProfiles, setSubProfiles) = UseState(new List<SubscriptionManager.Profile>());
             var (subActive, setSubActive) = UseState(new SubscriptionManager.ActiveInfo("", ""));
 
+            // ---- 应用分流（G9）状态 ----
+            var (splitLines, setSplitLines) = UseState(new List<string>());
+            var (splitNote, setSplitNote) = UseState("(还没读过)");
+            var (splitMsg, setSplitMsg) = UseState("");
+            var (probeText, setProbeText) = UseState("");
+            var (splitKind, setSplitKind) = UseState("name");
+            var (splitIdentity, setSplitIdentity) = UseState("");
+            var (splitTarget, setSplitTarget) = UseState("DIRECT");
+
             _setVpnStatus = setVpnStatus;
             _setActionHint = setActionHint;
             _setSnap = setSnap;
@@ -89,6 +162,17 @@ namespace ClashUWP.Frontend
             _setSubUrl = setSubUrl;
             _setSubProfiles = setSubProfiles;
             _setSubActive = setSubActive;
+            _setSplitLines = setSplitLines;
+            _setSplitNote = setSplitNote;
+            _setSplitMsg = setSplitMsg;
+            _setProbeText = setProbeText;
+            _setSplitKind = setSplitKind;
+            _setSplitIdentity = setSplitIdentity;
+            _setSplitTarget = setSplitTarget;
+            // ★ 值镜像同 _subUrl 那条纪律：「添加」按钮在渲染之外读这三个字段。
+            _splitKind = splitKind;
+            _splitIdentity = splitIdentity;
+            _splitTarget = splitTarget;
 
             // ★【1.0.63】值镜像：字段（_subUrl/_subActive）是给"渲染之外"的代码用的
             //   （轮询回填读 _subActive.Id、拉取按钮读 _subUrl），而 UseState 的值只活在
@@ -186,72 +270,266 @@ namespace ClashUWP.Frontend
                         RollingLog.Info("profile-sub-sync", sync);
                     }
                     catch { /* 读不到就显示"不存在"，不让 UI 白屏 */ }
+
+                    // ★ 应用分流名单也只在挂载时读一次（同上一条理由：手工文件不会自己变）。
+                    //   单独一个 try：订阅那边读失败不该让名单也不显示。
+                    try
+                    {
+                        var view = await AppSplitStore.LoadAsync();
+                        _setSplitLines(RuleLines(view.Split));
+                        _setSplitNote(view.LastInjection);
+                        if (view.Split.Rejected.Count > 0)
+                            _setSplitMsg($"文件里有 {view.Split.Rejected.Count} 行没被采纳：" +
+                                         string.Join(" / ", StrList(view.Split.Rejected)));
+                    }
+                    catch { _setSplitNote("(读取名单失败)"); }
                 });
             }, Array.Empty<object>());
 
-            return ScrollViewer(
-                VStack(
-                    TextBlock($"ClashUWP —— Reactor.Uwp 已接管（{count}）"),
-                    TextBlock($"VPN：{vpnStatus}"),
-                    actionHint.Length > 0 ? TextBlock(actionHint) : Empty(),
+            // ★★ 四页共用同一份状态与同一条轮询：切页<b>不</b>重启轮询、不重新读文件。
+            //   （轮询挂在挂载时的那次渲染上，切页只换 content 子树。）
+            Element body = page switch
+            {
+                PageProxy => ProxyPage(snap, activeGroup, selectedGroup),
+                PageSubscription => SubscriptionPage(subInfo, subProfiles, subActive, subUrl, actionHint),
+                PageSettings => SettingsPage(actionHint, logOpen, logText, material, setMaterial,
+                        splitLines, splitNote, splitMsg, probeText, splitKind, splitIdentity, splitTarget),
+                _ => HomePage(vpnStatus, actionHint, snap),
+            };
 
-                    // ================= VPN 控制 =================
-                    TextBlock("═══ VPN 控制 ═══"),
-                    HStack(
+            return NavigationView(
+                    content: body,
+                    menuItems: MenuItems,
+                    paneDisplayMode: NavPaneDisplayMode.Left,
+                    selectedIndex: page,
+                    // 受控选择：只认落在四项里的 index。内置那条「设置」第五项
+                    // （IsSettingsVisible 默认开着的那个）会报成越界值，本批直接关掉它 ——
+                    // 设置是侧边栏第四项，不需要框架再送一条到-pane-底部。
+                    onSelectedIndexChanged: index =>
+                    {
+                        if (index >= 0 && index < MenuItems.Length) setPage(index);
+                    },
+                    isSettingsVisible: false,
+                    // 没有回退栈（四页平级），返回键就该收起来而不是灰着。
+                    isBackButtonVisible: NavBackButtonVisible.Collapsed,
+                    header: PageHeader(page),
+                    paneTitle: "ClashUWP")
+                .Backdrop(MaterialKind(material));
+        }
+
+        // ==================== 外壳的三个小工 ====================
+
+        /// <summary>页标题（落在 <c>NavigationView.Header</c> 上，由控件模板给 28px 半粗）。</summary>
+        private static string PageHeader(int page) => page switch
+        {
+            PageProxy => "代理",
+            PageSubscription => "订阅",
+            PageSettings => "设置",
+            _ => "主页",
+        };
+
+        /// <summary>
+        /// 设置页那个材质序号 → 框架的 <see cref="BackdropKind"/>。
+        /// ★ 0 是默认（云母）；<c>None</c> 让框架把 root 背景恢复成不透明，用来对照
+        ///   "到底是材质没生效，还是材质生效了但内容层把它盖住了"。
+        /// </summary>
+        private static BackdropKind MaterialKind(int index) => index switch
+        {
+            1 => BackdropKind.DesktopAcrylic,
+            2 => BackdropKind.None,
+            _ => BackdropKind.Mica,
+        };
+
+        /// <summary>
+        /// 一个区块 = 小标题 + 内容。
+        /// ★ 标题的字号与字重是<b>写死的</b>（20 / 600），没走 <c>ApplyStyle("SubtitleTextBlockStyle")</c>：
+        ///   那条路径要在 <c>Application.Current.Resources</c> 里查到同名样式键才有效，
+        ///   而查不到时框架只记一条警告、什么都不画（<c>ElementExtensions.ApplyNamedStyle</c>），
+        ///   在本机又没有 XAML 可以对着看 ⇒ 用确定生效的显式值，不用"可能生效"的样式键。
+        ///   这套数值就是框架自己的 <c>SubHeading</c> 工厂用的那对（见 Reactor.Uwp 源码
+        ///   <c>Elements/Factories.cs</c>），不算另立标准。
+        /// ★ 没写 <c>.HeadingLevel(Level2)</c>：alpha.13 的 UWP 版
+        ///   <c>ElementExtensions</c> 里<b>没有</b>这个修饰器（对照反编译清单，
+        ///   <c>CornerRadius</c> 同样没有），写了就是 CS1061。读屏拿不到标题层级，
+        ///   这是本包的现状，不是本批偷懒。
+        /// </summary>
+        private static Element Section(string title, params Element?[] items) =>
+            VStack(8,
+                TextBlock(title)
+                    .FontSize(20)
+                    .FontWeight(new Windows.UI.Text.FontWeight(600)),
+                VStack(6, items));
+
+        /// <summary>一整页：外层滚动 + 区块之间的呼吸（20px，4px 网格）。</summary>
+        private static Element Page(params Element?[] sections) =>
+            ScrollViewer(VStack(20, sections))
+                .Padding(24, 20, 24, 20);
+
+        // ==================== 各区块 ====================
+
+        /// <summary>
+        /// 主页：先把"隧道在不在、点哪三下"讲完，再给运行态与活动连接。
+        /// ★ 这三块共用 3 秒轮询那份快照，切到别的页轮询照跑（见 <c>Render</c> 里的挂载 effect）。
+        /// </summary>
+        private Element HomePage(string vpnStatus, string actionHint, KernelView.Snapshot snap) =>
+            Page(
+                Section("VPN 控制",
+                    TextBlock($"当前状态：{vpnStatus}"),
+                    actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty(),
+                    HStack(8,
                         Button("建/重建 profile", () => _ = RunAsync(_setActionHint, "重建中…", VpnSession.RecreateAsync)),
                         Button("连接 VPN", () => _ = RunAsync(_setVpnStatus, "连接中…", () => VpnSession.ConnectAsync())),
-                        Button("断开 VPN", () => _ = RunAsync(_setVpnStatus, "断开中…", VpnSession.DisconnectAsync))),
+                        Button("断开 VPN", () => _ = RunAsync(_setVpnStatus, "断开中…", VpnSession.DisconnectAsync)))),
 
-                    // ================= 内核运行态（G8）=================
-                    TextBlock("═══ 内核运行态 ═══"),
-                    KernelStatusPanel(snap),
+                Section("内核运行态", KernelStatusPanel(snap)),
 
-                    // ================= 模式切换 =================
-                    HStack(
+                Section("活动连接", ConnectionList(snap)));
+
+        /// <summary>代理页：模式（rule/global/direct）+ 组 + 节点。都是纯内核 REST，不碰隧道。</summary>
+        private Element ProxyPage(KernelView.Snapshot snap, string activeGroup, string selectedGroup) =>
+            Page(
+                Section("模式",
+                    HStack(8,
                         Button("mode rule", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("rule"))),
                         Button("mode global", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("global"))),
-                        Button("mode direct", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("direct")))),
+                        Button("mode direct", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("direct"))))),
 
-                    // ================= 订阅（G1）=================
-                    TextBlock("═══ 订阅 ═══"),
-                    SubscriptionPanel(subInfo, subProfiles, subActive),
-                    HStack(
+                Section("代理组", GroupPicker(snap, selectedGroup)),
+
+                Section("节点", MemberList(snap, activeGroup)));
+
+        /// <summary>订阅页：元信息 + 已存 profile + 拉取/更新/热重载。</summary>
+        private Element SubscriptionPage(SubscriptionView.Info info,
+                                         List<SubscriptionManager.Profile> profiles,
+                                         SubscriptionManager.ActiveInfo active,
+                                         string subUrl,
+                                         string actionHint) =>
+            Page(
+                Section("当前生效", SubscriptionPanel(info, profiles, active)),
+
+                Section("添加订阅",
+                    HStack(8,
                         TextBox(subUrl, v => _setSubUrl(v), "https://… 订阅链接"),
                         Button("拉取并启用", () => _ = FetchSubscriptionAsync())),
-                    HStack(
+                    // ★ 只填 URL 时给一句明确提示（1.0.63 的坑：字段没镜像时按钮永远报"URL 不能为空"，
+                    //   界面上看不出是状态没跟上还是真没填 —— 现在把判定写在界面上）。
+                    subUrl.Trim().Length == 0
+                        ? TextBlock("（粘贴链接后点「拉取并启用」；浏览器一键导入会自动填进这里）")
+                              .Foreground(Theme.SecondaryText)
+                        : Empty(),
+                    actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty()),
+
+                Section("维护",
+                    HStack(8,
                         Button("更新当前订阅", () => _ = UpdateSubscriptionAsync()),
                         Button("重新加载配置", () => _ = ReloadConfigAsync()),
-                        Button("刷新列表", () => _ = RefreshSubscriptionsAsync())),
+                        Button("刷新列表", () => _ = RefreshSubscriptionsAsync()))));
 
-                    // ================= 选节点（G2）=================
-                    TextBlock("═══ 选节点 ═══"),
-                    GroupPicker(snap, selectedGroup),
-                    MemberList(snap, activeGroup),
+        /// <summary>
+        /// 设置页：背景材质 + <b>应用分流</b>（G9）+ 取证/调试入口 + 日志。
+        /// ★ 这里<b>不放</b> <c>statusToast</c> / <c>encapReturn</c> 那些实验把手 —— 它们住在
+        ///   <c>LocalState\settings.txt</c>，由插件进程读；前台要改就得做 read-modify-write，
+        ///   而那个文件是取证通道的命门（写坏一行 = 一整批实验臂失效）。
+        ///   界面化那 15 个把手是 Docs/17 计划表里的独立一项，不在本批。
+        /// ★ 应用分流的名单文件（<c>split-apps.txt</c>）<b>是</b>界面化的：它只归这一个功能，
+        ///   没有第二种读者会被写坏 —— 与上面那条纪律不冲突，别把它当成"把手已经进界面"。
+        /// </summary>
+        private Element SettingsPage(string actionHint, bool logOpen, string logText,
+                                     int material, Action<int> setMaterial,
+                                     List<string> splitLines, string splitNote, string splitMsg,
+                                     string probeText, string splitKind, string splitIdentity,
+                                     string splitTarget) =>
+            Page(
+                Section("背景材质",
+                    MaterialPicker(material, setMaterial),
+                    TextBlock("只影响本次运行；重启回云母。")
+                        .Foreground(Theme.SecondaryText)),
 
-                    // ================= 活动连接（G4）=================
-                    TextBlock("═══ 活动连接 ═══"),
-                    ConnectionList(snap),
+                Section("应用分流",
+                    AppSplitList(splitLines),
+                    HStack(8,
+                        Button((splitKind == "name" ? "▶ " : "") + "进程名", () => _setSplitKind("name")),
+                        Button((splitKind == "path" ? "▶ " : "") + "全路径", () => _setSplitKind("path")),
+                        Button((splitTarget == "DIRECT" ? "▶ " : "") + "直连", () => _setSplitTarget("DIRECT")),
+                        Button((splitTarget == "REJECT" ? "▶ " : "") + "屏蔽", () => _setSplitTarget("REJECT"))),
+                    HStack(8,
+                        TextBox(splitIdentity, v => _setSplitIdentity(v),
+                            splitKind == "path" ? @"C:\Windows\System32\notepad.exe" : "chrome.exe"),
+                        Button("添加", () => AddSplitRule(splitLines))),
+                    HStack(8,
+                        Button("保存名单", () => _ = SaveSplitAsync(splitLines)),
+                        Button("重新读取", () => _ = RefreshSplitAsync()),
+                        Button("探测进程可见性", () => _ = RunProbeAsync())),
+                    splitMsg.Length > 0 ? TextBlock(splitMsg).Foreground(Theme.SecondaryText) : Empty(),
+                    // ★ 这一行是本功能最重要的一条防线：名单"存下了"和"进没进内核配置"是两件事。
+                    TextBlock($"上次连接实际注入：{splitNote}").Foreground(Theme.SecondaryText),
+                    probeText.Length > 0 ? TextBlock(probeText).Foreground(Theme.SecondaryText) : Empty(),
+                    TextBlock("命中 DIRECT 的应用由内核从物理网卡直接发出去，命中 REJECT 的直接屏蔽；" +
+                              "名单为空时内核配置一字不改。")
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock("★ 生效时机两条都行：断开再连一次，或点「订阅 → 重新加载配置」热重载。" +
+                              "名单在<b>每次连接</b>和<b>每次热重载</b>时各重读一次，不需要重建 profile。")
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock("走的是内核规则层（PROCESS-NAME / PROCESS-PATH），不是平台的 traffic filter：" +
+                              "后者只要列表非空就会把没匹配上的应用一起拦掉，实测整机断网（Docs/08 §5.2 run 19）。")
+                        .Foreground(Theme.SecondaryText)),
 
-                    // ================= 调试工具 =================
-                    TextBlock("═══ 调试工具 ═══"),
-                    HStack(
+                Section("诊断",
+                    HStack(8,
                         Button("诊断内核", () => _ = RunAsync(_setActionHint, "诊断中…", () => MihomoController.DiagnoseKernelAsync())),
                         Button("查看配置", () => _ = RunAsync(_setActionHint, "读取中…", () => MihomoController.RunConfigsDumpAsync())),
                         Button("立即刷新", () => _ = RefreshNowAsync())),
-                    Button(logOpen ? "收起日志" : "查看日志",
-                        () => _ = ToggleLogAsync(logOpen)),
+                    actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty()),
 
-                    // ================= 日志（可滚动）=================
-                    logOpen ? LogPanel(logText) : Empty(),
+                Section("应用日志",
+                    Button(logOpen ? "收起日志" : "查看日志", () => _ = ToggleLogAsync(logOpen)),
+                    logOpen ? LogPanel(logText) : Empty()));
 
-                    // ================= 计数器 =================
-                    TextBlock("═══ 调试 ═══"),
-                    Button("点一下", () => setCount(count + 1))
-                )
-            );
+        /// <summary>
+        /// 材质三档。★ <b>故意不落盘</b>：做成"改一次记一次"要往 <c>settings.txt</c> 里加键，
+        ///   而那是插件的把手文件，为一个观感开关引入 read-modify-write 不值当。
+        ///   这三档的真正用处是<b>当场对比</b>：云母在 UWP 走的是 WinUI 2 的
+        ///   <c>BackdropMaterial</c>，成不成立要人眼看；"无"那一档用来分清
+        ///   "材质压根没上"和"材质上了但被内容盖住"这两种不同的失败。
+        /// </summary>
+        private static Element MaterialPicker(int current, Action<int> set) =>
+            HStack(8,
+                Button((current == 0 ? "▶ " : "") + "云母", () => set(0)),
+                Button((current == 1 ? "▶ " : "") + "桌面亚克力", () => set(1)),
+                Button((current == 2 ? "▶ " : "") + "无", () => set(2)));
+
+        /// <summary>
+        /// 名单行列表（每行一条 + 删除按钮）。
+        /// ★ 显示的是<b>规则类型 + 标识 + 去向</b>的人话形式，不是文件里的裸文本：
+        ///   用户要看的是"chrome 走直连"，不是 <c>name|chrome.exe|DIRECT</c>。
+        ///   翻译复用组件的 <see cref="AppSplit.Parse"/> —— 界面显示的与实际注入的
+        ///   必须是同一次解析的结果，不能在界面上再写一套"看起来一样"的格式。
+        /// ★ 解析不出来的行<b>不画</b>（它也不会被注入），但调用方在保存时会拿到拒绝清单，
+        ///   所以"看不见"不等于"悄悄丢了"。
+        /// </summary>
+        private Element AppSplitList(List<string> lines)
+        {
+            if (lines.Count == 0)
+                return TextBlock("(名单为空 —— 内核配置不会被改动)")
+                    .Foreground(Theme.SecondaryText);
+
+            AppSplit parsed = AppSplit.Parse(string.Join("\n", lines));
+            var items = new List<Element>();
+            int index = 0;
+            foreach (AppSplitRule r in parsed.Rules)
+            {
+                string type = r.Kind == "path" ? "PROCESS-PATH" : "PROCESS-NAME";
+                string where = r.Target == "REJECT" ? "屏蔽" : "直连";
+                int at = index;
+                items.Add(HStack(8,
+                    TextBlock($"{at + 1}. {type}  {r.Identity}  →  {where}"),
+                    Button("删除", () => RemoveSplitRule(lines, at))));
+                index++;
+            }
+            if (items.Count == 0)
+                items.Add(TextBlock("(这几行全部非法，见下方提示)").Foreground(Theme.SecondaryText));
+            return VStack(4, items.ToArray());
         }
-
-        // ==================== 各区块 ====================
 
         /// <summary>选中的组；快照里没有就退回第一个（换订阅/组消失时不至于空白）。</summary>
         private static string ResolveGroup(KernelView.Snapshot s, string selected)
@@ -452,6 +730,143 @@ namespace ClashUWP.Frontend
         {
             if (text.Length == 0) return TextBlock("(日志为空)");
             return ScrollViewer(TextBlock(text));
+        }
+
+        // ==================== 应用分流（G9）动作 ====================
+
+        /// <summary>
+        /// 把名单对象摊成界面用的行数组（<c>kind|标识|去向</c>）。
+        /// ★ 用组件解析出来的<b>规范化值</b>，不用文件原文：大小写、前后空格在
+        ///   <see cref="AppSplit.Parse"/> 那一层已经统一掉了，界面再显示原文就会出现
+        ///   "看着两条不一样、注进去是一样"的假分歧。
+        /// </summary>
+        private static List<string> RuleLines(AppSplit split)
+        {
+            var list = new List<string>(split.Rules.Count);
+            foreach (AppSplitRule r in split.Rules)
+                list.Add($"{r.Kind}|{r.Identity}|{r.Target}");
+            return list;
+        }
+
+        /// <summary>
+        /// 「添加」只做本地校验并换一个<b>新列表</b>，★ 不写盘。
+        /// 写盘留给「保存名单」，理由与订阅那边一样：一次编辑动作不该各发一次存储调用，
+        /// 而"存没存"这件事必须在界面上是一个单独、看得见的按钮。
+        /// 校验复用组件的解析器 —— 判据必须与实际注入用的那套完全相同，
+        /// 否则界面放过、插件丢掉，就成了"存下了但没生效"。
+        /// </summary>
+        private void AddSplitRule(List<string> current)
+        {
+            string identity = _splitIdentity.Trim();
+            if (identity.Length == 0)
+            {
+                _setSplitMsg("先填进程名或全路径。");
+                return;
+            }
+            if (current.Count >= AppSplit.MaxRules)
+            {
+                _setSplitMsg($"到上限 {AppSplit.MaxRules} 条了，先删几条。");
+                return;
+            }
+
+            AppSplit probe = AppSplit.Parse($"{_splitKind}|{identity}|{_splitTarget}");
+            if (probe.Rules.Count != 1)
+            {
+                string why = probe.Rejected.Count > 0 ? probe.Rejected[0] : "这一行没能解析成规则";
+                _setSplitMsg($"加不了：{why}");
+                return;
+            }
+
+            string line = $"{probe.Rules[0].Kind}|{probe.Rules[0].Identity}|{probe.Rules[0].Target}";
+            foreach (string existing in current)
+                if (string.Equals(existing, line, StringComparison.OrdinalIgnoreCase))
+                {
+                    _setSplitMsg($"名单里已经有这条了：{line}");
+                    return;
+                }
+
+            var next = new List<string>(current.Count + 1);
+            foreach (string s in current) next.Add(s);
+            next.Add(line);
+            _setSplitLines(next);
+            _setSplitIdentity("");
+            _setSplitMsg($"已加 1 条，现在 {next.Count} 条 —— 还没存盘，点「保存名单」。");
+        }
+
+        /// <summary>删一条（同样只动内存）。越界就当没发生，不拿异常当按钮防抖。</summary>
+        private void RemoveSplitRule(List<string> current, int index)
+        {
+            if (index < 0 || index >= current.Count) return;
+            var next = new List<string>(current.Count - 1);
+            for (int i = 0; i < current.Count; i++)
+                if (i != index) next.Add(current[i]);
+            _setSplitLines(next);
+            _setSplitMsg(next.Count == 0
+                ? "名单已清空 —— 保存后内核配置不会被改动。"
+                : $"已删 1 条，现在 {next.Count} 条 —— 还没存盘，点「保存名单」。");
+        }
+
+        /// <summary>
+        /// 存盘 + 读回。★ 消息文本来自 <see cref="AppSplitStore.SaveAsync"/>，
+        /// 那里返回的是"重新解析后的结果"，不是"我写成功了" —— 被挡掉的行必须当场看得见。
+        /// </summary>
+        private async Task SaveSplitAsync(List<string> lines)
+        {
+            try
+            {
+                AppSplit split = AppSplit.Parse(string.Join("\n", lines));
+                _setSplitMsg(await AppSplitStore.SaveAsync(split));
+                _setSplitNote(await AppSplitStore.LastInjectionAsync());
+            }
+            catch (Exception ex)
+            {
+                _setSplitMsg($"保存失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>手动重读名单（手改过文件、或想丢弃界面上没存的改动时用）。</summary>
+        private async Task RefreshSplitAsync()
+        {
+            try
+            {
+                var view = await AppSplitStore.LoadAsync();
+                _setSplitLines(RuleLines(view.Split));
+                _setSplitNote(view.LastInjection);
+                _setSplitMsg(view.Split.Rejected.Count > 0
+                    ? $"文件里有 {view.Split.Rejected.Count} 行没被采纳：" +
+                      string.Join(" / ", StrList(view.Split.Rejected)) +
+                      "（这个版本保存会用界面这份覆盖文件，注释也会被重写）"
+                    : $"已重新读取，共 {view.Split.Rules.Count} 条。");
+            }
+            catch (Exception ex)
+            {
+                _setSplitMsg($"读取失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 只读能力探针（<see cref="ProcessLookupProbe"/>）。
+        /// ★ 必须由用户点：它读的是别的进程的信息，属于"本包不需要、但一旦跑起来就该有交代"的动作。
+        /// ★ 全程不碰网络、不碰隧道，所以不进 3 秒轮询，也不在挂载时自动跑。
+        /// </summary>
+        private async Task RunProbeAsync()
+        {
+            _setProbeText("探测中…");
+            try
+            {
+                _setProbeText(await ProcessLookupProbe.RunAsync());
+            }
+            catch (Exception ex)
+            {
+                _setProbeText($"探测异常: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private static List<string> StrList(IList<string> src)
+        {
+            var list = new List<string>(src.Count);
+            foreach (string s in src) list.Add(s);
+            return list;
         }
 
         // ==================== 动作 ====================

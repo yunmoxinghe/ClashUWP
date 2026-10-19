@@ -67,6 +67,12 @@ namespace ClashUWP.Vpn
         private static CancellationTokenSource? s_pumpCts;
         /// <summary>进程级桥是否处于可收发状态。Encapsulate 以它为准决定是否喂包。</summary>
         private static volatile bool s_bridgeGlobal;
+        /// <summary>
+        /// ★【1.0.35 · G5】给 <see cref="SessionReset"/> 的只读门闩：内核此刻在不在跑。
+        /// 会话结束那一臂必须在 <see cref="DisconnectCore"/> 把 <c>s_bridgeGlobal</c> 置假<b>之前</c>
+        /// 调用，否则它永远读到"内核没跑"、重置就静默失效。
+        /// </summary>
+        internal static bool BridgeRunningForReset => s_bridgeGlobal;
         /// <summary>串行化 start/stop/pump 切换，防 Connect 与 Disconnect 交错。</summary>
         private static readonly object s_bridgeGate = new();
         /// <summary>最近一次桥绑定的物理网卡快照（桥停机后 bound_iface 会清零，快照供诊断）。</summary>
@@ -133,6 +139,13 @@ namespace ClashUWP.Vpn
 
         /// <summary>本次实际使用的 transport 外层目标（auto 解析后的结果），写快照与日志用。</summary>
         private string _outerTargetUsed = "";
+
+        /// <summary>
+        /// ★【1.0.35 · G9】本次连接的应用分流注入结果（<see cref="KernelConfig.Transform"/> 回来的那句）。
+        /// 放实例字段而不是只进日志：快照是"这一条会话"的档案，
+        /// 而"名单写了但没注进内核配置"必须能和当时的其它字段一起被读出来。
+        /// </summary>
+        private string _splitNote = "未处理";
 
         private uint _encapsulatedPackets;
         private uint _echoReplies;
@@ -427,7 +440,27 @@ namespace ClashUWP.Vpn
             //   热重载走的是<b>磁盘上那份文件</b>（PUT /configs 的 JSON body path），所以必须让它指向
             //   改写后的文件，否则常驻热重载会按订阅原文把 fake-ip 覆盖回 redir-host
             //   —— run 24 是靠 hotReload=0 才压住这个覆盖的，产品形态不能依赖它。
-            string mihomoConfig = LocalSettings.FakeIp ? KernelConfig.Transform(rawConfig) : rawConfig;
+            // ★【1.0.35 · G9】同一次改写里还会把 LocalState\split-apps.txt 的应用分流名单
+            //   注到 <c>rules:</c> 开头。名单是<b>每次连接重读</b>的（AppSplit.Load），
+            //   所以"前台改完 → 下次连接生效"，不需要重装、也不需要重建 VPN profile。
+            //   splitNote 必须进 RollingLog：这条功能最容易失败的形态是
+            //   "用户写了名单、界面也存下了，但内核那份配置里根本没有这几行" ——
+            //   静默不算失败，可查的静默才算把问题交给了用户（口径同上面 1.0.62 那行配置源）。
+            string mihomoConfig;
+            string splitNote;
+            if (LocalSettings.FakeIp)
+            {
+                mihomoConfig = KernelConfig.Transform(rawConfig, AppSplit.Load(), out splitNote);
+            }
+            else
+            {
+                // fakeIp=0 是整份改写器的总闸（KernelConfig.Transform 不进），
+                // 于是应用分流也一起关 —— 这一句把耦合写明，别让它成为"未知原因失效"。
+                mihomoConfig = rawConfig;
+                splitNote = "fakeIp=0 → 整份改写关闭，名单未注入";
+            }
+            _splitNote = splitNote;
+            RollingLog.Info("config", $"应用分流={splitNote}");
             string? mihomoConfigPath = LocalSettings.FakeIp
                 ? (KernelConfig.WriteEffectiveFile(mihomoConfig) ?? rawConfigPath)
                 : rawConfigPath;
@@ -1651,6 +1684,12 @@ namespace ClashUWP.Vpn
             // 收尾把两侧采样写全：会话结束时的这份是定位黑洞的主证据。
             WriteTunSamples("会话结束");
 
+            // ★【1.0.35 · G5】会话结束这一臂必须在下面的锁块把 s_bridgeGlobal 置假<b>之前</b>
+            //   发起（它读的就是那个门闩），且是 fire-and-forget：Disconnect 是平台同步回调，
+            //   收尾后面还有 Stop() 要走。这一臂是尽力而为 —— 进程可能随即被挂起，
+            //   真正的"干净起点"由会话开始那一臂保证（见 StartMihomoBridge）。
+            SessionReset.AtSessionEnd();
+
             // 进程级收尾：退泵 +（按开关）停桥。
             //
             // ★ 对齐安卓版的生命周期：ClashMetaForAndroid 的内核只在 TunService 起来时
@@ -1711,6 +1750,12 @@ namespace ClashUWP.Vpn
                 $"DnsIntoTunnel={LocalSettings.DnsIntoTunnel} ({string.Join(",", _config.DnsServers)})\r\n" +
                 $"NodeExclusions={(_nodeExclusions.Count)} switch={(LocalSettings.NodeExclusions ? "on" : "off")} /32\r\n" +
                 $"SelfSplitTunnel={_selfSplitFilterInfo}\r\n" +
+                // ★【1.0.35 · G9/G5】两行新证据。G9 最容易失败的形态是"名单存下了、
+                //   内核配置里却没有那几行"（rules 块缺失/行内写法/fakeIp 总闸关闭三种静默路径），
+                //   G5 最容易失败的形态是"控制器在包内根本不可达"（Docs/12 §8 那条未验前提）——
+                //   两条都必须能在这一份档案里当场分辨，不能只活在滚动日志的时间轴里。
+                $"AppSplit={_splitNote}\r\n" +
+                $"SessionReset={SessionReset.LastNote}\r\n" +
                 $"OuterTarget={_outerTargetUsed}:{LocalSettings.OuterPort} (要求={LocalSettings.OuterTarget}) fakeIp={(LocalSettings.FakeIp ? "on" : "off")}\r\n" +
                 $"IncludeMode={LocalSettings.IncludeMode} inclusion=[{string.Join(",", (LocalSettings.IncludeMode.Equals("narrow", StringComparison.OrdinalIgnoreCase) ? NarrowInclusionRoutes() : _config.IncludeRoutes))}]\r\n" +
                 $"SessionSeconds={ElapsedSeconds():F0}\r\n" +
@@ -1937,6 +1982,13 @@ namespace ClashUWP.Vpn
 
                 s_lastConfigFingerprint = Fingerprint(config);
 
+                // ★【1.0.35 · G5】会话开始这一臂：桥已经就绪（冷启动成功或复用常驻都算），
+                //   此时清缓存的语义是"这次连接从干净状态开始"（对齐安卓进入时那次 reset）。
+                //   sessionReset=0（默认）时本调用只做一次判断就返回，不产生任何 HTTP。
+                //   放在热重载<b>之后</b>发起、并自带 1.5 s 延迟：PUT /configs 会重建配置，
+                //   先清再重载等于白清。
+                SessionReset.AtSessionStart();
+
                 // 回程泵：mihomo 的回包是异步产生的，VpnChannel 没有「有包了」的事件，
                 // 只能轮询 get_packet → Inject。5ms 一拍，无包时休眠不空转。
                 var cts = new CancellationTokenSource();
@@ -2054,7 +2106,7 @@ namespace ClashUWP.Vpn
 
                     using var req = new System.Net.Http.HttpRequestMessage(
                         System.Net.Http.HttpMethod.Put,
-                        "http://127.0.0.1:9090/configs?force=true")
+                        SessionReset.ControllerBase + "/configs?force=true")
                     {
                         Content = new System.Net.Http.StringContent(
                             sb.ToString(), Encoding.UTF8, "application/json")

@@ -39,7 +39,12 @@ namespace ClashUWP.Vpn
                 LocalSettings.Load();
                 if (LocalSettings.FakeIp)
                 {
-                    string text = KernelConfig.Transform(raw);
+                    // ★【1.0.35 · G9】走同一条 3-arg 路径把注入结果记进日志：
+                    //   前台点「重载」之后热重载吃的就是这份文件，名单没注进去的话
+                    //   下一次连接会把热重载的结果覆盖掉 —— 两条路必须留同一句证据。
+                    //   本方法跑在<b>前台进程</b>里，RollingLog 按角色自动落 logs/app.log。
+                    string text = KernelConfig.Transform(raw, AppSplit.Load(), out string splitNote);
+                    RollingLog.Info("config", $"热重载配置已重生成 应用分流={splitNote}");
                     return KernelConfig.WriteEffectiveFile(text);   // config.kernel.yaml 绝对路径
                 }
                 return rawPath;
