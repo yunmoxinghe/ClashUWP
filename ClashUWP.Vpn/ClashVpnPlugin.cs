@@ -542,6 +542,34 @@ namespace ClashUWP.Vpn
             _splitNote = splitNote;
             _dnsNote = dnsNote;
             RollingLog.Info("config", $"应用分流={splitNote}；DNS 覆盖={dnsNote}");
+            // ★【1.0.75 · 空壳不拨号】改写完、落盘前，先问一句"这份配置有没有可用出站"。
+            //   【为什么卡在 WriteEffectiveFile 之前】再往下一步就是写 config.kernel.yaml ——
+            //   空配置一旦落盘，下一次热重载会把用户那份能用的正文覆盖掉（口径同 1.0.62
+            //   "桥 FailFast 不该没收用户的配置"）。判据只看将要交给内核的那份，不看磁盘上的旧那份。
+            //   【为什么门控在 failFast】关它（failFast=0）就是保留实验臂："先建隧道、再看诊断"
+            //   —— run 25 那种读法需要隧道在，才读得到 Encapsulated/Injected。
+            //   【对齐安卓版】CMFA 是 <c>catch → reason → finally stopSelf()</c>：配置不可用就
+            //   带着原因把服务停掉，绝不"先连着，回头再说"。我们的对等物就是
+            //   SetErrorMessage + TerminateConnection（AbortConnectionAttempt），
+            //   系统 VPN 面板因此能看到原因，而不是一台状态 Connected、流量全进黑洞的"空回环连接"。
+            if (LocalSettings.FailFast)
+            {
+                string emptyReason = KernelConfig.ReasonIfNoOutbound(mihomoConfig);
+                if (emptyReason.Length > 0)
+                {
+                    RollingLog.Warn("config",
+                        $"空壳不拨号：{emptyReason}；配置源={(string.IsNullOrWhiteSpace(_config.SubId) ? "config.yaml" : $"subscriptions/{_config.SubId}.yaml")}");
+                    try
+                    {
+                        channel.LogDiagnosticMessage("ClashUWP: 配置无任何可用出站，终止本次连接: " + emptyReason);
+                    }
+                    catch { /* 日志出口偶尔不可用 */ }
+                    LogSession($"evt=connect-abort stage=no-outbound reason={emptyReason}");
+                    AbortConnectionAttempt(channel, "配置无任何可用出站：" + emptyReason);
+                    return;
+                }
+            }
+
             string? mihomoConfigPath = LocalSettings.FakeIp
                 ? (KernelConfig.WriteEffectiveFile(mihomoConfig) ?? rawConfigPath)
                 : rawConfigPath;
@@ -2194,22 +2222,17 @@ namespace ClashUWP.Vpn
                     RollingLog.Info("bridge-start", "mihomo bridge 已启动，回程泵运行中.");
                     channel.LogDiagnosticMessage("ClashUWP: mihomo bridge 已启动，回程泵运行中.");
 
-                    // ★【1.0.73 · WiFi盾标修复】内核成功启动后必须调用 NotifyStatus(Ok)，
-                    //   否则平台认为隧道未完全建立，NCSI 不会报告 Internet 连通性，
-                    //   WiFi 图标不显示蓝色盾牌。
-                    // 【官方】NotifyStatus："Reports the status of the VPN connection to the system."
-                    //   必须在隧道 L3 接口建立且内核就绪后调用（即 Start + 桥启动完成后）。
-                    try
-                    {
-                        channel.NotifyStatus(VpnManagementErrorStatus.Ok);
-                        RollingLog.Info("notify-status", "已向平台报告 VpnManagementErrorStatus.Ok（WiFi 盾标触发点）");
-                        channel.LogDiagnosticMessage("ClashUWP: NotifyStatus(Ok) 已调用，隧道完全就绪");
-                    }
-                    catch (Exception notifyEx)
-                    {
-                        // NotifyStatus 失败不致命：隧道已能工作，只是系统可能不显示盾标
-                        RollingLog.Warn("notify-status", $"NotifyStatus 调用失败: {notifyEx.Message}");
-                    }
+                    // ★【1.0.75 · 撤销 1.0.73 的 NotifyStatus】那个"盾标修复"的一半是<b>不存在的 API</b>：
+                    //   1.0.73 写的 <c>channel.NotifyStatus(VpnManagementErrorStatus.Ok)</c> 从未编译过 ——
+                    //   当时组件没重新 pack（本地 feed 里最高只有 1.0.40，主工程还原报
+                    //   "找不到版本为 (>= 1.0.42)"，见 Docs/30 §2.1），错误被那次失败的构建一起吞掉了。
+                    //   现已按官方条文核实：<c>VpnChannel</c> 在 26100 的投影里
+                    //   （Microsoft.Windows.SDK.NET.Ref 10.0.26100.57，ilspycmd 全量导出）
+                    //   <b>没有任何 Notify* 成员</b>，也只有 IVpnChannel/2/4/5/6 五层接口。
+                    //   平台侧"隧道已就绪"这件事本来就是 <c>Start(...)</c> 成功 + 首个包被
+                    //   取走时由框架自己推进的，插件没有"上报状态"的原语可拿。
+                    //   ⇒ 盾标那条线索只剩 <b>ServerUri 不再指向 127.0.0.1</b>（1.0.73 的另一半，
+                    //     现默认 192.0.2.1，见 Docs/27 已更正的结论）。这里不再放任何"调了但没用"的调用。
 
                     // ★【1.0.74 · P1】检查系统健康状态（Statement of Health）。
                     //   【官方】SystemHealth："Gets the statement of health for the VPN connection."

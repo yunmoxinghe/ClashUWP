@@ -568,13 +568,40 @@ namespace ClashUWP.Vpn
         ///   · 只在<b>行内流式</b>的组定义里替换（订阅的写法就是行内），
         ///     块写法（<c>- name: x</c> 换行 <c>  type: url-test</c>）另有一支处理。
         /// </summary>
-        private static void LockUrlTestTolerance(List<string> lines)
+        /// <summary>
+        /// ★【1.0.75 纠偏】块写法组的边界判据。
+        ///
+        /// 旧写法是"往下扫到<b>任何</b>以 <c>- </c> 开头的行就停"，本意是"到下一个组为止"。
+        /// 但块写法的组长这样：
+        /// <code>
+        ///   - name: 美国自动
+        ///     type: url-test
+        ///     proxies:
+        ///       - 🇺🇸 01        ← 也是 "- " 开头，可它是<b>本组的成员行</b>
+        ///       - 🇺🇸 02
+        ///     tolerance: 30
+        /// </code>
+        /// <c>type:</c> 行往下第一眼就撞见 <c>proxies:</c> 里的成员行，于是 break，
+        /// <c>tolerance</c> 永远扫不到 —— 实测这份订阅的块写法组到内核里仍是
+        /// <c>tolerance: 30</c>，出口 IP 照跳（1.0.35 那次"锁死切换"对块写法<b>从未生效</b>）。
+        ///
+        /// 【新判据】真正的"下一个组"是<b>与本组列表项同一列</b>（或更左）的 <c>- </c>；
+        ///   更深的是本组内部的成员/子键，continue 越过去。
+        ///   本组列表项在哪一列，由 <c>type:</c> 行<b>往上</b>找第一个更左的 <c>- </c> 得出
+        ///   —— 与 <see cref="ChildIndent"/> 同一思路：缩进是订阅给的，不写死。
+        /// ★ 判不出列（向上找不到更左的 <c>- </c>）就<b>整组不动</b>：
+        ///   这里宁可漏改一条 tolerance，也不能把 YAML 改坏（run 25 的教训见
+        ///   <see cref="InjectAppSplitRules"/> 注释：改坏 YAML 的代价是"内核没起来但隧道照装"）。
+        /// </summary>
+        /// <returns>本次锁定/补写的 tolerance 行数（诊断与离线测试用）。</returns>
+        internal static int LockUrlTestTolerance(List<string> lines)
         {
             const string locked = "999999";
+            int touched = 0;
 
             int start = FindTopLevelKey(lines, "proxy-groups");
             if (start < 0)
-                return;
+                return 0;
 
             int end = EndOfBlock(lines, start);
 
@@ -594,16 +621,75 @@ namespace ClashUWP.Vpn
                     if (!line.Contains("url-test"))
                         continue;
 
-                    // 从这一行往下找本组的 tolerance（到下一个 "- " 开头为止）。
-                    for (int j = i + 1; j < end; j++)
+                    int typeCol = LeadingSpaces(line).Length;
+
+                    // ① 定界：本组列表项的 "- " 在哪一列、在哪一行（向上找第一个比 type 行更左的）。
+                    int itemCol = -1;
+                    int itemLine = -1;
+                    for (int k = i - 1; k > start; k--)
                     {
-                        string t = lines[j].Trim();
-                        if (t.StartsWith("- ")) break;          // 下一个组
-                        if (t.StartsWith("tolerance:"))
+                        string up = lines[k].TrimStart();
+                        if (!(up.StartsWith("- ") || up == "-"))
+                            continue;
+                        int col = LeadingSpaces(lines[k]).Length;
+                        if (col < typeCol) { itemCol = col; itemLine = k; break; }
+                    }
+                    if (itemCol < 0)
+                        continue;   // 定不了界就整组不动（见上面那条"宁可漏改"）
+
+                    // ② 先往<b>上</b>看：有的订阅把 tolerance 写在 type 之前
+                    //   （`- name / tolerance / type / proxies`）。这一条必须查，
+                    //   否则下面只会往下找 → 找不到 → 补一行 → <b>同一个映射里两个 tolerance 键</b>，
+                    //   而 yaml.v3 对重复键是<b>直接报错</b>的 —— 那就是"改坏 YAML"，
+                    //   代价见 InjectAppSplitRules 的注释（内核起不来但隧道照装）。
+                    int tol = -1;
+                    for (int k = i - 1; k > itemLine; k--)
+                    {
+                        string t = lines[k].Trim();
+                        if (t.StartsWith("tolerance:")) { tol = k; break; }
+                    }
+
+                    // ③ 在本组的区间内找 tolerance；没有就在 type 行同缩进<b>补一行</b>。
+                    //    补这行是有原因的：mihomo 的 url-test 默认 tolerance = 0，
+                    //    等于"只要有人更快就切"，比 30 更糟；订阅里不写这个键的组
+                    //    以前会被整个跳过，行为上就是"这份订阅没被锁过"。
+                    if (tol < 0)
+                    {
+                        for (int j = i + 1; j < end; j++)
                         {
-                            lines[j] = KeyLine(lines[j], "tolerance", locked);
-                            break;
+                            string raw = lines[j];
+                            string t = raw.Trim();
+                            if (t.Length == 0)
+                                continue;
+
+                            bool isDash = t.StartsWith("- ") || t == "-";
+                            if (isDash && LeadingSpaces(raw).Length <= itemCol)
+                                break;                      // 这才是下一个组
+                            if (isDash)
+                                continue;                   // ★ 本组的成员行，越过（旧写法在这里 break ⇒ 漏改）
+
+                            // 比本组列表项还左的非空行 = 这块已经结束（理论上 EndOfBlock 已挡）
+                            if (!isDash && LeadingSpaces(raw).Length <= itemCol && t.Contains(':'))
+                                break;
+
+                            if (t.StartsWith("tolerance:"))
+                            {
+                                tol = j;
+                                break;
+                            }
                         }
+                    }
+
+                    if (tol >= 0)
+                    {
+                        lines[tol] = KeyLine(lines[tol], "tolerance", locked);
+                        touched++;
+                    }
+                    else
+                    {
+                        lines.Insert(i + 1, LeadingSpaces(line) + "tolerance: " + locked);
+                        touched++;
+                        end++;   // 插了一行，块尾要跟着挪，否则后续循环少扫一行
                     }
                     continue;
                 }
@@ -614,6 +700,7 @@ namespace ClashUWP.Vpn
                     if (line.Contains("tolerance:"))
                     {
                         lines[i] = ToleranceRegex().Replace(line, "tolerance: " + locked);
+                        touched++;
                     }
                     else
                     {
@@ -624,11 +711,133 @@ namespace ClashUWP.Vpn
                             string head = line.Substring(0, close).TrimEnd();
                             string tail = line.Substring(close);
                             lines[i] = head + ", tolerance: " + locked + " " + tail;
+                            touched++;
                         }
                     }
                     continue;
                 }
             }
+            return touched;
+        }
+
+        /// <summary>
+        /// ★【1.0.75 · 空壳不拨号】这份配置<b>能不能真把流量送出去</b>？
+        /// 能就回空串；不能就回一句可直接给用户/日志看的理由。
+        ///
+        /// 【为什么必须有这一条】安卓版在这一点上是<b>硬失败</b>的：
+        ///   <c>ClashService.kt</c> 的启动流程是
+        ///   <c>try { Clash.start() } catch (e: Exception) { reason = e.message }
+        ///   finally { withContext(NonCancellable) { stopSelf() } }</c> ——
+        ///   配置不可用就<b>把服务停掉并带上原因</b>，绝不"先接着，回头再说"。
+        ///   我们以前相反：订阅正文读不到就回落内置兜底（那份兜底里<b>一个节点都没有</b>），
+        ///   于是平台侧是一条<b>状态 Connected、却没有任何出站能承接流量</b>的隧道 ——
+        ///   用户看到的"空回环连接"就是它：面板显示已连接、图标是盾、可哪儿都打不开，
+        ///   而健康哨兵要 30s×10 轮才兜住（memory「Never hog the machine's network」）。
+        ///   隧道期间的 0.0.0.0/0 没有内核承接就是黑洞（run 25 原话），
+        ///   所以"连接成功但配置是空的"比"连接失败"更贵。
+        ///
+        /// 【判据：有没有可用的<b>出站</b>，不是有没有文件】
+        ///   · <c>proxies:</c> 段里至少一条<b>列表项</b>（缩进判据同
+        ///     <see cref="FindTopLevelKey"/>/<see cref="EndOfBlock"/>：嵌套子列表不算条目）；
+        ///     行内写法（flow 列表 / 锚点 / <c>!include</c>）写在键行冒号后面 ——
+        ///     这种形态数不清，但<b>一律放行</b>，见下面"假阳性危险"；
+        ///   · 或者 <c>proxy-providers:</c> 段非空 —— 那种订阅的节点由内核自己拉，
+        ///     行数上看不出来，不能误杀；
+        ///   · 内置兜底那份是 JSON（首字符 <c>{</c>），里面没有 <c>"proxies"</c> ⇒ 不可用。
+        ///
+        /// 【★ 判据本身失败时一律放行】返回空串 = "不拦"。这里<b>假阴性是安全的、
+        ///   假阳性是危险的</b>：判据抛异常就拒绝连接，等于把"我们解析不懂的订阅格式"
+        ///   变成"用户连不上网"。宁可放过一个空壳（还有 failFast 那条内核启动失败兜着），
+        ///   也不能拦掉一份能用的订阅。
+        /// </summary>
+        internal static string ReasonIfNoOutbound(string config)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(config))
+                    return "交给内核的配置是空的";
+
+                string trimmed = config.TrimStart();
+
+                // ① 内置兜底（JSON）：没有 proxies 数组就是零出站。
+                if (trimmed.StartsWith("{"))
+                    return config.Contains("\"proxies\"")
+                        ? ""
+                        : "内置兜底配置不含任何节点（订阅正文缺失或读失败）";
+
+                string[] lines = config.Replace("\r\n", "\n").Split('\n');
+                // BOM 会让第一行的键匹配不上（<see cref="FindTopLevelKey"/> 按零缩进精确匹配），
+                // 而"匹配不到 proxies"在这里是<b>拒绝连接</b>的判据 —— 先把它摘掉。
+                if (lines.Length > 0 && lines[0].Length > 0 && lines[0][0] == '\uFEFF')
+                    lines[0] = lines[0].Substring(1);
+
+                int start = FindTopLevelKey(new List<string>(lines), "proxies");
+                if (start >= 0)
+                {
+                    // 行内写法：flow 列表、YAML 锚点、<c>!include</c> 全把内容写在键行冒号后面。
+                    // 这些形态<b>数不清条目，但"数不清"绝不等于"没有"</b> ——
+                    // 只要冒号后有真内容就放行（拦掉一份能用的订阅比放过一个空壳严重得多）。
+                    if (InlineAfterKey(lines[start]).Length > 0) return "";
+
+                    int end = EndOfBlock(new List<string>(lines), start);
+                    int itemCol = -1;
+                    for (int i = start + 1; i < end; i++)
+                    {
+                        string t = lines[i].Trim();
+                        if (t.Length == 0 || t.StartsWith("#")) continue;
+                        int col = LeadingSpaces(lines[i]).Length;
+                        bool isDash = t.StartsWith("- ") || t == "-" || t.StartsWith("-\t");
+                        if (!isDash) continue;
+                        if (itemCol < 0) itemCol = col;
+                        if (col != itemCol) continue;              // 更深的是节点自己的子列表
+                        // 到这儿就放行：本判据问的是"<b>有没有</b>条目"，
+                        // 不是"能不能数出节点名"（数名字是 SubscriptionView 的活）。
+                        // 只写 <c>-</c> 把 name 换到下一行的合法写法不能当空。
+                        return "";
+                    }
+                }
+
+                // ② proxy-providers：节点由内核运行时拉取，行数上看不见，放行。
+                List<string> all = new(lines);
+                int pp = FindTopLevelKey(all, "proxy-providers");
+                if (pp >= 0 && InlineAfterKey(all[pp]).Length > 0)
+                    return "";
+                if (pp >= 0)
+                {
+                    int ppEnd = EndOfBlock(all, pp);
+                    for (int i = pp + 1; i < ppEnd; i++)
+                    {
+                        string t = all[i].Trim();
+                        if (t.Length == 0 || t.StartsWith("#")) continue;
+                        return "";     // 段里有任何内容就按"有节点来源"处理
+                    }
+                }
+
+                return start < 0
+                    ? "配置里没有 proxies 段（一个可用出站都没有）"
+                    : "配置的 proxies 段是空的（0 个节点）";
+            }
+            catch
+            {
+                // 判据自己出错 ⇒ 不拦（见上条"假阴性安全、假阳性危险"）。
+                return "";
+            }
+        }
+
+        /// <summary>
+        /// 键行冒号后面的<b>行内内容</b>：flow 列表（<c>[{name: A}]</c>）、空列表（<c>[]</c>/<c>{}</c>）、
+        /// YAML 锚点（<c>*base</c>）、外部引入（<c>!include x.yaml</c>）、尾注（<c># …</c>）都写在这里。
+        /// 纯键行（冒号后什么都没有，或只有一个注释/空集合）返回空串。
+        /// 给 <see cref="ReasonIfNoOutbound"/> 用：它只需要知道"冒号后面到底有没有东西"。
+        /// </summary>
+        private static string InlineAfterKey(string line)
+        {
+            int c = line.IndexOf(':');
+            if (c < 0 || c + 1 >= line.Length) return "";
+            string rest = line.Substring(c + 1).Trim();
+            if (rest.Length == 0 || rest.StartsWith("#")) return "";
+            if (rest is "[]" or "{}") return "";
+            return rest;
         }
 
         /// <summary>
