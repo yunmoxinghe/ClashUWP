@@ -161,15 +161,24 @@ namespace ClashUWP.Vpn
         /// <summary>
         /// 读 <c>LocalState\profile-server.txt</c> 的第一行作为 profile 的 ServerUri。
         ///
-        /// 【口径】文件里没有效行 / 文件不存在 / 不是绝对 URI ⇒ 一律回默认占位
-        ///   <c>http://127.0.0.1</c>，所以不写文件时行为和以前完全一致。
+        /// ★【1.0.73 · WiFi盾标修复】默认值从 <c>http://127.0.0.1</c> 改为 <c>http://192.0.2.1</c>
+        ///   （TEST-NET-1，RFC 5737 保留地址，保证静默黑洞）。
+        ///
+        /// 【为什么必须改】127.0.0.1 会导致 NCSI 探测包打到环回接口，NCSI 报告
+        ///   <c>Capability=Local</c> 而非 <c>Internet</c>，Windows 认为 VPN 只是本地隧道，
+        ///   WiFi 图标不显示蓝色盾牌。192.0.2.1 是 RFC 5737 明确保留的文档地址段，
+        ///   任何路由器都不会转发它，也不会和真实网络冲突，且不会回 ICMP ——
+        ///   NCSI 的被动探测（PassivePacketHops）能正确判断为"可达 Internet"。
+        ///
+        /// 【口径】文件里没有效行 / 文件不存在 / 不是绝对 URI ⇒ 一律回新默认值。
         ///   必须是带 scheme 的绝对地址（如 <c>http://192.168.0.1</c>）：
         ///   <c>new Uri("192.168.0.1")</c> 会当成相对地址不报错，但平台用不了，
         ///   所以这里显式要求 <c>UriKind.Absolute</c>。
         /// </summary>
         private static async Task<string> ReadProfileServerOverrideAsync()
         {
-            const string fallback = "http://127.0.0.1";
+            // ★ 192.0.2.1 = TEST-NET-1（RFC 5737），保证静默黑洞，不回 ICMP、不被路由。
+            const string fallback = "http://192.0.2.1";
             try
             {
                 Windows.Storage.StorageFile file = await Windows.Storage.ApplicationData.Current.LocalFolder
@@ -577,14 +586,12 @@ namespace ClashUWP.Vpn
             var cases = new (string Label, string Server, bool Ui)[]
             {
                 // 单变量隔离，每次只动一个条件：
-                //   ① 基线：回环地址 + 无系统UI + 立即连（复现用户点「连接」的路径）
-                //   ② 只换地址 → 证明「回环不被接受」是否成立
+                //   ① 基线：新默认黑洞地址 + 无系统UI + 立即连（复现用户点「连接」的路径）
+                //   ② 只换地址 → 证明「192.0.2.1 比 127.0.0.1 更适合 NCSI」是否成立
                 //   ③ 只换成 RequireVpnClientAppUI=true（主 profile 就是 true）
-                //   （原④「加 3 秒延迟」是旧 CannotFindProfile 假设的用例，现已过时且
-                //     反而触发 0x800703E3 假失败，接真内核前移除。）
+                ("blackhole", "http://192.0.2.1",      false),
                 ("loopback",  "http://127.0.0.1",      false),
-                ("realip",    "http://10.137.192.135", false),
-                ("ui-true",   "http://127.0.0.1",      true),
+                ("ui-true",   "http://192.0.2.1",      true),
             };
 
             foreach ((string label, string server, bool requireUi) in cases)

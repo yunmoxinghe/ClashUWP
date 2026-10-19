@@ -2177,6 +2177,23 @@ namespace ClashUWP.Vpn
                     _bridgeDiag = $"本进程首次启动（排空 {drained} 包，v6栈={(s_bridgeKernelV6 ? "on" : "off")}）";
                     RollingLog.Info("bridge-start", "mihomo bridge 已启动，回程泵运行中.");
                     channel.LogDiagnosticMessage("ClashUWP: mihomo bridge 已启动，回程泵运行中.");
+
+                    // ★【1.0.73 · WiFi盾标修复】内核成功启动后必须调用 NotifyStatus(Ok)，
+                    //   否则平台认为隧道未完全建立，NCSI 不会报告 Internet 连通性，
+                    //   WiFi 图标不显示蓝色盾牌。
+                    // 【官方】NotifyStatus："Reports the status of the VPN connection to the system."
+                    //   必须在隧道 L3 接口建立且内核就绪后调用（即 Start + 桥启动完成后）。
+                    try
+                    {
+                        channel.NotifyStatus(VpnManagementErrorStatus.Ok);
+                        RollingLog.Info("notify-status", "已向平台报告 VpnManagementErrorStatus.Ok（WiFi 盾标触发点）");
+                        channel.LogDiagnosticMessage("ClashUWP: NotifyStatus(Ok) 已调用，隧道完全就绪");
+                    }
+                    catch (Exception notifyEx)
+                    {
+                        // NotifyStatus 失败不致命：隧道已能工作，只是系统可能不显示盾标
+                        RollingLog.Warn("notify-status", $"NotifyStatus 调用失败: {notifyEx.Message}");
+                    }
                 }
 
                 s_lastConfigFingerprint = Fingerprint(config);
