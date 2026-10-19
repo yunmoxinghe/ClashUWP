@@ -14,6 +14,11 @@ dotnet run --project Tools\DnsConfigTest
 if errorlevel 1 goto :fail
 
 echo.
+echo === Subscription name header parsing (1.0.72) ===
+dotnet run --project Tools\SubscriptionNameTest
+if errorlevel 1 goto :fail
+
+echo.
 echo ALL OFFLINE TESTS PASSED
 exit /b 0
 

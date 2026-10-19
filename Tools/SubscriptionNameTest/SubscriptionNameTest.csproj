@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    订阅显示名离线夹具（Docs/25 §1.6 / §2.5）。
+    ★ 不是产品工程、不在解决方案里：dotnet run 即可。
+      直接编译前台 ClashUWP/Backend/SubscriptionName.cs，被测代码与产品逐字同一份；
+      本文件不依赖 WinRT/Storage，故可用普通 net10.0 控制台跑。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>SubscriptionNameTest</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\ClashUWP\Backend\SubscriptionName.cs" Link="SubscriptionName.cs" />
+  </ItemGroup>
+</Project>

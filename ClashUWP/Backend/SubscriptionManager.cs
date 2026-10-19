@@ -57,10 +57,20 @@ namespace ClashUWP.Backend
         /// <summary>settings.txt 里存"当前 profile id"的键。</summary>
         internal const string ActiveKey = "subActive";
 
+        /// <summary>
+        /// settings.txt 里存订阅显示名的键（<c>subName:{id}</c>）。
+        /// ★【1.0.72】名字来自拉取响应头：<c>Profile-Title</c> 或
+        ///   <c>Content-Disposition</c> 的 filename（RFC 5987 的 filename*）。
+        ///   实测本机 `starlink…` 机场的 filename* 解码就是「星链机场」；
+        ///   之前只读正文、把名字丢了，UI 与快速设置才一直显示 URL 派生串。
+        /// </summary>
+        internal const string NameKey = "subName";
+
         internal sealed record Result(bool Ok, string Message, string? ProfileId = null);
 
         internal sealed record Profile(
             string Id,
+            string Name,
             string Url,
             DateTime FetchedAt,
             long SizeBytes,
@@ -85,6 +95,7 @@ namespace ClashUWP.Backend
                 return new Result(false, $"不是合法的 http/https URL: {url}");
 
             string text;
+            string displayName = "";
             try
             {
                 using var http = new HttpClient(
@@ -104,6 +115,10 @@ namespace ClashUWP.Backend
                 int code = (int)resp.StatusCode;
                 if (!resp.IsSuccessStatusCode)
                     return new Result(false, $"拉取失败 HTTP {code}（{uri.Host}）");
+
+                // ★ 先取显示名再读正文：机场把订阅名放在响应头里
+                //   （Profile-Title / Content-Disposition），以前这里完全没看。
+                displayName = SubscriptionName.FromHeaders(resp.Headers, resp.Content.Headers);
 
                 text = await resp.Content.ReadAsStringAsync();
             }
@@ -129,21 +144,37 @@ namespace ClashUWP.Backend
                 await WriteAllTextAsync(path, text);
 
                 await SetUrlAsync(id, url);
+                // ★ 响应头没给名字时保留上一次的名字，别用空串把好名字冲掉
+                //   （机场偶尔会换返回形态；名字不该跟着抖动）。
+                if (displayName.Length > 0)
+                    await SetNameAsync(id, displayName);
+
+                var info = SubscriptionView.Parse(text, text.Length, DateTime.Now);
+                var list = await ListAsync();
+                var self = list.FirstOrDefault(x => x.Id == id)
+                           ?? new Profile(id,
+                                  displayName.Length > 0 ? displayName : FallbackName(id, url),
+                                  url, DateTime.Now, text.Length, info.NodeCount, info.RuleCount);
+
                 // ★【1.0.62】为该订阅注册一个独立的系统 VPN profile（快速设置面板原生列出、
                 //   点哪个连哪个）。无论是否立即启用都注册 —— 拉过的订阅都应在快速设置里可切。
-                await VpnProfileSetup.EnsureSubscriptionProfileAsync(id, HostOf(url));
-                var info = SubscriptionView.Parse(text, text.Length, DateTime.Now);
+                // ★【1.0.72】把注册结果带进返回值：以前这一步的结果只落日志，
+                //   UI 永远显示"已拉取"，即使系统 profile 根本没建/没更新成功。
+                // ★ 同一机场的多条链接可能给同一个名字（本机两份都是 iKuuu_V2）：
+                //   快速设置靠 ProfileName 区分，重名时退回 host，保证两条都能认出来。
+                var reg = await VpnProfileSetup.EnsureSubscriptionProfileResultAsync(
+                    id, SystemProfileName(self, list));
                 if (activate)
                 {
                     await SetActiveAsync(id);
                     // ★ UX 对齐 Verge：拉取并启用后原地热重载，不必断重连。
                     var reload = await ReloadActiveConfigAsync();
                     return new Result(true,
-                        $"已拉取 {info.NodeCount} 节点 / {info.RuleCount} 规则（{info.SizeBytes / 1024.0:F1} KB）　{reload.Message}",
+                        $"已拉取 {info.NodeCount} 节点 / {info.RuleCount} 规则（{info.SizeBytes / 1024.0:F1} KB）　{reload.Message}　{reg.Message}",
                         id);
                 }
                 return new Result(true,
-                    $"已拉取 {info.NodeCount} 节点 / {info.RuleCount} 规则（{info.SizeBytes / 1024.0:F1} KB）（未启用）",
+                    $"已拉取 {info.NodeCount} 节点 / {info.RuleCount} 规则（{info.SizeBytes / 1024.0:F1} KB）（未启用）　{reg.Message}",
                     id);
             }
             catch (Exception ex)
@@ -175,9 +206,13 @@ namespace ClashUWP.Backend
                 var reload = await ReloadActiveConfigAsync();
                 // ★【1.0.62】该订阅的 profile 已在 fetch 时注册；这里确保显示名与生效态一致（幂等）。
                 var (_, url) = await GetActiveAsync();
-                var reg = await VpnProfileSetup.EnsureSubscriptionProfileAsync(id, HostOf(url));
+                var list = await ListAsync();
+                var self = list.FirstOrDefault(x => x.Id == id);
+                string shown = self != null ? DisplayName(self, list) : FallbackName(id, url);
+                string profName = self != null ? SystemProfileName(self, list) : FallbackName(id, url);
+                var reg = await VpnProfileSetup.EnsureSubscriptionProfileAsync(id, profName);
                 return new Result(true,
-                    $"已切到 {id}：{info.NodeCount} 节点 / {info.RuleCount} 规则　{reload.Message}　{reg}", id);
+                    $"已切到「{shown}」：{info.NodeCount} 节点 / {info.RuleCount} 规则　{reload.Message}　{reg}", id);
             }
             catch (Exception ex)
             {
@@ -203,8 +238,15 @@ namespace ClashUWP.Backend
         /// <see cref="ActivateAsync"/> 时注册，而订阅往往是<b>升级前</b>就拉好的
         /// （1.0.59 就能 fetch）。不补这一下，升级到 1.0.62 后快速设置面板里
         /// 依然是空的 —— 功能等于没上线。
-        /// 【幂等且便宜】已有系统 profile 的只读回查（<c>HasSubscriptionProfileAsync</c>），
-        /// 不重复 Add；结果进日志，每次启动一眼能看出补了几条、有没有失败。
+        ///
+        /// ★★【1.0.72 修复 · 对账的是"全部订阅"，不是"只补缺的"】
+        ///   1.0.62~1.0.71 先查有没有、有就跳过。于是 profile 的显示名 / ServerUri /
+        ///   CustomConfiguration 一旦漂移（例如改了 profile-server.txt、或旧版本
+        ///   把 subId 写错），启动对账<b>永远不会修</b>；而 UI 侧那次更新又走 Add
+        ///   返回 Other（见 <see cref="VpnProfileSetup.EnsureSubscriptionProfileResultAsync"/>），
+        ///   等于两条路都修不好。
+        ///   现在每份订阅都过一遍幂等的 Ensure：一致 → 不动；不一致且已断开 → Update；
+        ///   连接中 → 跳过并记日志。计数结果只落<b>一行</b>（调用方不再重复记）。
         /// 【不碰隧道】只写系统 profile 列表，不连接、不改 config.yaml。
         /// </summary>
         internal static async Task<string> SyncSystemProfilesAsync()
@@ -212,16 +254,23 @@ namespace ClashUWP.Backend
             try
             {
                 var list = await ListAsync();
-                int added = 0, present = 0;
+                int added = 0, updated = 0, present = 0, skipped = 0, failed = 0;
                 foreach (var p in list)
                 {
-                    if (await VpnProfileSetup.HasSubscriptionProfileAsync(p.Id)) { present++; continue; }
-                    var reg = await VpnProfileSetup.EnsureSubscriptionProfileAsync(p.Id, HostOf(p.Url));
-                    if (reg.Contains("注册=Ok")) added++;
-                    RollingLog.Info("profile-sub-sync", reg);
+                    var reg = await VpnProfileSetup.EnsureSubscriptionProfileResultAsync(
+                        p.Id, SystemProfileName(p, list));
+                    switch (reg.Action)
+                    {
+                        case VpnProfileSetup.SubProfileAction.Added: added++; break;
+                        case VpnProfileSetup.SubProfileAction.Updated: updated++; break;
+                        case VpnProfileSetup.SubProfileAction.Unchanged: present++; break;
+                        case VpnProfileSetup.SubProfileAction.Skipped: skipped++; break;
+                        default: failed++; break;
+                    }
                 }
-                string msg = $"启动对账：订阅 {list.Count} 份，系统profile 已就位 {present}，新补 {added}";
-                if (list.Count > 0) RollingLog.Info("profile-sub-sync", msg);
+                string msg = $"启动对账：订阅 {list.Count} 份，profile 新增 {added} / 更新 {updated} / " +
+                             $"已就位 {present} / 跳过 {skipped} / 失败 {failed}";
+                RollingLog.Info("profile-sub-sync", msg);
                 return msg;
             }
             catch (Exception ex)
@@ -332,12 +381,20 @@ namespace ClashUWP.Backend
 
             try
             {
+                // ★★【1.0.72 修复 · 顺序反过来】先删系统 profile，成功后才删订阅正文。
+                //   旧顺序（先删文件）在 1.0.62~1.0.71 留下过幽灵：会话收不干净时
+                //   RemoveSubscriptionProfileAsync 拒绝删除，而文件已经没了 ——
+                //   快速设置里那条 profile 还在，插件连上去却读不到 subscriptions\{id}.yaml。
+                //   现在 profile 删不掉就整体判失败，正文保留，用户可重试；
+                //   反过来（profile 已删、文件删除失败）重试一次即可收尾，不会留幽灵。
+                var removal = await VpnProfileSetup.RemoveSubscriptionProfileAsync(id);
+                if (!removal.Ok)
+                    return new Result(false, $"未删除 {id}：{removal.Message}（订阅正文与生效记录保留）");
+
                 var file = await GetFileAsync(path);
                 if (file != null) await file.DeleteAsync();
                 await ClearUrlAsync(id);
-                // ★【1.0.62】顺手清掉该订阅在快速设置里的 profile，避免留幽灵条目。
-                var reg = await VpnProfileSetup.RemoveSubscriptionProfileAsync(id);
-                return new Result(true, $"已删除 {id}（{reg}）");
+                return new Result(true, $"已删除 {id}（{removal.Message}）");
             }
             catch (Exception ex)
             {
@@ -378,6 +435,11 @@ namespace ClashUWP.Backend
             {
                 string id = Path.GetFileNameWithoutExtension(f.Name);
                 string url = kv.TryGetValue(UrlKey + ":" + id, out string? u) ? u : "";
+                // 显示名：响应头给的名字优先；老订阅没有这个键时退回 host
+                // （host 也比 id 短得多，不会再出现 `…-link-<token>` 那种长串）。
+                string name = kv.TryGetValue(NameKey + ":" + id, out string? n) && !string.IsNullOrWhiteSpace(n)
+                    ? n
+                    : FallbackName(id, url);
 
                 long size = 0;
                 DateTime mtime = DateTime.MinValue;
@@ -399,7 +461,7 @@ namespace ClashUWP.Backend
                     // 读不了一份也不能让整份列表失败，那份就显示成 0 节点。
                 }
 
-                result.Add(new Profile(id, url, mtime, size, nodes, rules));
+                result.Add(new Profile(id, name, url, mtime, size, nodes, rules));
             }
 
             result.Sort((a, b) => b.FetchedAt.CompareTo(a.FetchedAt));
@@ -464,12 +526,64 @@ namespace ClashUWP.Backend
             return kv.TryGetValue(UrlKey + ":" + id, out string? u) ? u : "";
         }
 
-        /// <summary>从 URL 取 host 作为快速设置里 profile 的显示名（比 id 可读）。</summary>
+        /// <summary>从 URL 取 host（没有响应头名字时的显示名回落）。</summary>
         private static string HostOf(string url)
         {
             if (Uri.TryCreate(url, UriKind.Absolute, out Uri? u))
                 return u.Host;
             return "";
+        }
+
+        private static Task SetNameAsync(string id, string name)
+            => AppendSettingAsync($"{NameKey}:{id}", name);
+
+        /// <summary>没有响应头名字时的回落：host → id，保证显示名永远非空。</summary>
+        private static string FallbackName(string id, string url)
+        {
+            string host = HostOf(url);
+            return host.Length > 0 ? host : id;
+        }
+
+        /// <summary>
+        /// 给人看的名字（UI / CLI）。
+        /// ★ 同一机场的多条链接会给出同一个名字（本机两份 iKuuu 的 filename 都是
+        ///   <c>iKuuu_V2</c>）。列表里重名就追加 host，否则用户分不清点的是哪条；
+        ///   唯一时不加后缀，保持「星链机场」这种干净显示。
+        /// </summary>
+        internal static string DisplayName(Profile p, IReadOnlyList<Profile> all)
+        {
+            if (!HasSameName(p, all)) return p.Name;
+            string host = HostOf(p.Url);
+            if (host.Length == 0) return p.Id;
+            return string.Equals(host, p.Name, StringComparison.OrdinalIgnoreCase)
+                ? p.Name
+                : $"{p.Name}（{host}）";
+        }
+
+        /// <summary>
+        /// 系统 VPN profile 的显示名（<c>ClashUWP · </c> 前缀由 VpnProfileSetup 加）。
+        /// ★ 重名时退回 host：Windows 快速设置靠 ProfileName 区分条目，
+        ///   两条同名 profile 既难辨认，也可能让平台拒绝新建。
+        /// </summary>
+        private static string SystemProfileName(Profile p, IReadOnlyList<Profile> all)
+        {
+            if (!HasSameName(p, all)) return p.Name;
+            string host = HostOf(p.Url);
+            if (host.Length == 0) return p.Id;
+            // host 也撞（同 host 不同 path，MakeId 的已知边界）⇒ 用 id 保唯一。
+            foreach (Profile q in all)
+                if (q.Id != p.Id && string.Equals(HostOf(q.Url), host, StringComparison.OrdinalIgnoreCase))
+                    return p.Id;
+            return host;
+        }
+
+        private static bool HasSameName(Profile p, IReadOnlyList<Profile> all)
+        {
+            // O(n) 遍历，但 n 是个位数（订阅数量通常 ≤5），不需要 HashSet
+            foreach (Profile q in all)
+                if (q.Id != p.Id && string.Equals(q.Name, p.Name, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
         }
 
         // ── 文件小工具 ────────────────────────────────────────────────────
@@ -541,7 +655,10 @@ namespace ClashUWP.Backend
             foreach (var p in profiles)
             {
                 bool isActive = string.Equals(p.Id, active.Id, StringComparison.OrdinalIgnoreCase);
-                sb.Append($"\n{(isActive ? "▶" : " ")} {p.Id}  {p.NodeCount}节点/{p.RuleCount}规则  " +
+                string shown = DisplayName(p, profiles);
+                if (!string.Equals(shown, p.Id, StringComparison.Ordinal))
+                    shown += $" [{p.Id}]";   // CLI 的 switch/delete 还要用 id
+                sb.Append($"\n{(isActive ? "▶" : " ")} {shown}  {p.NodeCount}节点/{p.RuleCount}规则  " +
                           $"{p.SizeBytes / 1024.0:F1}KB  {p.FetchedAt:MM-dd HH:mm}");
             }
             return sb.ToString();

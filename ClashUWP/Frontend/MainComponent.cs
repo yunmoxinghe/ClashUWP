@@ -211,6 +211,20 @@ namespace ClashUWP.Frontend
                 var cts = new System.Threading.CancellationTokenSource();
                 _ = Task.Run(async () =>
                 {
+                    // ★★【1.0.72 修复 · 回填改成"边沿触发"】
+                    //   1.0.62~1.0.71 每轮都拿 connectedSub 与 _subActive.Id 比，
+                    //   不等就 Adopt —— 但 app 内切订阅（ActivateAsync）只热重载配置、
+                    //   不重连 profile，于是"连着的仍是 A、生效已改成 B"是<b>正常中间态</b>。
+                    //   旧逻辑每 3 秒都把 A 回填成生效，用户的切换被自己撤销
+                    //   （本机 1.0.64 日志：profile-sub-adopt 连续刷了几分钟）。
+                    //   ⇒ 只在<b>轮询观察到 connectedSub 发生变化</b>时才回填：
+                    //     变化只能来自系统侧（快速设置连接/断开），那才是需要跟账的事件。
+                    //   首轮只取基线、不判定：启动时"生效 B / 隧道 A"可能是上一次会话的
+                    //   残留（例如切到 B 后 app 被系统关掉），此时隧道里跑的未必是 A 的正文，
+                    //   贸然回填只会把书本账改错。
+                    string lastConnectedSub = "";
+                    bool firstPoll = true;
+
                     while (!cts.IsCancellationRequested)
                     {
                         try
@@ -222,23 +236,39 @@ namespace ClashUWP.Frontend
                             string status = await VpnSession.StatusAsync();
                             _setVpnStatus(status);
 
-                            // ★★【1.0.62】快速面板切订阅的「账要跟上」：
-                            //   连的是某条订阅 profile 且与当前生效的不是同一份 ⇒ 回填。
+                            // ★★ 快速面板切订阅的「账要跟上」：系统侧连接目标变了才回填。
                             //   隧道本身早就在跑那份配置（插件 Connect 自己读的文件），
                             //   这里补的只是 config.yaml + 生效 id 这份书本账。
-                            //   幂等：回填后两值相等，下一轮直接跳过（不会每 3 秒重复写）。
                             string connectedSub = await VpnSession.ConnectedSubAsync();
-                            if (connectedSub.Length > 0 && connectedSub != _subActive.Id)
+                            if (firstPoll)
                             {
-                                var adopt = await SubscriptionManager.AdoptAsync(connectedSub);
-                                if (adopt.Ok)
+                                firstPoll = false;
+                                lastConnectedSub = connectedSub;
+                                if (connectedSub.Length > 0 && connectedSub != _subActive.Id)
+                                    RollingLog.Info("profile-sub-adopt",
+                                        $"启动基线：隧道连着 {connectedSub}，生效记为 {_subActive.Id}；不自动回填");
+                            }
+                            else if (connectedSub != lastConnectedSub)
+                            {
+                                string prev = lastConnectedSub;
+                                lastConnectedSub = connectedSub;
+                                if (connectedSub.Length > 0)
                                 {
-                                    _setActionHint(adopt.Message);
-                                    await RefreshSubscriptionsAsync();
+                                    var adopt = await SubscriptionManager.AdoptAsync(connectedSub);
+                                    if (adopt.Ok)
+                                    {
+                                        _setActionHint(adopt.Message);
+                                        await RefreshSubscriptionsAsync();
+                                    }
+                                    else
+                                    {
+                                        RollingLog.Warn("profile-sub-adopt", adopt.Message);
+                                    }
                                 }
                                 else
                                 {
-                                    RollingLog.Warn("profile-sub-adopt", adopt.Message);
+                                    RollingLog.Info("profile-sub-adopt",
+                                        $"系统侧连接已断开（此前 {prev}），生效订阅保持不变");
                                 }
                             }
                         }
@@ -284,8 +314,9 @@ namespace ClashUWP.Frontend
                         // ★【1.0.62】启动对账：老版本拉过的订阅还没有系统 profile，
                         //   不补注册的话快速设置面板里就是空的（详见 SyncSystemProfilesAsync）。
                         //   放在读列表之后：有列表才有得补；失败只进日志，不挡 UI。
-                        string sync = await SubscriptionManager.SyncSystemProfilesAsync();
-                        RollingLog.Info("profile-sub-sync", sync);
+                        // ★【1.0.72】汇总行由 SyncSystemProfilesAsync 自己记（1.0.62~1.0.71
+                        //   里外各记一遍，同一毫秒出现两条一模一样的 profile-sub-sync）。
+                        await SubscriptionManager.SyncSystemProfilesAsync();
                     }
                     catch { /* 读不到就显示"不存在"，不让 UI 白屏 */ }
 
@@ -696,8 +727,11 @@ namespace ClashUWP.Frontend
                 {
                     bool isActive = string.Equals(p.Id, active.Id, StringComparison.OrdinalIgnoreCase);
                     string id = p.Id;
+                    // ★【1.0.72】显示响应头带来的订阅名（如「星链机场」），
+                    //   不再把 URL 派生的长 id 直接糊在按钮上；重名时 DisplayName 会补 host。
+                    string shown = SubscriptionManager.DisplayName(p, profiles);
                     items.Add(Button(
-                        $"{(isActive ? "▶ " : "  ")}{id}  {p.NodeCount}节点/{p.RuleCount}规则  " +
+                        $"{(isActive ? "▶ " : "  ")}{shown}  {p.NodeCount}节点/{p.RuleCount}规则  " +
                         $"{p.SizeBytes / 1024.0:F1}KB  {p.FetchedAt:MM-dd HH:mm}",
                         () => _ = UseSubscriptionAsync(id)));
                 }

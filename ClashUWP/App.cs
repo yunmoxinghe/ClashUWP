@@ -240,8 +240,35 @@ namespace ClashUWP
         /// </summary>
         protected override void OnLaunched(LaunchActivatedEventArgs args)
         {
-            base.OnLaunched(args);
+            // ★★【1.0.72 修复 · 重复 Launch 不许再建一套 Reactor 外壳】
+            //   ReactorApplication.OnLaunched 每次都会 <c>new ReactorHost(CreateRootComponent())</c>，
+            //   而 <c>Window.Current.Content ??= host.Root</c> 只在空窗口时生效 ——
+            //   也就是说第二次 Launch（用户再次点应用图标、系统重放启动激活等）会
+            //   <b>新建并渲染一个永远不会上屏的 MainComponent</b>：它的 UseEffect 照跑，
+            //   于是多出一条 3 秒轮询（重复的 KernelView / VPN 状态 / 回填判定），
+            //   并且这个组件实例不会被卸载（清理函数永远不执行）。
+            //   本机 1.0.64 日志实证：同一次激活后 profile-sub-sync 在同一毫秒出现两份、
+            //   随后启动对账的 Add 各刷一遍；再叠加下面 Adopt 的旧逻辑就出现"每 3 秒
+            //   回填一次"的放大效应。
+            //   ⇒ 外壳已经建好时，只补做"激活事件订阅"，不调 base。
+            if (Windows.UI.Xaml.Window.Current?.Content != null)
+            {
+                RollingLog.Info("launch", "已有窗口内容树，跳过重复的 Reactor 外壳构建");
+                EnsureActivationSubscribed();
+                return;
+            }
 
+            base.OnLaunched(args);
+            EnsureActivationSubscribed();
+        }
+
+        /// <summary>
+        /// 订阅 <c>CoreApplicationView.Activated</c>（协议激活的真正入口）。
+        /// 必须在窗口/视图就位后调用（见 <see cref="OnLaunched"/> 的说明）；
+        /// Once 模式，重复调用无副作用。
+        /// </summary>
+        private void EnsureActivationSubscribed()
+        {
             if (_activationSubscribed) return;
             _activationSubscribed = true;
 
