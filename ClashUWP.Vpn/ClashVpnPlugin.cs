@@ -82,6 +82,17 @@ namespace ClashUWP.Vpn
         private static VpnChannel? s_activeChannel;
         /// <summary>进程级桥是否刻意留在跑动状态（内核常驻策略，见 Disconnect 的注释）。</summary>
         private static bool s_bridgeResident;
+        /// <summary>
+        /// ★【1.0.70 · G7】当前常驻内核的 gvisor 栈是否<b>以 v6 形态</b>建起来的
+        /// （= 最近一次全量 Start 时 <c>ipv6</c> 档为 2）。
+        ///
+        /// 【为什么必须单独记】栈的地址族集合在 <c>tun.NewStack</c> 时定死一次，
+        /// 之后热重载 / 已启动分支的 rebind 都改不了它（Go 侧 Start 命中 stack != nil
+        /// 只重绑网卡就返回）。若 0/1 → 2 的切换只做热重载，DNS 会开始发 fake v6，
+        /// 而 gvisor 栈不认识 v6 —— 应用连假 v6 地址就是黑洞，且日志里看不出是配置问题。
+        /// 反向（2 → 0/1）不需要重建：没有 v6 路由、没有 AAAA，栈里的 v6 能力闲置无害。
+        /// </summary>
+        private static bool s_bridgeKernelV6;
         /// <summary>上一次连接用的内核配置，用于判断订阅是否变了（变了才热重载）。</summary>
         private static string s_lastConfigFingerprint = "";
         // ★【1.0.38 · G6】重绑要"重放同一次 start"，所以 start 的三个入参必须留档。
@@ -151,6 +162,13 @@ namespace ClashUWP.Vpn
 
         /// <summary>本次实际使用的 transport 外层目标（auto 解析后的结果），写快照与日志用。</summary>
         private string _outerTargetUsed = "";
+
+        /// <summary>
+        /// ★【1.0.70 · G7】本次 IPv6 下发的实际形态（臂号 / 地址 / 路由 / 内核侧 env），写快照用。
+        /// arm=0 时逐字说明"未下发"，与 1.0.69 的行为对齐 —— 这一列存在本身就是
+        /// "这次连接到底动没动 v6"的唯一档案。
+        /// </summary>
+        private string _ipv6Diag = "arm=0 未下发";
 
         /// <summary>
         /// ★【1.0.35 · G9】本次连接的应用分流注入结果（<see cref="KernelConfig.Transform"/> 回来的那句）。
@@ -462,7 +480,10 @@ namespace ClashUWP.Vpn
             string splitNote;
             if (LocalSettings.FakeIp)
             {
-                mihomoConfig = KernelConfig.Transform(rawConfig, AppSplit.Load(), out splitNote);
+                // ★【1.0.70 · G7】ipv6 档位与 fake-ip v6 池一起进改写器：
+                //   档 0 时两个参数都不改变输出（逐字同 1.0.69），档 1/2 才动 dns/tun 块。
+                mihomoConfig = KernelConfig.Transform(rawConfig, AppSplit.Load(),
+                    LocalSettings.Ipv6, LocalSettings.Ipv6FakeRange, out splitNote);
             }
             else
             {
@@ -529,7 +550,7 @@ namespace ClashUWP.Vpn
                 $"ClashUWP: 排除路由 候选 {_nodeExclusions.Count} 条 /32（节点服务器，" +
                 $"下发={(LocalSettings.NodeExclusions ? "是" : "否 nodeExclusions=0")}），" +
                 $"DNS {(domains == null ? "留物理网卡(dnsInTunnel=0)" : "进隧道 " + string.Join(",", _config.DnsServers))}，" +
-                $"内核={LocalSettings.Source} 开关[resident={LocalSettings.ResidentBridge} hotReload={LocalSettings.HotReload} selfSplitTunnel={LocalSettings.SelfSplitTunnel} outer={_outerTargetUsed}:{LocalSettings.OuterPort}(要求={LocalSettings.OuterTarget}) fakeIp={(LocalSettings.FakeIp ? "on" : "off")}]");
+                $"内核={LocalSettings.Source} 开关[resident={LocalSettings.ResidentBridge} hotReload={LocalSettings.HotReload} selfSplitTunnel={LocalSettings.SelfSplitTunnel} ipv6={LocalSettings.Ipv6} outer={_outerTargetUsed}:{LocalSettings.OuterPort}(要求={LocalSettings.OuterTarget}) fakeIp={(LocalSettings.FakeIp ? "on" : "off")}]");
 
             // 步 6 · ★ 建隧道 = 建 L3 网卡。
             // 【官方】Start(...)："Creates the VPN channel to be used by the VPN plug-in.
@@ -573,6 +594,35 @@ namespace ClashUWP.Vpn
 
                 var ipv4 = new List<HostName> { new(_config.ClientIpV4) };
 
+                // ★【1.0.70 · G7】IPv6 三档（默认 0 = 与 1.0.69 逐字一致）。
+                //   0 = 不下发 v6 地址、不下发 v6 路由、内核配置一个字节都不改；
+                //   1 = 防泄漏：给 L3 接口一个 ULA 地址 + 下发 2000::/3（全局单播的
+                //       "IPv6 版默认路由"），同时内核 dns.ipv6=false —— 应用拿不到 AAAA，
+                //       硬编码 v6 字面量的流量也会进隧道而不是从物理网卡旁路；
+                //   2 = 全量：在 1 之上让内核真正跑 v6（tun.inet6-address + fake-ip v6 池 +
+                //       dns.ipv6=true），并额外把 fake-ip v6 池前缀（默认 ULA，不在
+                //       2000::/3 里）拉进隧道。
+                //   ★ 地址必须配路由才有意义：先遣 V6D/E vs V6F/H 实测过
+                //     "只给 fd00::2 不给路由"和"只给路由不给地址"两种情况接口都不承载 v6。
+                //   ★ 绝不用 ::/0：先遣 docs/96 四臂实测它会把 IPv6 变成真正的默认路由、
+                //     连 IPv4 的出站都被抢走；2000::/3 四臂三通过，是这条路上验证过的形态。
+                List<HostName>? ipv6 = null;
+                if (LocalSettings.Ipv6 >= 1)
+                {
+                    string v6addr = LocalSettings.Ipv6ClientAddress.Length > 0
+                        ? LocalSettings.Ipv6ClientAddress
+                        : _config.ClientIpV6;
+                    ipv6 = new List<HostName> { new(v6addr) };
+                    _ipv6Diag = $"arm={LocalSettings.Ipv6} addr={v6addr} " +
+                                $"routes=[{string.Join(",", Ipv6InclusionRoutes())}] " +
+                                $"kernelIpv6={(LocalSettings.Ipv6 >= 2 ? "on" : "off（AAAA 不解析）")} " +
+                                $"pool={LocalSettings.Ipv6FakeRange}";
+                }
+                else
+                {
+                    _ipv6Diag = "arm=0 未下发";
+                }
+
                 // ★★ 先遣项目实测出的两条硬约束，两条都压在旧实现身上（docs/76）：
                 //
                 // ① V1 <c>Start()</c> **静默丢弃 Ipv4InclusionRoutes**（docs/76 发现一，
@@ -603,7 +653,7 @@ namespace ClashUWP.Vpn
 
                 channel.StartWithTrafficFilter(
                     ipv4,                                  // assignedClientIPv4list
-                    null,                                  // assignedClientIPv6list（v6 暂未接管）
+                    ipv6,                                  // assignedClientIPv6list ★ G7：arm=0 → null（同 1.0.69）
                     null,                                  // vpnInterfaceId
                     routes,                                // routeScope（含节点 /32 排除）
                     domains ?? new VpnDomainNameAssignment(), // namespaceScope：★ 这里传的是<b>空 assignment 对象</b>，不是 null（"null 对象=不发 NRPT"是旧注释的误述，见 Docs/09 C3；空对象与 null 的语义差别在 trafficFilter 那一路已实测过 ⇒ 本项属未验证）
@@ -679,12 +729,14 @@ namespace ClashUWP.Vpn
                 //   重新 Connect，从不回调 Disconnect），这一行也已经把变量固化下来了。
                 LogSession($"evt=start includeMode={LocalSettings.IncludeMode} " +
                            $"include=[{string.Join(",", includeUsed)}] " +
+                           $"v6include=[{string.Join(",", Ipv6InclusionRoutes())}] " +
                            $"outer={_outerTargetUsed}:{LocalSettings.OuterPort} " +
-                           $"dnsInTunnel={(LocalSettings.DnsIntoTunnel ? 1 : 0)} " +
+                           $"dnsInTunnel={(LocalSettings.DnsIntoTunnel ? 1 : 0)} ipv6={LocalSettings.Ipv6} " +
                            $"nodeExcl={_nodeExclusions.Count} mtu={_config.Mtu}");
                 RollingLog.Info("session", "L3 隧道接口已建立：" +
                            $"includeMode={LocalSettings.IncludeMode} " +
                            $"include=[{string.Join(",", includeUsed)}] " +
+                           $"ipv6={LocalSettings.Ipv6} v6include=[{string.Join(",", Ipv6InclusionRoutes())}] " +
                            $"outer={_outerTargetUsed}:{LocalSettings.OuterPort} mtu={_config.Mtu}");
 
                 // 步 7 · ★ 启动 mihomo 进程内数据面（路线 A）。
@@ -713,7 +765,7 @@ namespace ClashUWP.Vpn
                 //     （桥此刻绑到哪张物理网卡），桥没起来时读到空串，基线就没意义。
                 //   ★ 为什么默认只观测（netFollow=1）：订阅事件这件事在 vpnClient 后台任务
                 //     进程里到底收不收得到<b>没有实测</b>，而动作臂要再调一次 clash_bridge_start
-                //     —— 两条都是 Docs/22 的待验项，代码全写完、默认不动桥。
+                //     —— 两条都是 Docs/21 的待验项，代码全写完、默认不动桥。
                 //   ★ 它是<b>尽力而为</b>：Start 内部订阅失败只进 channel=net-follow 日志，
                 //     绝不让"跟随网络"这个附加能力把整条连接拖垮（见 NetworkFollow.Start 的 catch）。
                 NetworkFollow.Start(BoundIfaceNow());
@@ -770,6 +822,7 @@ namespace ClashUWP.Vpn
                         try { s_boundIfaceSnapshot = MihomoBridge.BoundInterface(); } catch { }
                         MihomoBridge.clash_bridge_stop();
                         s_bridgeResident = false;
+                        s_bridgeKernelV6 = false;
                     }
                     else
                     {
@@ -1748,6 +1801,7 @@ namespace ClashUWP.Vpn
                 {
                     MihomoBridge.clash_bridge_stop();
                     s_bridgeResident = false;
+                    s_bridgeKernelV6 = false;
                     channel.LogDiagnosticMessage("ClashUWP: mihomo 内核随会话停止（residentBridge=0）.");
                 }
             }
@@ -1774,6 +1828,9 @@ namespace ClashUWP.Vpn
                 $"BoundIface={s_boundIfaceSnapshot}\r\n" +
                 $"ResidentBridge={LocalSettings.ResidentBridge}\r\n" +
                 $"DnsIntoTunnel={LocalSettings.DnsIntoTunnel} ({string.Join(",", _config.DnsServers)})\r\n" +
+                // ★【1.0.70 · G7】IPv6 三档的现场：臂号 / 接口地址 / v6 路由 / fake-ip v6 池。
+                //   arm=0 的"未下发"必须逐字可见 —— 它是"这次连接与 1.0.69 完全一致"的凭据。
+                $"Ipv6={_ipv6Diag}\r\n" +
                 $"NodeExclusions={(_nodeExclusions.Count)} switch={(LocalSettings.NodeExclusions ? "on" : "off")} /32\r\n" +
                 $"SelfSplitTunnel={_selfSplitFilterInfo}\r\n" +
                 // ★【1.0.35 · G9/G5】两行新证据。G9 最容易失败的形态是"名单存下了、
@@ -1921,9 +1978,33 @@ namespace ClashUWP.Vpn
                 lockTaken = true;
 
                 // 上一任的泵先摘除（它可能还挂在已 Stop 的旧 channel 上）。
+                // ★ 放在重建判断之前：停桥重建时绝不能让旧泵还对着旧 vtun 取包。
                 var old = s_pumpCts;
                 s_pumpCts = null;
                 try { old?.Cancel(); } catch { }
+
+                // ★【1.0.70 · G7】常驻栈的地址族是 Start 时定死的，热重载改不了
+                //   （理由见 <see cref="s_bridgeKernelV6"/>）。目标档 2 而常驻栈没有 v6
+                //   时先 Stop 再全量 Start —— 这是 <c>residentBridge=0</c> 每次断开都在走
+                //   的销毁/重建路径，不是"同进程第二次 Start"那条病态路径。
+                //   Stop 失败不阻断：后续 Start 会命中 already started 并按复用处理，
+                //   快照里 s_bridgeKernelV6 与实际不符会体现在下一轮的判断上。
+                if (s_bridgeResident && LocalSettings.Ipv6 >= 2 && !s_bridgeKernelV6)
+                {
+                    RollingLog.Info("bridge-start",
+                        "ipv6 档 0/1 → 2：常驻内核的 gvisor 栈没有 v6，停桥重建（Stop → Start）");
+                    try
+                    {
+                        int stopRc = MihomoBridge.clash_bridge_stop();
+                        RollingLog.Info("bridge-start", $"为重建 v6 栈调用 clash_bridge_stop rc={stopRc}");
+                    }
+                    catch (Exception ex)
+                    {
+                        RollingLog.Error("bridge-start", "为重建 v6 栈停桥抛异常: " + ex.Message, ex);
+                    }
+                    s_bridgeResident = false;
+                    s_bridgeGlobal = false;
+                }
 
                 // ★ 复用/首次都要先排空回程队列：常驻时队列里可能留着上一会话的包，
                 //   注进新建的 L3 接口就是凭空给 TCP 塞陈旧段（TLS 首包失败的现成成因）。
@@ -1944,6 +2025,29 @@ namespace ClashUWP.Vpn
                         $"本进程首次启动桥 mtu={_config.Mtu} drained={drained} " +
                         $"mmdbDir={(mmdbDir.Length == 0 ? "(空!)" : mmdbDir)}");
                     var sw = System.Diagnostics.Stopwatch.StartNew();
+                    // ★【1.0.70 · G7 · arm 2】必须在 P/Invoke 之前设：mihomo 的
+                    //   <c>config.Parse</c> 里 <c>parseIPV6(rawCfg)</c>（config.go:716）会调
+                    //   <c>verifyIP6()</c>（config/utils.go:205）—— 本机没有全局 IPv6 地址，
+                    //   校验失败就会把 <c>tun.inet6-address</c> 与 <c>dns.fake-ip-range6</c>
+                    //   静默清空（config.go:1679-1682），arm 2 的内核半边等于没写。
+                    //   官方留了环境变量 <c>SKIP_SYSTEM_IPV6_CHECK=1</c> 作为这个校验的
+                    //   逃生口（utils.go 先读它、命中即直接返回 true），口径与 Clash Verge
+                    //   在无 v6 机器上开 v6 一致。只影响本次进程解析，不改注册表/系统设置。
+                    if (LocalSettings.Ipv6 >= 2)
+                    {
+                        try
+                        {
+                            Environment.SetEnvironmentVariable("SKIP_SYSTEM_IPV6_CHECK", "1");
+                            RollingLog.Info("bridge-start",
+                                "arm=2 已设 SKIP_SYSTEM_IPV6_CHECK=1（本机无全局 v6，跳过 mihomo 的系统校验）");
+                        }
+                        catch (Exception ex)
+                        {
+                            // 设不上不致命：没有 inet6-address 时内核只是不跑 v6，
+                            // 隧道侧的地址与路由仍在 —— 会体现在快照的 _ipv6Diag 里。
+                            RollingLog.Warn("bridge-start", "设置 SKIP_SYSTEM_IPV6_CHECK 失败: " + ex.Message);
+                        }
+                    }
                     var startTask = Task.Run(() => MihomoBridge.Start(config, (int)_config.Mtu, mmdbDir));
                     calledStart = true;
                     if (!startTask.Wait(TimeSpan.FromSeconds(20)))
@@ -2008,7 +2112,9 @@ namespace ClashUWP.Vpn
                 {
                     s_bridgeGlobal = true;
                     s_bridgeResident = true;
-                    _bridgeDiag = $"本进程首次启动（排空 {drained} 包）";
+                    // ★【1.0.70 · G7】栈的地址族在这一刻定死，供下一轮判断要不要重建。
+                    s_bridgeKernelV6 = LocalSettings.Ipv6 >= 2;
+                    _bridgeDiag = $"本进程首次启动（排空 {drained} 包，v6栈={(s_bridgeKernelV6 ? "on" : "off")}）";
                     RollingLog.Info("bridge-start", "mihomo bridge 已启动，回程泵运行中.");
                     channel.LogDiagnosticMessage("ClashUWP: mihomo bridge 已启动，回程泵运行中.");
                 }
@@ -2873,6 +2979,15 @@ namespace ClashUWP.Vpn
                     assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName(address), prefix));
             }
 
+            // ★【1.0.70 · G7】v6 进隧道路由 —— arm 0 时清单为空，一个 VpnRoute 都不加，
+            //   行为与 1.0.69 逐字一致。路由与 <c>assignedClientIPv6list</c> 必须成对：
+            //   没有 v6 地址的接口装不上 v6 路由，只有地址没有路由则流量照旧从物理网卡旁路。
+            foreach (string cidr in Ipv6InclusionRoutes())
+            {
+                if (TryParseCidr(cidr, out string? address, out byte prefix))
+                    assignment.Ipv6InclusionRoutes.Add(new VpnRoute(new HostName(address), prefix));
+            }
+
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string cidr in _config.ExcludeRoutes)
             {
@@ -2911,6 +3026,30 @@ namespace ClashUWP.Vpn
             //   只有 NetworkAdapterId/带宽/IanaInterfaceType），拿不到网关就别猜。
 
             return assignment;
+        }
+
+        /// <summary>
+        /// ★【1.0.70 · G7】v6 进隧道路由清单。arm 0 → 空（一条都不下发）。
+        ///
+        /// 【为什么是 2000::/3 而不是 ::/0】先遣项目 docs/96 的四臂实测：
+        ///   <c>::/0</c> 一旦下发，IPv6 就成为<b>真正的默认路由</b>，连 IPv4 的出站选择
+        ///   都被它抢走（4/4 臂把 VPN 变成 v4 默认路由）；<c>2000::/3</c> 是全局单播的
+        ///   覆盖段，能兜住全部公网 v6 地址而不碰 ::/0 的语义，3/3 臂通过。
+        ///
+        /// 【arm 2 为什么还要加池前缀】fake-ip v6 池默认 <c>fdfe:dcba:9876::/64</c> 是
+        ///   ULA（fc00::/7），不在 <c>2000::/3</c> 里；不单独下发，域名解析出的假 v6
+        ///   地址就会走物理网卡 —— fake-ip 在 v6 上等于白做。池前缀由
+        ///   <see cref="LocalSettings.TryNormalizeV6Prefix"/> 消毒过（只接受 ULA /48–/64）。
+        /// </summary>
+        private List<string> Ipv6InclusionRoutes()
+        {
+            var list = new List<string>();
+            if (LocalSettings.Ipv6 < 1)
+                return list;
+            list.Add("2000::/3");
+            if (LocalSettings.Ipv6 >= 2)
+                list.Add(LocalSettings.Ipv6FakeRange);
+            return list;
         }
 
         /// <summary>

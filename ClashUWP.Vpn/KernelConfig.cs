@@ -78,7 +78,9 @@ namespace ClashUWP.Vpn
         ///   产出<b>逐字相同</b>的那份 <c>config.kernel.yaml</c>
         ///   （Docs/12 §9.4 的"单源"约定：少一条注入，热重载就会把名单覆盖回订阅原文）。
         /// </summary>
-        internal static string Transform(string yaml, AppSplit? split, out string splitNote)
+        internal static string Transform(string yaml, AppSplit? split,
+                                         int ipv6Arm, string ipv6FakeRange,
+                                         out string splitNote)
         {
             splitNote = "未处理";
             try
@@ -96,8 +98,14 @@ namespace ClashUWP.Vpn
                 }
 
                 List<string> lines = new(yaml.Replace("\r\n", "\n").Split('\n'));
-                EnsureDnsBlock(lines);
-                EnsureTunBlock(lines);
+                // ★【1.0.39 · G7】顶层 ipv6 必须在 dns/tun 之前 —— mihomo 的
+                //   config.go:716 `parseIPV6(rawCfg)` 的注释原文就是 "must before DNS and Tun"，
+                //   而它的实现（:1680-1682）在开关关闭或本机无全局 v6 时会把
+                //   `tun.inet6-address` / `dns.fake-ip-range6` 整个清空。
+                if (ipv6Arm >= 2)
+                    EnsureTopLevelIpv6(lines);
+                EnsureDnsBlock(lines, ipv6Arm, ipv6FakeRange);
+                EnsureTunBlock(lines, ipv6Arm, ipv6FakeRange);
                 LockUrlTestTolerance(lines);
                 InjectAppSplitRules(lines, split, out splitNote);
 
@@ -140,7 +148,7 @@ namespace ClashUWP.Vpn
         /// <c>dns:</c> 块：enhanced-mode 强制 fake-ip，缺 fake-ip-range / fake-ip-filter 就补。
         /// 没有 dns 块时（订阅只写代理不写 DNS 的情况）追加一个最小可用块。
         /// </summary>
-        private static void EnsureDnsBlock(List<string> lines)
+        private static void EnsureDnsBlock(List<string> lines, int ipv6Arm, string ipv6FakeRange)
         {
             int start = FindTopLevelKey(lines, "dns");
             if (start >= 0 && IsInlineBlock(lines, start))
@@ -152,10 +160,13 @@ namespace ClashUWP.Vpn
                     lines.Add("");
                 lines.Add("dns:");
                 lines.Add("    enable: true");
-                lines.Add("    ipv6: false");
+                // 档 2 要 AAAA 回假 IP；档 1 明确不答 AAAA（泄漏封堵的一半）。
+                lines.Add(ipv6Arm >= 2 ? "    ipv6: true" : "    ipv6: false");
                 lines.Add("    default-nameserver: [223.5.5.5, 119.29.29.29]");
                 lines.Add("    enhanced-mode: fake-ip");
                 lines.Add($"    fake-ip-range: {FakeIpRange}");
+                if (ipv6Arm >= 2)
+                    lines.Add($"    fake-ip-range6: {ipv6FakeRange}");
                 lines.Add($"    fake-ip-filter: {FakeIpFilter}");
                 lines.Add("    nameserver: ['https://doh.pub/dns-query', 'https://dns.alidns.com/dns-query']");
                 lines.Add("    fallback: ['https://223.5.5.5/dns-query', 'https://223.6.6.6/dns-query']");
@@ -194,6 +205,63 @@ namespace ClashUWP.Vpn
                 lines.Insert(at + 1, keyIndent + $"fake-ip-filter: {FakeIpFilter}");
                 end++;
             }
+
+            // ★【1.0.39 · G7】以下两项只在档 ≥1 时动。档 0（默认）逐字保持订阅原文，
+            //   连"订阅里写了 ipv6: true"也不碰 —— 那是本批之前的行为。
+            if (ipv6Arm >= 1)
+            {
+                string want = ipv6Arm >= 2 ? "true" : "false";
+                int ipv6Key = FindKeyInRange(lines, start + 1, end, "ipv6");
+                if (ipv6Key < 0)
+                {
+                    lines.Insert(enhanced + 1, keyIndent + "ipv6: " + want);
+                    end++;
+                }
+                else if (ValueOf(lines[ipv6Key]).Length > 0)
+                {
+                    lines[ipv6Key] = KeyLine(lines[ipv6Key], "ipv6", want);
+                }
+                // 值为空 ⇒ 是块形状，别整行替换（同上面 enhanced-mode 的理由）。
+
+                if (ipv6Arm >= 2 &&
+                    FindKeyInRange(lines, start + 1, end, "fake-ip-range6") < 0)
+                {
+                    int at = FindKeyInRange(lines, start + 1, end, "fake-ip-range");
+                    if (at < 0) at = enhanced;
+                    lines.Insert(at + 1, keyIndent + $"fake-ip-range6: {ipv6FakeRange}");
+                    end++;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 顶层 <c>ipv6: true</c>。★【1.0.39 · G7】只在档 2 调：mihomo 的
+        /// <c>parseIPV6</c>（<c>config.go:716/:1679-1682</c>）在它关闭时会把
+        /// <c>tun.inet6-address</c> 与 <c>dns.fake-ip-range6</c> 清空 ——
+        /// 那是"配置写了却没生效"的静默失败形态。档 0/1 不碰订阅原文。
+        /// 已有键且是标量就改成 true；值为空（块形状）则不动，不拿 YAML 冒险。
+        /// </summary>
+        private static void EnsureTopLevelIpv6(List<string> lines)
+        {
+            int at = FindTopLevelKey(lines, "ipv6");
+            if (at >= 0)
+            {
+                if (ValueOf(lines[at]).Length > 0)
+                    lines[at] = "ipv6: true";
+                return;
+            }
+
+            // 插到"文件头注释 / 文档分隔符"之后，保持 YAML 可读且不破坏 ---。
+            int insert = 0;
+            while (insert < lines.Count)
+            {
+                string t = lines[insert].Trim();
+                if (t.Length == 0 || t.StartsWith("#") || t == "---" || t == "...")
+                    insert++;
+                else
+                    break;
+            }
+            lines.Insert(insert, "ipv6: true");
         }
 
         /// <summary>
@@ -202,17 +270,35 @@ namespace ClashUWP.Vpn
         /// 并确保 <c>dns-hijack</c> 含 <c>any:53</c> —— fake-ip 靠的就是这个劫持器。
         /// 完全没有 tun 块时补一个。
         /// </summary>
-        private static void EnsureTunBlock(List<string> lines)
+        private static void EnsureTunBlock(List<string> lines, int ipv6Arm, string ipv6FakeRange)
         {
+            // ★【1.0.39 · G7】档 2 要内核 v6 栈地址。取 fake 池的网络号 +1（/126），
+            //   与 mihomo 默认的 fdfe:dcba:9876::1/126 同形态；池子从 ::4 开始分配，
+            //   ::2 是 DNS 劫持地址，因此 ::1/126 与假地址不冲突（fakeip/pool.go）。
+            string inet6 = ipv6Arm >= 2 ? Inet6FromPool(ipv6FakeRange) : "";
+
             int start = FindTopLevelKey(lines, "tun");
             if (start >= 0 && IsInlineBlock(lines, start))
             {
-                // 行内流式写法（tun: {enable: true, ...}）：只做两处行内替换，
+                // 行内流式写法（tun: {enable: true, ...}）：只做行内替换，
                 // 不整块重写 —— enable=true 在这里是"必须改"（wintun 在沙箱里建不出来），
                 // 而整行重写会把用户写的其余字段一起丢掉。
                 lines[start] = InlineRegex().Replace(lines[start], "enable: false");
                 if (!lines[start].Contains("any:53") && !lines[start].Contains("0.0.0.0:53"))
                     lines[start] = HijackRegex().Replace(lines[start], "dns-hijack: [any:53]");
+
+                if (ipv6Arm >= 2 && !lines[start].Contains("inet6-address"))
+                {
+                    int close = lines[start].LastIndexOf('}');
+                    if (close > 0)
+                    {
+                        string head = lines[start].Substring(0, close).TrimEnd().TrimEnd(',');
+                        string tail = lines[start].Substring(close);
+                        // `tun: {}` 这种空映射不能加逗号，否则变成 `{, ...}`。
+                        string sep = head.EndsWith("{", StringComparison.Ordinal) ? "" : ",";
+                        lines[start] = head + sep + $" inet6-address: [{inet6}] " + tail;
+                    }
+                }
                 return;
             }
             if (start < 0)
@@ -223,6 +309,8 @@ namespace ClashUWP.Vpn
                 lines.Add("    enable: false");
                 lines.Add("    stack: gvisor");
                 lines.Add("    dns-hijack: [any:53]");
+                if (ipv6Arm >= 2)
+                    lines.Add($"    inet6-address: [{inet6}]");
                 lines.Add("    mtu: 1400");
                 return;
             }
@@ -238,6 +326,10 @@ namespace ClashUWP.Vpn
             {
                 string indent = enable >= 0 ? LeadingSpaces(lines[enable]) : "    ";
                 lines.Insert(start + 1, indent + "dns-hijack: [any:53]");
+                // 不 return：档 2 还要补 inet6-address。插在 dns-hijack 之后即可。
+                end++;
+                if (ipv6Arm >= 2 && FindKeyInRange(lines, start + 1, end, "inet6-address") < 0)
+                    lines.Insert(start + 2, indent + $"inet6-address: [{inet6}]");
                 return;
             }
 
@@ -253,28 +345,58 @@ namespace ClashUWP.Vpn
             {
                 if (!value.Contains("any:53") && !value.Contains("0.0.0.0:53"))
                     lines[hijack] = KeyLine(lines[hijack], "dns-hijack", "[any:53]");
-                return;
+            }
+            else
+            {
+                int last = hijack;
+                bool hasAny = false;
+                for (int i = hijack + 1; i < lines.Count; i++)
+                {
+                    string t = lines[i].Trim();
+                    if (t.Length == 0)
+                        continue;
+                    if (!t.StartsWith("-"))
+                        break;
+                    last = i;
+                    if (t.Contains("any:53") || t.Contains("0.0.0.0:53"))
+                        hasAny = true;
+                }
+                if (!hasAny)
+                {
+                    string itemIndent = last > hijack
+                        ? LeadingSpaces(lines[last])
+                        : LeadingSpaces(lines[hijack]) + "  ";
+                    lines.Insert(last + 1, itemIndent + "- any:53");
+                    end++;
+                }
             }
 
-            int last = hijack;
-            bool hasAny = false;
-            for (int i = hijack + 1; i < lines.Count; i++)
+            if (ipv6Arm >= 2 && FindKeyInRange(lines, start + 1, end, "inet6-address") < 0)
             {
-                string t = lines[i].Trim();
-                if (t.Length == 0)
-                    continue;
-                if (!t.StartsWith("-"))
-                    break;
-                last = i;
-                if (t.Contains("any:53") || t.Contains("0.0.0.0:53"))
-                    hasAny = true;
+                int anchor = enable >= 0 ? enable : hijack;
+                string indent = LeadingSpaces(lines[anchor]);
+                lines.Insert(anchor + 1, indent + $"inet6-address: [{inet6}]");
             }
-            if (hasAny)
-                return;
-            string itemIndent = last > hijack
-                ? LeadingSpaces(lines[last])
-                : LeadingSpaces(lines[hijack]) + "  ";
-            lines.Insert(last + 1, itemIndent + "- any:53");
+        }
+
+        /// <summary>
+        /// 由 fake-ip v6 池推出内核栈自己的 v6 地址（网络号 +1，/126）。
+        /// 例：<c>fdfe:dcba:9876::/64</c> → <c>fdfe:dcba:9876::1/126</c>。
+        /// 池值已经过 <see cref="LocalSettings.TryNormalizeV6Prefix"/> 归一；这里再兜一次底。
+        /// </summary>
+        private static string Inet6FromPool(string pool)
+        {
+            if (!LocalSettings.TryNormalizeV6Prefix(pool, out string normalized))
+                normalized = LocalSettings.DefaultIpv6FakeRange;
+
+            string network = normalized.Substring(0, normalized.IndexOf('/'));
+            byte[] bytes = System.Net.IPAddress.Parse(network).GetAddressBytes();
+            for (int i = bytes.Length - 1; i >= 0; i--)
+            {
+                if (++bytes[i] != 0)
+                    break;
+            }
+            return $"{new System.Net.IPAddress(bytes)}/126";
         }
 
         /// <summary>

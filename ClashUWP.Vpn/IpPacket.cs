@@ -203,6 +203,15 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal static bool IsNonUnicastDestination(byte[] p, int length)
         {
+            if (length < 1)
+                return false;
+
+            // ★【1.0.70 · G7】IPv6 组播 ff00::/8 同样不该进隧道：
+            //   给接口下发 v6 地址后 Windows 会发 ND/RS（目的 ff02::1:ffxx:xxxx），
+            //   喂进 gvisor 既没人应答也白烧包数。v4 的那三条判据照旧。
+            if (Version(p) == 6)
+                return length >= 40 && p[24] == 0xFF;
+
             if (length < 20 || Version(p) != Ipv4Version)
                 return false;
             uint dst = DestinationAddress(p);
@@ -253,7 +262,18 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal static ChecksumFix FixChecksums(byte[] p, int length)
         {
-            if (length < 20 || Version(p) != Ipv4Version)
+            if (length < 20)
+                return ChecksumFix.None;
+
+            // ★【1.0.70 · G7】IPv6 走独立分支：头里没有校验和，传输层伪头是
+            //   16+16 字节地址 + 32 位长度 + next header，与 v4 的 12 字节伪头不同。
+            //   这条不是"顺手补全"：gvisor 端点未声明 RXChecksumOffload，
+            //   conntrack 对 v6 TCP/UDP 同样逐包验校验和（v4 那张黑洞病史见下方注释），
+            //   而 Windows 的 checksum offload 对 v6 一视同仁 —— 不补算，
+            //   arm 1/2 的 v6 流量会重复 v4 在 1.0.15 之前的"包进得去、内核不回话"。
+            if (Version(p) == 6)
+                return FixChecksumsV6(p, length);
+            if (Version(p) != Ipv4Version)
                 return ChecksumFix.None;
 
             int hl = HeaderLength(p);
@@ -304,6 +324,93 @@ namespace ClashUWP.Vpn
             }
 
             return fix;
+        }
+
+        /// <summary>
+        /// ★【1.0.70 · G7】IPv6 的校验和修补。返回哪些字段被改过。
+        ///
+        /// 只处理 next header 直接是 TCP(6)/UDP(17) 的包；带扩展头（Hop-by-Hop /
+        /// Routing / Fragment…）的一律<b>不动</b> —— 保守原则：改错一个字节比不补更糟，
+        /// 而 Windows 的普通 TCP/UDP 出站不带扩展头。
+        ///
+        /// ★ UDP 在 IPv6 里校验和是<b>必填</b>（RFC 2460 §8.1，与 IPv4 允许 0 不同），
+        ///   所以这里连 stored==0 也要补算；算出 0 写 0xFFFF（同 v4 的 RFC 768 处理）。
+        /// </summary>
+        private static ChecksumFix FixChecksumsV6(byte[] p, int length)
+        {
+            const int v6Header = 40;
+            if (length < v6Header)
+                return ChecksumFix.None;
+
+            // payload length（不含 40 字节头）才是真实长度，buf 尾部可能有填充。
+            int payload = ReadUInt16BigEndian(p, 4);
+            int total = v6Header + payload;
+            int n = Math.Min(length, total);
+            if (n <= v6Header)
+                return ChecksumFix.None;
+
+            byte next = p[6];
+            if (next == 6)
+            {
+                if (n < v6Header + 20)
+                    return ChecksumFix.None;
+                int off = v6Header + 16;
+                ushort stored = ReadUInt16BigEndian(p, off);
+                ushort want = TransportChecksumV6(p, n, v6Header, off, 6);
+                if (want == stored)
+                    return ChecksumFix.None;
+                WriteUInt16BigEndian(p, off, want);
+                return ChecksumFix.Transport;
+            }
+            if (next == 17)
+            {
+                if (n < v6Header + 8)
+                    return ChecksumFix.None;
+                int off = v6Header + 6;
+                ushort stored = ReadUInt16BigEndian(p, off);
+                ushort want = TransportChecksumV6(p, n, v6Header, off, 17);
+                if (want == 0)
+                    want = 0xFFFF;
+                if (want == stored)
+                    return ChecksumFix.None;
+                WriteUInt16BigEndian(p, off, want);
+                return ChecksumFix.Transport;
+            }
+            return ChecksumFix.None;
+        }
+
+        /// <summary>
+        /// IPv6 伪头 + 传输层的 RFC 1071 校验和：
+        ///   src(16) + dst(16) + 上层长度(32 位) + 3 字节 0 + next header(1) + 载荷。
+        /// <paramref name="checksumOffset"/> 处的两字节在计算时视为 0。
+        /// </summary>
+        private static ushort TransportChecksumV6(byte[] p, int total, int start,
+            int checksumOffset, byte protocol)
+        {
+            uint sum = 0;
+            // 伪头的源/目的地址就是 IPv6 头里的 8..39（不是包头的 0..31：
+            // 0..7 是 version/traffic class/flow label/payload length/next header/hop limit）。
+            for (int i = 8; i < 40; i += 2)
+                sum += (uint)((p[i] << 8) | p[i + 1]);
+
+            int l4Len = total - start;
+            sum += (uint)(l4Len >> 16);                  // 上层长度低 16 位之外的高位
+            sum += (uint)(l4Len & 0xFFFF);
+            sum += protocol;                             // 3 字节 0 + next header 的末字
+
+            int end = total;
+            for (int i = start; i + 1 < end; i += 2)
+            {
+                if (i == checksumOffset)
+                    continue;                            // 校验和字段视为 0
+                sum += (uint)((p[i] << 8) | p[i + 1]);
+            }
+            if (((end - start) & 1) == 1)                // 奇数字节：尾部补 0
+                sum += (uint)(p[end - 1] << 8);
+
+            while ((sum >> 16) != 0)
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            return (ushort)~sum;
         }
 
         /// <summary>

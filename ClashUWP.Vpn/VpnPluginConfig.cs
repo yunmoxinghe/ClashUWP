@@ -34,6 +34,22 @@ namespace ClashUWP.Vpn
         /// <summary>分配给 VPN 接口的 IPv4 地址（本机这一侧）。</summary>
         public string ClientIpV4 { get; set; } = "10.7.0.2";
 
+        /// <summary>
+        /// ★【1.0.39 · G7】分配给 VPN 接口的 IPv6 地址（本机这一侧），默认 ULA
+        /// <c>fd66:6:6600::2</c>（RFC 4193 的 <c>fd00::/8</c>）。
+        ///
+        /// 【为什么必须是 ULA】隧道内地址是链路内约定，不是"猜本机该有哪个公网 v6"；
+        ///   先遣项目 docs/96 的最小修复用的就是 <c>fd00::2</c>。
+        /// 【生效条件】只有 <c>settings.txt: ipv6=1/2</c> 时才会把它放进
+        ///   <c>StartWithTrafficFilter</c> 的 <c>assignedClientIPv6list</c>；
+        ///   档 0（默认）时这个值原样存在但<b>不下发</b>，行为与本批之前逐字一致。
+        /// 【为什么不能落进 fake-ip v6 池】<c>fdfe:dcba:9876::/64</c> 是 AAAA 假地址段，
+        ///   隧道自身地址与它重叠后，日志里"假 IP / 本机地址"就没法区分了。
+        /// ★ 与 <see cref="ClientIpV4"/> 一样，这是 profile 携带的连接参数；
+        ///   <c>settings.txt: ipv6ClientAddress</c> 可以临时覆盖（见当地读取点）。
+        /// </summary>
+        public string ClientIpV6 { get; set; } = "fd66:6:6600::2";
+
         /// <summary>MTU。会被夹到 ≤ <see cref="MtuHardLimit"/>。</summary>
         public uint Mtu { get; set; } = MtuHardLimit;
 
@@ -105,6 +121,12 @@ namespace ClashUWP.Vpn
 
             config.ClientIpV4 = Element(root, "clientIpV4") ?? config.ClientIpV4;
 
+            // ★【1.0.39 · G7】<clientIpV6>：非法值回落默认，不抛。
+            //   写错一个字符的代价必须是"这一档没按预期生效"，不能是 Connect 抛在平台回调里。
+            string? rawV6 = Element(root, "clientIpV6");
+            if (rawV6 != null && IsIpv6Literal(rawV6))
+                config.ClientIpV6 = rawV6;
+
             if (uint.TryParse(Element(root, "mtu"), NumberStyles.None,
                               CultureInfo.InvariantCulture, out uint mtu))
             {
@@ -166,6 +188,8 @@ var dns = Elements(root, "dns");
             var sb = new StringBuilder();
             sb.Append("<clash>");
             sb.Append(CultureInfo.InvariantCulture, $"<clientIpV4>{ClientIpV4}</clientIpV4>");
+            // ★【1.0.39 · G7】v6 地址随 profile 走；插件只在 ipv6=1/2 时才下发它。
+            sb.Append(CultureInfo.InvariantCulture, $"<clientIpV6>{ClientIpV6}</clientIpV6>");
             sb.Append(CultureInfo.InvariantCulture, $"<mtu>{Mtu}</mtu>");
             sb.Append(CultureInfo.InvariantCulture, $"<maxFrame>{MaxFrame}</maxFrame>");
             foreach (string dns in DnsServers) sb.Append($"<dns>{dns}</dns>");
@@ -175,6 +199,21 @@ var dns = Elements(root, "dns");
                 sb.Append($"<subId>{SubId}</subId>");
             sb.Append("</clash>");
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// 严格 IPv6 字面量：必须是 <see cref="System.Net.Sockets.AddressFamily.InterNetworkV6"/>，
+        /// 且不带 <c>%zone</c>（带作用域的地址不能直接做 <c>HostName</c> 的稳定身份）。
+        /// 不用"含冒号"这种形状判断 —— <c>a:b</c> 也会过。
+        /// </summary>
+        internal static bool IsIpv6Literal(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.IndexOf(':') < 0 ||
+                value.IndexOf('%') >= 0)
+                return false;
+            return System.Net.IPAddress.TryParse(value, out System.Net.IPAddress? ip) &&
+                   ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 &&
+                   !ip.IsIPv4MappedToIPv6;
         }
 
         private static string? Element(XElement root, string name) =>

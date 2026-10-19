@@ -430,6 +430,64 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal static int NetFollow = 1;
 
+        /// <summary>
+        /// ★【1.0.39 · G7】IPv6 形态。默认 <b>0 = 逐字旧行为</b>（v6 完全不碰）。
+        ///
+        /// 【旧行为是什么】<c>assignedClientIPv6list</c> 传 <c>null</c>、只下发 v4 路由、
+        ///   内核 <c>ipv6</c>/<c>dns.ipv6</c> 由订阅原文决定。后果（Docs/05 §5 自己列为未收口）：
+        ///   <b>IPv6 泄漏</b> —— 隧道里没有 v6 路由，本机所有 v6 出站照物理网卡走，
+        ///   代理与规则对它完全无感（先遣项目 docs/96 判据 13 实测的正是这一形态）。
+        ///
+        /// 【三档】
+        ///   0 = 不动。
+        ///   1 = <b>堵泄漏</b>：给隧道一个 ULA v6 地址 + 下发 <c>2000::/3</c> 的
+        ///       <c>Ipv6InclusionRoutes</c>，内核 <c>dns.ipv6</c> 强制 false（不答 AAAA）。
+        ///       ⇒ 应用真去连 v6 字面量时进隧道；AAAA 查询拿不到 v6，普通应用不会优先 v6。
+        ///       两个取值都是先遣项目实测过的（docs/27：给了 <c>ipAddressv6</c> 才有
+        ///       IPv6 协议实例与 link-local；docs/96：必须 <c>2000::/3</c> 而不是
+        ///       <c>::/0</c> —— 后者会让 Windows 把 VPN 也变成 IPv4 默认路由，
+        ///       4/4 臂一致复现）。
+        ///   2 = <b>全链路</b>：1 之外再开内核 v6 —— 顶层 <c>ipv6: true</c>、
+        ///       <c>tun.inet6-address</c>、<c>dns.ipv6: true</c>、
+        ///       <c>dns.fake-ip-range6</c>（AAAA 回假 IP），并把假 IP v6 池本身
+        ///       也 include 进隧道。
+        ///
+        /// ★【为什么默认 0，而且 2 也不给默认】
+        ///   ① 这台机器<b>没有全局 IPv6</b>（memory「Local network baseline」），
+        ///      两档都无法在本轮验证；而这一档<b>碰隧道本体</b>（改 Start 的地址与路由表），
+        ///      代价直接落在"整机能不能上网"上。
+        ///   ② 我们的桥与先遣项目不同：<c>sing-tun</c> 的 gvisor 栈注册了 IPv6，
+        ///      所以 2 档<b>有得做</b>；但"内核有没有 v6 出口"取决于节点与订阅，
+        ///      实测之前不承诺。
+        ///   ⇒ 默认停在 0，把 1/2 做成可单变量切换的臂，判据写进 Docs/22。
+        /// </summary>
+        internal static int Ipv6 = 0;
+
+        /// <summary>
+        /// 档 2 的 fake-ip v6 池（写进 <c>dns.fake-ip-range6</c>，同时作为 include 路由）。
+        /// 默认 <c>fdfe:dcba:9876::/64</c>：与 mihomo 的 <c>tun.inet6-address</c>
+        /// 默认段同前缀但取 /64（默认的 <c>::1/126</c> 只有 4 个地址，做池子太小）。
+        /// 池子从 <c>::4</c> 开始分配（<c>component/fakeip/pool.go</c> 的
+        /// <c>first = gateway.Next().Next().Next()</c>），<c>::2</c> 是 DNS 劫持地址，
+        /// 因此 <c>::1/126</c> 的 inet6 前缀不会与分配出来的假地址冲突。
+        ///
+        /// ★ 只接受 ULA（<c>fc00::/7</c>）且前缀长 48~64：这不是洁癖 ——
+        ///   它同时被当作<b>路由目标</b>下发，写成 <c>2000::/3</c> 就会把全局 v6 当假池、
+        ///   写成 <c>::/0</c> 就会触发上面说的 IPv4 默认路由副作用。非法值回落默认。
+        /// </summary>
+        internal const string DefaultIpv6FakeRange = "fdfe:dcba:9876::/64";
+
+        /// <summary>运行值（<c>settings.txt: ipv6FakeRange</c>，非法回落默认）。</summary>
+        internal static string Ipv6FakeRange = DefaultIpv6FakeRange;
+
+        /// <summary>
+        /// <c>settings.txt: ipv6ClientAddress</c> 的临时覆盖；<b>空串 = 用 profile 里的
+        /// <see cref="VpnPluginConfig.ClientIpV6"/></b>。
+        /// 留这个口是为了不重建系统 profile 就能换隧道 v6 地址做单变量，
+        /// 与 <c>ipv6FakeRange</c> 同一个理由；产品默认不写它。
+        /// </summary>
+        internal static string Ipv6ClientAddress = "";
+
         internal static void Load()
         {
             // 先恢复默认，避免上一次连接的值残留到本次
@@ -457,6 +515,9 @@ namespace ClashUWP.Vpn
             // ★ 默认 0 = 不清（理由见字段注释：两个未验前提）。字段初始值与这里必须一致。
             SessionReset = 0;
             NetFollow = 1;
+            Ipv6 = 0;
+            Ipv6FakeRange = DefaultIpv6FakeRange;
+            Ipv6ClientAddress = "";
             Source = "默认值";
 
             try
@@ -492,11 +553,34 @@ namespace ClashUWP.Vpn
                 FailFast = ReadBool(map, "failFast", FailFast);
                 SessionReset = ReadInt(map, "sessionReset", SessionReset, 0, 2);
                 NetFollow = ReadInt(map, "netFollow", NetFollow, 0, 2);
+                Ipv6 = ReadInt(map, "ipv6", Ipv6, 0, 2);
+                Ipv6FakeRange = ReadString(map, "ipv6FakeRange", Ipv6FakeRange);
+                Ipv6ClientAddress = ReadString(map, "ipv6ClientAddress", Ipv6ClientAddress);
                 Source = "settings.txt";
             }
             catch
             {
                 // 没有文件/读不到 → 用默认值，这是正常路径不是错误
+            }
+
+            // ★【1.0.39 · G7】这两个值一个直接进 YAML、一个同时进路由表，
+            //   写错一档的代价是"配置解析失败 / 把全局 v6 当假池"，不是"这一项没生效"。
+            //   非法值一律回落默认，并把原话留在日志里（口径同其他 settings 的形状闸门）。
+            if (Ipv6ClientAddress.Length > 0 && !VpnPluginConfig.IsIpv6Literal(Ipv6ClientAddress))
+            {
+                RollingLog.Warn("settings",
+                    $"ipv6ClientAddress 不是合法 IPv6 字面量（回落 profile 值）：{Ipv6ClientAddress}");
+                Ipv6ClientAddress = "";
+            }
+            if (!TryNormalizeV6Prefix(Ipv6FakeRange, out string normalizedFake6))
+            {
+                RollingLog.Warn("settings",
+                    $"ipv6FakeRange 不是 ULA 的 IPv6 前缀（回落 {DefaultIpv6FakeRange}）：{Ipv6FakeRange}");
+                Ipv6FakeRange = DefaultIpv6FakeRange;
+            }
+            else
+            {
+                Ipv6FakeRange = normalizedFake6;
             }
 
             // ★ 这一行是发布版最值钱的日志：把<b>本次真正生效</b>的开关原样打出来。
@@ -512,8 +596,52 @@ namespace ClashUWP.Vpn
                 $"fakeIp={(FakeIp ? 1 : 0)} failFast={(FailFast ? 1 : 0)} " +
                 $"watchdog={(SessionWatchdog ? 1 : 0)} statusToast={(StatusToast ? 1 : 0)} " +
                 $"sessionReset={SessionReset} " +
-                $"netFollow={NetFollow} " +
+                $"netFollow={NetFollow} ipv6={Ipv6} " +
+                $"v6addr={(Ipv6ClientAddress.Length > 0 ? Ipv6ClientAddress : "(profile)")} " +
+                $"v6pool={Ipv6FakeRange} " +
                 $"{RollingLog.Diag()}");
+        }
+
+        /// <summary>
+        /// ★【1.0.39 · G7】把 <c>ipv6FakeRange</c> 归一成"网络地址/前缀长"，同时做形状闸门：
+        ///   · 必须是 IPv6 前缀、前缀长 48~64；
+        ///   · 必须是 ULA（<c>fc00::/7</c>）。
+        /// 后半条不是洁癖：这个值会被同时写进 <c>dns.fake-ip-range6</c> 和
+        /// <c>Ipv6InclusionRoutes</c>，写成 <c>2000::/3</c> 就把全局 v6 当假池，
+        /// 写成 <c>::/0</c> 会触发 Windows 的 IPv4 默认路由副作用（先遣项目 docs/96 §6.2）。
+        /// 非法返回 false，调用方回落默认并把原话记日志。
+        /// </summary>
+        internal static bool TryNormalizeV6Prefix(string value, out string normalized)
+        {
+            normalized = "";
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            string[] parts = value.Split('/');
+            if (parts.Length != 2 || !VpnPluginConfig.IsIpv6Literal(parts[0]))
+                return false;
+            if (!int.TryParse(parts[1], out int prefixLen) || prefixLen < 48 || prefixLen > 64)
+                return false;
+            if (!System.Net.IPAddress.TryParse(parts[0], out System.Net.IPAddress? ip))
+                return false;
+
+            byte[] bytes = ip.GetAddressBytes();
+            if (bytes.Length != 16)
+                return false;
+
+            int full = prefixLen / 8;
+            int rem = prefixLen % 8;
+            for (int i = full; i < bytes.Length; i++)
+                bytes[i] = 0;
+            if (rem > 0)
+                bytes[full] &= (byte)(0xFF << (8 - rem));
+
+            // fc00::/7：首字节高 7 位为 1111110。
+            if ((bytes[0] & 0xFE) != 0xFC)
+                return false;
+
+            normalized = $"{new System.Net.IPAddress(bytes)}/{prefixLen}";
+            return true;
         }
 
         /// <summary>读字符串开关（空值一律回落 fallback —— 空 HostName 会让 ConnectAsync 抛）。</summary>

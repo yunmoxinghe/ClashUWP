@@ -43,7 +43,11 @@ namespace ClashUWP.Vpn
                     //   前台点「重载」之后热重载吃的就是这份文件，名单没注进去的话
                     //   下一次连接会把热重载的结果覆盖掉 —— 两条路必须留同一句证据。
                     //   本方法跑在<b>前台进程</b>里，RollingLog 按角色自动落 logs/app.log。
-                    string text = KernelConfig.Transform(raw, AppSplit.Load(), out string splitNote);
+                    // ★【1.0.70 · G7】ipv6 两个参数必须与插件侧逐字同源：热重载吃的
+                    //   就是这份文件，前台漏传会让"重载后 tun.inet6-address 消失"，
+                    //   而插件下一次连接又改回来 —— 同一个开关两种行为，最难查。
+                    string text = KernelConfig.Transform(raw, AppSplit.Load(),
+                        LocalSettings.Ipv6, LocalSettings.Ipv6FakeRange, out string splitNote);
                     RollingLog.Info("config", $"热重载配置已重生成 应用分流={splitNote}");
                     return KernelConfig.WriteEffectiveFile(text);   // config.kernel.yaml 绝对路径
                 }
