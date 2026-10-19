@@ -488,6 +488,20 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal static string Ipv6ClientAddress = "";
 
+        /// <summary>
+        /// ★【1.0.40 · DNS 可配】是否读取并套用 <c>LocalState\dns-config.txt</c>。默认<b>开</b>。
+        ///
+        /// 【为什么留总闸】这份文件里任何一条非法值都会在<b>写文件前</b>被
+        ///   <see cref="DnsConfig.Validate"/> 挡掉（逐条出处见该类注释），
+        ///   但"改写生成出来的 YAML 让 mihomo 解析失败"这个风险类别本身仍然存在 ——
+        ///   一旦 <c>start rc=-2</c>，<see cref="FailFast"/> 会放弃这次连接。
+        ///   留一行 <c>dnsConfig=0</c> 就能整条摘掉，不动别的开关。
+        /// 【与 <see cref="FakeIp"/> 的耦合】<c>fakeIp=0</c> 时整份改写器都不进，
+        ///   DNS 覆盖自然也不进 —— 与 <see cref="AppSplit"/> 同一句话，写在这里是为了
+        ///   让它不再成为"未知原因失效"。
+        /// </summary>
+        internal static bool DnsConfigEnabled = true;
+
         internal static void Load()
         {
             // 先恢复默认，避免上一次连接的值残留到本次
@@ -518,6 +532,7 @@ namespace ClashUWP.Vpn
             Ipv6 = 0;
             Ipv6FakeRange = DefaultIpv6FakeRange;
             Ipv6ClientAddress = "";
+            DnsConfigEnabled = true;
             Source = "默认值";
 
             try
@@ -556,6 +571,7 @@ namespace ClashUWP.Vpn
                 Ipv6 = ReadInt(map, "ipv6", Ipv6, 0, 2);
                 Ipv6FakeRange = ReadString(map, "ipv6FakeRange", Ipv6FakeRange);
                 Ipv6ClientAddress = ReadString(map, "ipv6ClientAddress", Ipv6ClientAddress);
+                DnsConfigEnabled = ReadBool(map, "dnsConfig", DnsConfigEnabled);
                 Source = "settings.txt";
             }
             catch
@@ -598,7 +614,7 @@ namespace ClashUWP.Vpn
                 $"sessionReset={SessionReset} " +
                 $"netFollow={NetFollow} ipv6={Ipv6} " +
                 $"v6addr={(Ipv6ClientAddress.Length > 0 ? Ipv6ClientAddress : "(profile)")} " +
-                $"v6pool={Ipv6FakeRange} " +
+                $"v6pool={Ipv6FakeRange} dnsConfig={(DnsConfigEnabled ? 1 : 0)} " +
                 $"{RollingLog.Diag()}");
         }
 

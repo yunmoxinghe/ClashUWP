@@ -36,7 +36,9 @@ namespace ClashUWP.Vpn
     ///   隧道一塌、流量退回直连，这一路探针自然还是绿的 —— 探针量的是"这个 IP 可达"，
     ///   不是"别的应用还在走我的隧道"。和 run 30 那次"整机没了但没人断开"是同一件事。
     ///   所以换成一个<b>只有隧道活着才可能成立</b>的判据：让系统解析器查
-    ///   <c>www.google.com</c>，答案必须是 fake-ip 池里的 <c>198.18.x.x</c>。
+    ///   <c>www.google.com</c>，答案必须落在<b>本次生效的</b>假 IP 池里
+    ///   （默认 <c>198.18.0.0/16</c>；1.0.40 起可被 <c>dns-config.txt</c> 改，
+    ///   所以判据吃的是调用方传进来的那份 CIDR，不写死）。
     ///   直连解析拿的是污染真 IP（<c>2001::1</c> / <c>174.132.167.252</c>，23:59 已复测），
     ///   隧道 DNS 挂了则解析报错或超时 —— 两种坏形状都会被判 NO。
     ///   ★ 弃权条件有两个，都必须写进日志而不是猜：
@@ -95,9 +97,17 @@ namespace ClashUWP.Vpn
         /// <summary>只允许一次触发的门闩（0=未触发，1=已触发）。</summary>
         private static int _tripped;
 
-        /// <summary>武装本轮看门狗；重复调用会先停掉上一轮。</summary>
-        internal static void Start(VpnChannel channel, VpnPluginConfig cfg,
-                                   DateTime connectBeganAt, ClashVpnPlugin owner)
+        /// <summary>
+        /// 武装本轮看门狗；重复调用会先停掉上一轮。
+        /// ★【1.0.40 · DNS 可配】<paramref name="fakeIpCidr"/> 与 <paramref name="nrptDns"/>
+        ///   必须是<b>本次连接实际生效</b>的那一份（由 <see cref="ClashVpnPlugin"/> 计算）：
+        ///   假 IP 池可被 <c>dns-config.txt: fake-ip-range</c> 改，NRPT 服务器可被
+        ///   <c>nrpt-dns</c> 改 —— 看门狗若仍按内置 198.18/16 与 profile 默认判，
+        ///   会把一条好隧道判死（改池子）或探一个没人应答的旧 DNS（改服务器）。
+        /// </summary>
+        internal static void Start(VpnChannel channel,
+                                   DateTime connectBeganAt, ClashVpnPlugin owner,
+                                   string fakeIpCidr, IList<string> nrptDns)
         {
             Stop("重新武装");
             if (!LocalSettings.SessionWatchdog)
@@ -110,7 +120,8 @@ namespace ClashUWP.Vpn
             var cts = new CancellationTokenSource();
             _cts = cts;
             Interlocked.Exchange(ref _tripped, 0);
-            _ = Task.Run(() => LoopAsync(channel, cfg, connectBeganAt, owner, cts.Token));
+            _ = Task.Run(() => LoopAsync(channel, connectBeganAt, owner,
+                                         fakeIpCidr, nrptDns, cts.Token));
         }
 
         internal static void Stop(string why)
@@ -123,14 +134,15 @@ namespace ClashUWP.Vpn
             Log($"evt=watchdog-stop why={why}");
         }
 
-        private static async Task LoopAsync(VpnChannel channel, VpnPluginConfig cfg,
+        private static async Task LoopAsync(VpnChannel channel,
                                             DateTime connectBeganAt, ClashVpnPlugin owner,
+                                            string fakeIpCidr, IList<string> nrptDns,
                                             CancellationToken token)
         {
             int seq = 0;
             int failures = 0;
             int dnsFailures = 0;
-            string tunnelProbes = TunnelProbeTargets(cfg);
+            string tunnelProbes = TunnelProbeTargets(nrptDns);
             string? trip = null;
 
             while (!token.IsCancellationRequested)
@@ -182,8 +194,9 @@ namespace ClashUWP.Vpn
                 else
                 {
                     string fip = await FakeIpProbeAsync();
-                    bool ok = fip.StartsWith("198.18.", StringComparison.Ordinal);
-                    fakeNote = $"fake-ip={(ok ? "OK" : "NO")}:{fip}";
+                    // ★【1.0.40】按本次生效的池判，不再硬写 198.18.（池子可被 dns-config 改）。
+                    bool ok = DnsConfig.InCidr(fip, fakeIpCidr);
+                    fakeNote = $"fake-ip={(ok ? "OK" : "NO")}:{fip} pool={fakeIpCidr}";
                     dnsFailures = ok ? 0 : dnsFailures + 1;
                 }
 
@@ -254,12 +267,12 @@ namespace ClashUWP.Vpn
         /// 能代表隧道的探针地址 = 本次下发进隧道的 DNS 服务器（IPv4）。
         /// 返回空串 = 弃权（见类注释）。
         /// </summary>
-        private static string TunnelProbeTargets(VpnPluginConfig cfg)
+        private static string TunnelProbeTargets(IList<string> nrptDns)
         {
             if (!LocalSettings.DnsIntoTunnel)
                 return "";
             var v4 = new List<string>();
-            foreach (string dns in cfg.DnsServers)
+            foreach (string dns in nrptDns)
                 if (dns.IndexOf(':') < 0)
                     v4.Add(dns);
             return string.Join(",", v4);
@@ -290,7 +303,7 @@ namespace ClashUWP.Vpn
         ///   <c>Resolve-DnsName</c> 看到的是同一份答案，Native AOT 下也可用。
         ///
         /// 【返回值口径】
-        ///   · 正常 → 地址字符串（隧道活着时应为 <c>198.18.x.x</c>；退回直连时是污染真 IP）
+        ///   · 正常 → 地址字符串（隧道活着时应落在生效的假 IP 池里；退回直连时是污染真 IP）
         ///   · 无记录 → <c>解析失败:NoData</c> / <c>NoHostKnown</c>
         ///   · 卡住 → <c>解析超时</c>
         ///   ★ 超时和失败<b>都算 NO</b>：run 31 现场宿主的 <c>Resolve-DnsName</c> 就是空返回，

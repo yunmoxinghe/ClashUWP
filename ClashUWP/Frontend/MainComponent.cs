@@ -126,6 +126,15 @@ namespace ClashUWP.Frontend
         private string _splitIdentity = "";
         private string _splitTarget = "DIRECT";
 
+        // ---- DNS 覆盖（1.0.40 · DNS 可配）----
+        // 编辑器直接拿整份 dns-config.txt 的原文：它是一行一个键值的配置文本，
+        // 头部注释就是使用说明 ⇒ 保存回原文，不丢用户备注（理由见 DnsConfigStore）。
+        private Action<string> _setDnsText = _ => { };
+        private Action<string> _setDnsMsg = _ => { };
+        private Action<string> _setDnsSnapshot = _ => { };
+        // 按钮在渲染之外读它（同 _splitIdentity 的值镜像纪律）。
+        private string _dnsText = "";
+
         public override Element Render()
         {
             // ---- 外壳状态（【1.0.67】）----
@@ -152,6 +161,11 @@ namespace ClashUWP.Frontend
             var (splitIdentity, setSplitIdentity) = UseState("");
             var (splitTarget, setSplitTarget) = UseState("DIRECT");
 
+            // ---- DNS 覆盖（1.0.40）状态 ----
+            var (dnsText, setDnsText) = UseState("");
+            var (dnsMsg, setDnsMsg) = UseState("");
+            var (dnsSnapshot, setDnsSnapshot) = UseState("(还没读过)");
+
             _setVpnStatus = setVpnStatus;
             _setActionHint = setActionHint;
             _setSnap = setSnap;
@@ -169,10 +183,14 @@ namespace ClashUWP.Frontend
             _setSplitKind = setSplitKind;
             _setSplitIdentity = setSplitIdentity;
             _setSplitTarget = setSplitTarget;
-            // ★ 值镜像同 _subUrl 那条纪律：「添加」按钮在渲染之外读这三个字段。
+            _setDnsText = setDnsText;
+            _setDnsMsg = setDnsMsg;
+            _setDnsSnapshot = setDnsSnapshot;
+            // ★ 值镜像同 _subUrl 那条纪律：「添加」/「保存」按钮在渲染之外读这些字段。
             _splitKind = splitKind;
             _splitIdentity = splitIdentity;
             _splitTarget = splitTarget;
+            _dnsText = dnsText;
 
             // ★【1.0.63】值镜像：字段（_subUrl/_subActive）是给"渲染之外"的代码用的
             //   （轮询回填读 _subActive.Id、拉取按钮读 _subUrl），而 UseState 的值只活在
@@ -283,6 +301,19 @@ namespace ClashUWP.Frontend
                                          string.Join(" / ", StrList(view.Split.Rejected)));
                     }
                     catch { _setSplitNote("(读取名单失败)"); }
+
+                    // ★ DNS 覆盖（1.0.40）同样只在挂载时读一次：dns-config.txt 是手工文件，
+                    //   不会自己变。文件不存在时 DnsConfigStore 会给出带键说明的模板正文。
+                    try
+                    {
+                        var dv = await DnsConfigStore.LoadAsync();
+                        _setDnsText(dv.Text);
+                        _setDnsSnapshot(dv.LastSnapshot);
+                        if (dv.Parsed.Rejected.Count > 0)
+                            _setDnsMsg($"文件里有 {dv.Parsed.Rejected.Count} 行没被采纳：" +
+                                       string.Join(" / ", StrList(dv.Parsed.Rejected)));
+                    }
+                    catch { _setDnsSnapshot("(读取 dns-config.txt 失败)"); }
                 });
             }, Array.Empty<object>());
 
@@ -293,7 +324,8 @@ namespace ClashUWP.Frontend
                 PageProxy => ProxyPage(snap, activeGroup, selectedGroup),
                 PageSubscription => SubscriptionPage(subInfo, subProfiles, subActive, subUrl, actionHint),
                 PageSettings => SettingsPage(actionHint, logOpen, logText, material, setMaterial,
-                        splitLines, splitNote, splitMsg, probeText, splitKind, splitIdentity, splitTarget),
+                        splitLines, splitNote, splitMsg, probeText, splitKind, splitIdentity, splitTarget,
+                        dnsText, dnsMsg, dnsSnapshot),
                 _ => HomePage(vpnStatus, actionHint, snap),
             };
 
@@ -438,7 +470,8 @@ namespace ClashUWP.Frontend
                                      int material, Action<int> setMaterial,
                                      List<string> splitLines, string splitNote, string splitMsg,
                                      string probeText, string splitKind, string splitIdentity,
-                                     string splitTarget) =>
+                                     string splitTarget, string dnsText, string dnsMsg,
+                                     string dnsSnapshot) =>
             Page(
                 Section("背景材质",
                     MaterialPicker(material, setMaterial),
@@ -472,6 +505,34 @@ namespace ClashUWP.Frontend
                         .Foreground(Theme.SecondaryText),
                     TextBlock("走的是内核规则层（PROCESS-NAME / PROCESS-PATH），不是平台的 traffic filter：" +
                               "后者只要列表非空就会把没匹配上的应用一起拦掉，实测整机断网（Docs/08 §5.2 run 19）。")
+                        .Foreground(Theme.SecondaryText)),
+
+                Section("DNS 覆盖",
+                    TextBlock("dns-config.txt：一行一条 key = value，# 开头是注释。空文件 = 内核配置一字不改。")
+                        .Foreground(Theme.SecondaryText),
+                    // ★ 多行原文编辑器：这份文件是配置文本而不是结构化名单，保存回原文才不丢注释。
+                    TextBox(dnsText, v => _setDnsText(v),
+                        "nameserver = 223.5.5.5, 119.29.29.29",
+                        acceptsReturn: true, maxLength: 20000),
+                    HStack(8,
+                        Button("保存并校验", () => _ = SaveDnsAsync(_dnsText)),
+                        Button("重新读取", () => _ = RefreshDnsAsync())),
+                    dnsMsg.Length > 0 ? TextBlock(dnsMsg).Foreground(Theme.SecondaryText) : Empty(),
+                    TextBlock($"当前文本：{DnsSummary(dnsText)}").Foreground(Theme.SecondaryText),
+                    // ★ 与「上次连接实际注入」同一个理由：存下了 ≠ 内核吃到了。
+                    TextBlock($"上次连接实际覆盖：{dnsSnapshot}").Foreground(Theme.SecondaryText),
+                    TextBlock("支持键：enhanced-mode / fake-ip-range / fake-ip-range6 / fake-ip-filter / " +
+                              "fake-ip-ttl / default-nameserver / nameserver / fallback / " +
+                              "proxy-server-nameserver / direct-nameserver / ipv6 / prefer-h3 / " +
+                              "ipv6-timeout / nrpt-dns。名单外的键会被拒绝（原因写在保存结果里）；" +
+                              "列表类键是整条替换，想保留订阅默认就把原值一起抄进来。")
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock("★ 级联：改 fake-ip-range，窄 include 路由和看门狗判据会一起跟着走；" +
+                              "nrpt-dns 是交给 Windows NRPT 的 DNS，需 settings.txt: dnsInTunnel=1。" +
+                              "内核侧断开再连或热重载都生效；nrpt-dns 要断开再连才换。")
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock("★ fake-ip-range6 只在 settings.txt: ipv6=2 时生效（要配合 Docs/22 的 v6 档）。" +
+                              "settings.txt 里写 dnsConfig=0 可整份关闭本功能。")
                         .Foreground(Theme.SecondaryText)),
 
                 Section("诊断",
@@ -841,6 +902,58 @@ namespace ClashUWP.Frontend
             catch (Exception ex)
             {
                 _setSplitMsg($"读取失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // ==================== DNS 覆盖（1.0.40）动作 ====================
+
+        /// <summary>
+        /// 当前编辑器文本的解析摘要（每次渲染现算，不另存一份 state）。
+        /// ★ 用的是组件里同一个 <see cref="DnsConfig.Parse"/> —— 界面显示的"几项有效"
+        ///   必须就是插件会读到的结果，不能另写一套。
+        /// </summary>
+        private static string DnsSummary(string text)
+        {
+            DnsConfig parsed = DnsConfig.Parse(text);
+            string s = parsed.IsEmpty ? "0 项有效" : $"{parsed.Entries.Count} 项有效";
+            if (parsed.Rejected.Count > 0)
+                s += $"，{parsed.Rejected.Count} 行会被拒";
+            return s;
+        }
+
+        /// <summary>
+        /// 存盘 + 读回。消息文本来自 <see cref="DnsConfigStore.SaveAsync"/>，
+        /// 那里返回的是"重新解析后的结果"，不是"我写成功了"。
+        /// </summary>
+        private async Task SaveDnsAsync(string text)
+        {
+            try
+            {
+                _setDnsMsg(await DnsConfigStore.SaveAsync(text));
+                _setDnsSnapshot(await DnsConfigStore.LastSnapshotAsync());
+            }
+            catch (Exception ex)
+            {
+                _setDnsMsg($"保存失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>手动重读（手改过文件、或想丢弃界面上没存的改动时用）。</summary>
+        private async Task RefreshDnsAsync()
+        {
+            try
+            {
+                var view = await DnsConfigStore.LoadAsync();
+                _setDnsText(view.Text);
+                _setDnsSnapshot(view.LastSnapshot);
+                _setDnsMsg(view.Parsed.Rejected.Count > 0
+                    ? $"文件里有 {view.Parsed.Rejected.Count} 行没被采纳：" +
+                      string.Join(" / ", StrList(view.Parsed.Rejected))
+                    : $"已重新读取，共 {view.Parsed.Entries.Count} 项有效。");
+            }
+            catch (Exception ex)
+            {
+                _setDnsMsg($"读取失败: {ex.GetType().Name}: {ex.Message}");
             }
         }
 

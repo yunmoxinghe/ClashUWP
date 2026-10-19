@@ -78,22 +78,25 @@ namespace ClashUWP.Vpn
         ///   产出<b>逐字相同</b>的那份 <c>config.kernel.yaml</c>
         ///   （Docs/12 §9.4 的"单源"约定：少一条注入，热重载就会把名单覆盖回订阅原文）。
         /// </summary>
-        internal static string Transform(string yaml, AppSplit? split,
+        internal static string Transform(string yaml, AppSplit? split, DnsConfig? dns,
                                          int ipv6Arm, string ipv6FakeRange,
-                                         out string splitNote)
+                                         out string splitNote, out string dnsNote)
         {
             splitNote = "未处理";
+            dnsNote = "未处理";
             try
             {
                 if (string.IsNullOrWhiteSpace(yaml))
                 {
                     splitNote = split == null || split.IsEmpty ? "无名单，配置未动" : "配置为空，名单忽略";
+                    dnsNote = dns == null || dns.IsEmpty ? "无覆盖" : "配置为空，覆盖忽略";
                     return yaml;
                 }
                 // 内置兜底配置是 JSON（首字符 '{'），不该用行式 YAML 解析器碰它。
                 if (yaml.TrimStart().StartsWith("{"))
                 {
                     splitNote = split == null || split.IsEmpty ? "无名单，配置未动" : "兜底 JSON 不注入名单";
+                    dnsNote = dns == null || dns.IsEmpty ? "无覆盖" : "兜底 JSON 不叠 DNS 覆盖";
                     return yaml;
                 }
 
@@ -106,6 +109,10 @@ namespace ClashUWP.Vpn
                     EnsureTopLevelIpv6(lines);
                 EnsureDnsBlock(lines, ipv6Arm, ipv6FakeRange);
                 EnsureTunBlock(lines, ipv6Arm, ipv6FakeRange);
+                // ★【1.0.40 · DNS 可配】覆盖必须叠在 EnsureDnsBlock 之后：
+                //   后者为了数据面会强制 enhanced-mode=fake-ip 并补默认池，
+                //   用户在这份文件里写的值应当<b>覆盖</b>那些默认，而不是被它们覆盖。
+                ApplyDnsOverrides(lines, dns, ipv6Arm, ipv6FakeRange, out dnsNote);
                 LockUrlTestTolerance(lines);
                 InjectAppSplitRules(lines, split, out splitNote);
 
@@ -121,6 +128,7 @@ namespace ClashUWP.Vpn
             catch
             {
                 splitNote = "改写异常，退回原文";
+                dnsNote = "改写异常，覆盖未应用";
                 return yaml;
             }
         }
@@ -377,6 +385,132 @@ namespace ClashUWP.Vpn
                 string indent = LeadingSpaces(lines[anchor]);
                 lines.Insert(anchor + 1, indent + $"inet6-address: [{inet6}]");
             }
+        }
+
+        /// <summary>
+        /// ★【1.0.40 · DNS 可配】把 <see cref="DnsConfig"/> 的白名单项叠进 <c>dns:</c> 块。
+        ///
+        /// 【为什么一条一条就地改，不整块重写】订阅的 dns 块里有大量本功能不认识的键
+        ///   （geodata、fallback-filter、cache-algorithm…），整块重写等于把它们丢掉；
+        ///   而"丢掉一个 mihomo 需要的键"与 run 25 的孤儿行同属"改坏 YAML"一类，
+        ///   代价是内核起不来、隧道照装。这里只碰白名单里的键。
+        ///
+        /// 【三条防护】
+        ///   · <c>dns:</c> 是行内流式写法（<c>dns: {…}</c>）⇒ <b>整份跳过</b>，一条不改；
+        ///   · 要改的键存在但其值是<b>空</b>（块序列/块映射的父键，如
+        ///     <c>nameserver:</c> 换行跟 <c>- …</c>）⇒ 跳过该键，绝不留孤儿行；
+        ///   · <c>ipv6</c> 与 <c>fake-ip-range6</c> 的归属由 G7 档位决定：
+        ///     档 ≥1 时 dns.ipv6 是泄漏封堵的一部分，档 &lt;2 时 fake-ip-range6 是死配置
+        ///     —— 这两种情况跳过并写进 <paramref name="note"/>，让快照里看得见。
+        ///
+        /// 【覆盖语义】列表类键是<b>整条替换</b>（不是追加）；想保留订阅默认就把原值一起抄进来。
+        /// </summary>
+        private static void ApplyDnsOverrides(List<string> lines, DnsConfig? dns,
+                                              int ipv6Arm, string ipv6FakeRange, out string note)
+        {
+            if (dns == null)
+            {
+                note = "总闸关闭（dnsConfig=0）";
+                return;
+            }
+            if (dns.IsEmpty)
+            {
+                note = dns.Rejected.Count > 0
+                    ? $"0 项有效（{dns.Rejected.Count} 行被拒，见 channel=dns 日志）"
+                    : "无覆盖";
+                return;
+            }
+
+            int start = FindTopLevelKey(lines, "dns");
+            if (start < 0)
+            {
+                note = $"{dns.Entries.Count} 项未应用：配置里没有 dns 块";
+                return;
+            }
+            if (IsInlineBlock(lines, start))
+            {
+                note = $"{dns.Entries.Count} 项未应用：dns 是行内流式写法";
+                return;
+            }
+
+            int applied = 0;
+            int nrptOnly = 0;
+            var skipped = new List<string>();
+
+            foreach (DnsEntry e in dns.Entries)
+            {
+                string key = e.Key;
+                if (key == "nrpt-dns")
+                {
+                    nrptOnly++;     // 只给 NRPT，不进 YAML
+                    continue;
+                }
+
+                if (key == "ipv6" && ipv6Arm >= 1)
+                {
+                    // 档 1/2 的 AAAA 开关是数据面安全属性，不接受覆盖。
+                    skipped.Add("ipv6(由 settings 档位决定)");
+                    continue;
+                }
+                if (key == "fake-ip-range6" && ipv6Arm < 2)
+                {
+                    skipped.Add("fake-ip-range6(需 ipv6=2)");
+                    continue;
+                }
+
+                string value;
+                if (key == "fake-ip-range6")
+                    value = ipv6FakeRange;          // 已由调用方归一（ULA + 网络号/前缀长）
+                else if (key == "enhanced-mode")
+                    value = "fake-ip";
+                else if (key == "ipv6" || key == "prefer-h3")
+                    value = dns.GetBoolAsYaml(key);
+                else if (DnsConfig.IsListKey(key))
+                    value = DnsConfig.ToInlineList(e.Value);
+                else
+                    value = e.Value;
+
+                // 每次都重新定位：上一条可能已经插过行，行号不能复用。
+                int s = FindTopLevelKey(lines, "dns");
+                if (s < 0)
+                {
+                    skipped.Add($"{key}(dns 块消失)");
+                    continue;
+                }
+                int end = EndOfBlock(lines, s);
+                int at = FindKeyInRange(lines, s + 1, end, key);
+                if (at >= 0 && ValueOf(lines[at]).Length == 0)
+                {
+                    skipped.Add($"{key}(块写法，未替换)");
+                    continue;
+                }
+
+                if (at >= 0)
+                {
+                    lines[at] = KeyLine(lines[at], key, value);
+                }
+                else
+                {
+                    int indent = ChildIndent(lines, s, end);
+                    lines.Insert(end, new string(' ', indent) + key + ": " + value);
+                }
+                applied++;
+            }
+
+            string nrptPart = nrptOnly > 0 ? $"，nrpt-dns→NRPT×{nrptOnly}" : "";
+            if (applied == 0 && skipped.Count == 0 && nrptOnly > 0)
+            {
+                note = $"内核 dns 块未动（只有 NRPT 覆盖 {nrptOnly} 项）" +
+                       (dns.Rejected.Count > 0 ? $"，另拒 {dns.Rejected.Count} 行" : "");
+                return;
+            }
+            note = applied == 0
+                ? $"{dns.Entries.Count} 项均未应用" +
+                  (skipped.Count > 0 ? $"：{string.Join("、", skipped)}" : "") + nrptPart
+                : $"应用 {applied} 项" +
+                  (skipped.Count > 0 ? $"（跳过 {string.Join("、", skipped)}）" : "") +
+                  nrptPart +
+                  (dns.Rejected.Count > 0 ? $"，另拒 {dns.Rejected.Count} 行" : "");
         }
 
         /// <summary>

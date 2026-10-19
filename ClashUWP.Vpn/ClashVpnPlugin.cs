@@ -177,6 +177,27 @@ namespace ClashUWP.Vpn
         /// </summary>
         private string _splitNote = "未处理";
 
+        /// <summary>
+        /// ★【1.0.40 · DNS 可配】本次连接读到的 <c>dns-config.txt</c>（总闸关/文件空时是空对象）。
+        /// 它有三个读者，必须共用这<b>一个实例</b>：
+        ///   ① <see cref="KernelConfig.Transform"/> 的 dns 块覆盖；
+        ///   ② <see cref="NarrowInclusionRoutes"/> 的假 IP 池路由（改了池子，路由必须跟着改）；
+        ///   ③ <see cref="SessionWatchdog"/> 的"答案在不在假 IP 池里"判据。
+        /// 三处各读一次文件就会各拿到一份可能不同的结果（用户在会话中途保存），
+        /// 那会造出"路由改了、看门狗还按旧池判死"的假故障。
+        /// </summary>
+        private DnsConfig _dnsConfig = new DnsConfig();
+
+        /// <summary>本次 DNS 覆盖的实际结果（内核侧），写快照 <c>Dns=</c> 行与日志。</summary>
+        private string _dnsNote = "未处理";
+
+        /// <summary>
+        /// ★【1.0.40】本次生效的 v6 假 IP 池（<c>dns-config.txt: fake-ip-range6</c> 优先，
+        /// 否则 <see cref="LocalSettings.Ipv6FakeRange"/>）。路由、<c>tun.inet6-address</c>、
+        /// <c>dns.fake-ip-range6</c> 三处必须用同一个值 —— 与 v4 池同一个级联纪律。
+        /// </summary>
+        private string _ipv6PoolEffective = LocalSettings.DefaultIpv6FakeRange;
+
         private uint _encapsulatedPackets;
         private uint _echoReplies;
         private uint _unknownPackets;
@@ -450,6 +471,26 @@ namespace ClashUWP.Vpn
             //     （sample 也是先 ConnectAsync(server) 再 Start；V2 条文那句
             //      "The socket must be unconnected at the point of the call" 的矛盾见 Docs/09 §3.1）。
             LocalSettings.Load();
+
+            // ★【1.0.40 · DNS 可配】每次连接读一次 dns-config.txt（总闸关 = 不读）。
+            //   ★ 必须在步 4.1 的改写之前、步 5 的 BuildRoutes 之前：
+            //     前者要把覆盖叠进内核配置，后者要用生效的假 IP 池算窄 include 路由。
+            //   ★ 被拒绝的行必须原话进日志 —— "存下了但没生效"的静默失败
+            //     在 DNS 上比应用分流更贵：一条写错就可能让整份配置解析失败。
+            _dnsConfig = LocalSettings.DnsConfigEnabled ? DnsConfig.Load() : new DnsConfig();
+            _ipv6PoolEffective = _dnsConfig.EffectiveFakeIpRange6(LocalSettings.Ipv6FakeRange);
+            RollingLog.Info("dns",
+                (LocalSettings.DnsConfigEnabled ? "读 dns-config.txt：" : "总闸关闭(dnsConfig=0)，不读 dns-config.txt；")
+                + (LocalSettings.DnsConfigEnabled ? _dnsConfig.Describe() : "无覆盖")
+                + (LocalSettings.Ipv6 >= 2 ? $" v6pool={_ipv6PoolEffective}" : ""));
+            if (LocalSettings.DnsConfigEnabled && _dnsConfig.Rejected.Count > 0)
+            {
+                var reasons = new System.Text.StringBuilder();
+                foreach (string r in _dnsConfig.Rejected)
+                    reasons.Append(reasons.Length == 0 ? "" : " / ").Append(r);
+                RollingLog.Warn("dns", "dns-config.txt 有行被拒：" + reasons);
+            }
+
             // ★【1.0.62】按 profile 携带的订阅 id 选配置源：
             //   有 subId（每条订阅一个系统 profile ClashUWP-{id}）→ 读 subscriptions/{id}.yaml；
             //   无 subId（基础 profile ClashUWP）→ 读 config.yaml（生效副本，向后兼容）。
@@ -478,22 +519,29 @@ namespace ClashUWP.Vpn
             //   静默不算失败，可查的静默才算把问题交给了用户（口径同上面 1.0.62 那行配置源）。
             string mihomoConfig;
             string splitNote;
+            string dnsNote;
             if (LocalSettings.FakeIp)
             {
-                // ★【1.0.70 · G7】ipv6 档位与 fake-ip v6 池一起进改写器：
-                //   档 0 时两个参数都不改变输出（逐字同 1.0.69），档 1/2 才动 dns/tun 块。
+                // ★【1.0.70 · G7】ipv6 档位与<b>生效的</b> fake-ip v6 池一起进改写器：
+                //   档 0 时几个参数都不改变输出（逐字同 1.0.69），档 1/2 才动 dns/tun 块。
+                // ★【1.0.40 · DNS 可配】dns 覆盖是同一份改写的输入之一；总闸关时传 null，
+                //   改写器会把它写成"总闸关闭"而不是"无覆盖"，快照里分得清。
                 mihomoConfig = KernelConfig.Transform(rawConfig, AppSplit.Load(),
-                    LocalSettings.Ipv6, LocalSettings.Ipv6FakeRange, out splitNote);
+                    LocalSettings.DnsConfigEnabled ? _dnsConfig : null,
+                    LocalSettings.Ipv6, _ipv6PoolEffective,
+                    out splitNote, out dnsNote);
             }
             else
             {
                 // fakeIp=0 是整份改写器的总闸（KernelConfig.Transform 不进），
-                // 于是应用分流也一起关 —— 这一句把耦合写明，别让它成为"未知原因失效"。
+                // 于是应用分流与 DNS 覆盖也一起关 —— 这一句把耦合写明，别让它成为"未知原因失效"。
                 mihomoConfig = rawConfig;
                 splitNote = "fakeIp=0 → 整份改写关闭，名单未注入";
+                dnsNote = "fakeIp=0 → 整份改写关闭，DNS 覆盖未应用";
             }
             _splitNote = splitNote;
-            RollingLog.Info("config", $"应用分流={splitNote}");
+            _dnsNote = dnsNote;
+            RollingLog.Info("config", $"应用分流={splitNote}；DNS 覆盖={dnsNote}");
             string? mihomoConfigPath = LocalSettings.FakeIp
                 ? (KernelConfig.WriteEffectiveFile(mihomoConfig) ?? rawConfigPath)
                 : rawConfigPath;
@@ -549,7 +597,8 @@ namespace ClashUWP.Vpn
             channel.LogDiagnosticMessage(
                 $"ClashUWP: 排除路由 候选 {_nodeExclusions.Count} 条 /32（节点服务器，" +
                 $"下发={(LocalSettings.NodeExclusions ? "是" : "否 nodeExclusions=0")}），" +
-                $"DNS {(domains == null ? "留物理网卡(dnsInTunnel=0)" : "进隧道 " + string.Join(",", _config.DnsServers))}，" +
+                $"DNS {(domains == null ? "留物理网卡(dnsInTunnel=0)" : "进隧道 " + string.Join(",", EffectiveNrptDnsServers()))}，" +
+                $"DNS覆盖={_dnsNote}，" +
                 $"内核={LocalSettings.Source} 开关[resident={LocalSettings.ResidentBridge} hotReload={LocalSettings.HotReload} selfSplitTunnel={LocalSettings.SelfSplitTunnel} ipv6={LocalSettings.Ipv6} outer={_outerTargetUsed}:{LocalSettings.OuterPort}(要求={LocalSettings.OuterTarget}) fakeIp={(LocalSettings.FakeIp ? "on" : "off")}]");
 
             // 步 6 · ★ 建隧道 = 建 L3 网卡。
@@ -616,7 +665,9 @@ namespace ClashUWP.Vpn
                     _ipv6Diag = $"arm={LocalSettings.Ipv6} addr={v6addr} " +
                                 $"routes=[{string.Join(",", Ipv6InclusionRoutes())}] " +
                                 $"kernelIpv6={(LocalSettings.Ipv6 >= 2 ? "on" : "off（AAAA 不解析）")} " +
-                                $"pool={LocalSettings.Ipv6FakeRange}";
+                                $"pool={_ipv6PoolEffective}" +
+                                (string.Equals(_ipv6PoolEffective, LocalSettings.Ipv6FakeRange,
+                                    StringComparison.OrdinalIgnoreCase) ? "" : "(dns-config 覆盖)");
                 }
                 else
                 {
@@ -732,6 +783,8 @@ namespace ClashUWP.Vpn
                            $"v6include=[{string.Join(",", Ipv6InclusionRoutes())}] " +
                            $"outer={_outerTargetUsed}:{LocalSettings.OuterPort} " +
                            $"dnsInTunnel={(LocalSettings.DnsIntoTunnel ? 1 : 0)} ipv6={LocalSettings.Ipv6} " +
+                           $"dnsCfg={(_dnsConfig.IsEmpty ? "none" : _dnsConfig.Entries.Count + "项")} " +
+                           $"fakePool={_dnsConfig.FakeIpRoute} " +
                            $"nodeExcl={_nodeExclusions.Count} mtu={_config.Mtu}");
                 RollingLog.Info("session", "L3 隧道接口已建立：" +
                            $"includeMode={LocalSettings.IncludeMode} " +
@@ -748,7 +801,10 @@ namespace ClashUWP.Vpn
                 //   必须在 Start 成功之后：之前隧道还不存在，探什么都是误判。
                 //   放在桥之后：桥的 failFast 若已经决定放弃这次连接，看门狗不该再插一脚
                 //   —— 它第一件事就是检查开关，开关关着（或桥失败路径已断开）就不会动手。
-                SessionWatchdog.Start(channel, _config, _connectBeganAt, this);
+                // ★【1.0.40】假 IP 池与 NRPT 服务器必须传本次生效的那一份：
+                //   看门狗判据②按池子判答案、判据①探的正是 NRPT 实际下发的 DNS。
+                SessionWatchdog.Start(channel, _connectBeganAt, this,
+                    _dnsConfig.FakeIpRoute, EffectiveNrptDnsServers());
 
                 // 步 8.5 · ★【1.0.49】武装插件进程内的<b>整机物理网络兜底看门狗</b>。
                 //   ★ 为什么放在插件进程而不是只靠前台的 HealthMonitor：
@@ -1827,7 +1883,11 @@ namespace ClashUWP.Vpn
                 $"Bridge={_bridgeDiag}\r\n" +
                 $"BoundIface={s_boundIfaceSnapshot}\r\n" +
                 $"ResidentBridge={LocalSettings.ResidentBridge}\r\n" +
-                $"DnsIntoTunnel={LocalSettings.DnsIntoTunnel} ({string.Join(",", _config.DnsServers)})\r\n" +
+                $"DnsIntoTunnel={LocalSettings.DnsIntoTunnel} ({string.Join(",", EffectiveNrptDnsServers())}) " +
+                $"nrpt={(_dnsConfig.Has("nrpt-dns") ? "dns-config 覆盖" : "profile")}\r\n" +
+                // ★【1.0.40 · DNS 可配】内核侧覆盖的结果：应用几项、跳过什么、拒绝了什么。
+                //   最坏的失败形态是"界面存下了、内核配置里没有"——这一列就是那条证据。
+                $"Dns={_dnsNote}\r\n" +
                 // ★【1.0.70 · G7】IPv6 三档的现场：臂号 / 接口地址 / v6 路由 / fake-ip v6 池。
                 //   arm=0 的"未下发"必须逐字可见 —— 它是"这次连接与 1.0.69 完全一致"的凭据。
                 $"Ipv6={_ipv6Diag}\r\n" +
@@ -3048,7 +3108,7 @@ namespace ClashUWP.Vpn
                 return list;
             list.Add("2000::/3");
             if (LocalSettings.Ipv6 >= 2)
-                list.Add(LocalSettings.Ipv6FakeRange);
+                list.Add(_ipv6PoolEffective);
             return list;
         }
 
@@ -3060,12 +3120,30 @@ namespace ClashUWP.Vpn
         /// </summary>
         private IEnumerable<string> NarrowInclusionRoutes()
         {
-            var list = new List<string> { KernelConfig.FakeIpRoute };
+            // ★【1.0.40】池子可被 dns-config.txt: fake-ip-range 改，路由必须跟着走。
+            //   只改 YAML 不改这里 = 新池的域名流量根本不进隧道（比黑洞更糟的"以为在代理其实直连"）。
+            //   空配置时 FakeIpRoute 就是原来的 198.18.0.0/16，逐字不变。
+            var list = new List<string> { _dnsConfig.FakeIpRoute };
             if (LocalSettings.DnsIntoTunnel)
-                foreach (string dns in _config.DnsServers)
+                foreach (string dns in EffectiveNrptDnsServers())
                     if (dns.IndexOf(':') < 0)          // v6 DNS 先不掺进来，v4 路由表只管 v4
                         list.Add($"{dns}/32");
             return list;
+        }
+
+        /// <summary>
+        /// ★【1.0.40 · DNS 可配】本次要交给 Windows NRPT 的 DNS 服务器：<br/>
+        ///   <c>dns-config.txt: nrpt-dns</c> 优先（逗号分隔、已逐条校验为纯 IP），
+        ///   否则用 profile 的 <c>&lt;dns&gt;</c> 清单（<see cref="_config"/>.DnsServers）。
+        /// ★ 这三个读者必须是同一份结果：<see cref="BuildDomainNames"/>（真正下发）、
+        ///   步 5 的诊断行、<see cref="SessionWatchdog"/> 的隧道内探针目标。
+        ///   分开算会出现"看门狗探旧 DNS、系统解析走新 DNS"的假故障。
+        /// </summary>
+        private IList<string> EffectiveNrptDnsServers()
+        {
+            if (_dnsConfig.Has("nrpt-dns"))
+                return DnsConfig.SplitList(_dnsConfig.Get("nrpt-dns"));
+            return _config.DnsServers;
         }
 
         /// <summary>
@@ -3148,7 +3226,8 @@ namespace ClashUWP.Vpn
             try
             {
                 var dnsServers = new List<HostName>();
-                foreach (string dns in _config.DnsServers)
+                // ★【1.0.40】nrpt-dns 覆盖（没有就还是 profile 的 <dns> 清单）。
+                foreach (string dns in EffectiveNrptDnsServers())
                 {
                     if (!string.IsNullOrWhiteSpace(dns))
                         dnsServers.Add(new HostName(dns.Trim()));

@@ -39,16 +39,23 @@ namespace ClashUWP.Vpn
                 LocalSettings.Load();
                 if (LocalSettings.FakeIp)
                 {
-                    // ★【1.0.35 · G9】走同一条 3-arg 路径把注入结果记进日志：
+                    // ★【1.0.35 · G9】走同一条路径把注入结果记进日志：
                     //   前台点「重载」之后热重载吃的就是这份文件，名单没注进去的话
                     //   下一次连接会把热重载的结果覆盖掉 —— 两条路必须留同一句证据。
                     //   本方法跑在<b>前台进程</b>里，RollingLog 按角色自动落 logs/app.log。
                     // ★【1.0.70 · G7】ipv6 两个参数必须与插件侧逐字同源：热重载吃的
                     //   就是这份文件，前台漏传会让"重载后 tun.inet6-address 消失"，
                     //   而插件下一次连接又改回来 —— 同一个开关两种行为，最难查。
+                    // ★【1.0.40 · DNS 可配】dns-config.txt 与生效 v6 池同样必须同源：
+                    //   热重载若漏叠 DNS 覆盖，会把用户配置打回订阅原文，直到下次连接。
+                    DnsConfig dnsCfg = LocalSettings.DnsConfigEnabled ? DnsConfig.Load() : new DnsConfig();
+                    string pool6 = dnsCfg.EffectiveFakeIpRange6(LocalSettings.Ipv6FakeRange);
                     string text = KernelConfig.Transform(raw, AppSplit.Load(),
-                        LocalSettings.Ipv6, LocalSettings.Ipv6FakeRange, out string splitNote);
-                    RollingLog.Info("config", $"热重载配置已重生成 应用分流={splitNote}");
+                        LocalSettings.DnsConfigEnabled ? dnsCfg : null,
+                        LocalSettings.Ipv6, pool6,
+                        out string splitNote, out string dnsNote);
+                    RollingLog.Info("config",
+                        $"热重载配置已重生成 应用分流={splitNote}；DNS 覆盖={dnsNote} v6pool={pool6}");
                     return KernelConfig.WriteEffectiveFile(text);   // config.kernel.yaml 绝对路径
                 }
                 return rawPath;

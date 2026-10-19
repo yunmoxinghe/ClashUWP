@@ -35,7 +35,7 @@
   <Identity
     Name="421769c5-17f4-4287-b6c1-193222d21e14"
     Publisher="CN=gold"
-    Version="1.0.70.0" />
+    Version="1.0.71.0" />
 
   <mp:PhoneIdentity PhoneProductId="421769c5-17f4-4287-b6c1-193222d21e14" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
