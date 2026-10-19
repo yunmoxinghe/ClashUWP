@@ -14,6 +14,6 @@
     <!-- 产物落在 obj/bin 下，与产品构建互不影响。 -->
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\..\ClashUWP.Vpn\IpPacket.cs" Link="IpPacket.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\IpPacket.cs" Link="IpPacket.cs" />
   </ItemGroup>
 </Project>

@@ -10,10 +10,10 @@ namespace ClashUWP.Vpn
 {
     /// <summary>
     /// 一条 DNS 覆盖项（<see cref="DnsConfig"/> 的一行）。
-    /// 两个字符串字段是最普通的投影形状 —— 前台编辑器与插件读取共用同一个模型，
+    /// 两个字符串字段保持最普通的形状 —— 前台编辑器与插件读取共用同一个模型，
     /// 不在界面里再写一套"看起来一样"的规则。
     /// </summary>
-    public sealed class DnsEntry
+    internal sealed class DnsEntry
     {
         /// <summary>键名，已归一成小写（<see cref="DnsConfig.Keys"/> 里的那批）。</summary>
         public string Key { get; set; } = "";
@@ -63,7 +63,7 @@ namespace ClashUWP.Vpn
     ///     来源与 NRPT 的下发路径混成了一件事，按代码路径更正。）
     ///   ★ 总闸：<c>settings.txt: dnsConfig=0</c> 时整个文件不读，内核与 NRPT 都不动。
     /// </summary>
-    public sealed class DnsConfig
+    internal sealed class DnsConfig
     {
         /// <summary>配置文件名。<c>static 属性</c>而非 <c>const</c>：本类 public、会被投影进 winmd，
         /// 而 <c>const</c> 不穿过投影，前台 <c>DnsConfigStore</c> 要在运行期读到同一个名字。</summary>

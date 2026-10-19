@@ -32,7 +32,7 @@ namespace ClashUWP.Vpn
     ///   既漏了 sample 的「先 Disconnect 再 Delete」，又让刚建出来的 profile
     ///   未必已被平台索引 —— 两条都是自己给自己挖坑。
     /// </summary>
-    public static class VpnProfileSetup
+    internal static class VpnProfileSetup
     {
         /// <summary>
         /// 主 profile 名字。<b>不在这里定义字面量</b>：真正的唯一定义在组件的

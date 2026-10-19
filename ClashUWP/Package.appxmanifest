@@ -8,34 +8,44 @@
   IgnorableNamespaces="uap mp rescap">
 
   <!--
-    ⚠️ 改这个文件之前先读这段。这里有两条曾经判断错、后来被部署实测纠正过的事实。
+    ⚠️ 改这个文件之前先读这段。这里的事实有被部署实测纠正过的，也有被现读源码纠正过的。
 
     【事实 1】<Application> 的 Executable + EntryPoint 直接激活托管类型 —— 这条成立。
-      本项目是 net10-windows10.0.26100 + UseUwp（CoreCLR，不是 .NET Native）：
+      本项目是 net10-windows10.0.26100 + UseUwp（CoreCLR / NativeAOT，不是 .NET Native）：
       SDK 生成的清单里就是 <Application Executable="ClashUWP.exe" EntryPoint="ClashUWP.App">，
       输出目录里确实没有 CLRHost.dll。
-      但这条结论<b>只适用于前台 Application</b>，不能外推到后台任务。
+      ★ 全 AOT 下前台进程是 ClashUWP.exe 桩跳 __managed__Main（手写 Main），
+        平台并不按 EntryPoint 字符串反射托管类型，所以 App 转 internal 不影响启动。
 
-    【事实 2】后台任务<b>仍然需要</b> activatableClass.inProcessServer 声明 —— 早期判断错了。
+    【事实 2】后台任务<b>仍然需要</b> activatableClass.inProcessServer 声明 —— 早期判断错过一次。
       平台侧是纯清单驱动的：读 ActivatableClassId + Path，LoadLibrary(Path)，
       再 GetProcAddress("DllGetActivationFactory")。它不查 winmd，也不认识托管 exe。
-      实测把 VpnBackgroundTask 留在应用 exe 工程里，部署直接报：
+      当年把 VpnBackgroundTask 留在应用 exe 工程里，部署直接报：
           0x80080204 「如果不是音频后台任务，则不允许在
           windows.activatableClass.inProcessServer 中没有 ActivatableClassId 的情况下，
           令 EntryPoint="ClashUWP.Vpn.VpnBackgroundTask"」
-      根因：exe 工程不产出 winmd，平台找不到可激活类。
 
-      → 正确形态见文件末尾 <Extensions>（Package 级）：
-        后台任务类必须放在 CsWinRTComponent 工程（ClashUWP.Vpn）里。
-        该工程以「自包含组件」模式构建（PublishAot + NativeLib=Shared），再由主工程
-        CsWinRTMergeReferencedActivationFactories=true 合并进主模块 ClashUWP.dll，
-        所以 Path 填 ClashUWP.dll；不需要 WinRT.Host.dll 宿主（托管组件模式才需要）。
+    【事实 2 的根因更正（1.0.76 现读 CsWinRT 2.3.1 源码）】
+      当时归因给"exe 工程不产出 winmd，所以必须拆组件"——<b>这条归因只对了一半</b>：
+      真正的门槛在 CsWinRT 生成器里：
+          Generator.cs: if (!IsCsWinRTComponent() && !ShouldGenerateWinMDOnly()) return;
+      即"非组件形态的工程不注册自己的激活工厂"。而 targets 是按属性无条件
+      import Authoring.targets 的，对 OutputType 没有门禁 ⇒ 主工程自己写
+      CsWinRTComponent=true 就能合法产出 winmd + 导出 DllGetActivationFactory。
+      ⇒ 1.0.76 起插件类 VpnBackgroundTask 就住在本工程（ClashUWP\Vpn\，命名空间不变），
+        清单只剩一个 Application，第二个（无头）入口和 AppListEntry="none" 那套豁免问题一起消失。
+
+      → 两个必要条件（缺一部署就回到 0x80080204 / 0x8007007E）：
+        ① 工程侧 CsWinRTComponent=true（产出 winmd 并导出激活工厂）；
+        ② 文件末尾 Package 级 <Extensions> 的 inProcessServer 注册（Path=ClashUWP.dll）。
+        模块形态（native 产物切成共享库 ClashUWP.dll + 极小 exe 桩）仍由
+        CsWinRTMergeReferencedActivationFactories=true 触发，那行属性不能删，理由见 csproj 注释。
   -->
 
   <Identity
     Name="8B8CC4F4.ClashUWP"
     Publisher="CN=A19C62A9-1AA6-44AB-9F57-2DE6C380D9C9"
-    Version="1.0.75.0" />
+    Version="1.0.77.0" />
 
   <mp:PhoneIdentity PhoneProductId="e5bd739e-05a5-4a61-a7ab-2b5d1da1de4e" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -64,12 +74,41 @@
           遥控的才是 VpnSession/健康哨兵/DebugCommandLoop 真实状态所在的那个进程。
           （background-task AppService 会起空壳宿主，看不到主进程内存 —— 选错
             形态整个通道就白做。）
-        · 与上方 Plugin 的 backgroundTasks 不同，这里<b>不需要</b>
+        · 与下方 backgroundTasks 不同，appService <b>不需要</b>
           Package 级 activatableClass.inProcessServer 注册 —— 那条"事实 2"
           只约束后台任务激活；in-app AppService 由前台进程自己接收，没有
           独立的 WinRT 类要平台去 LoadLibrary。
         · Name 必须与 CLI 侧 AppServiceConnection.AppServiceName 逐字一致：
           "ClashUWP.Debug"（见 ClashUWP.Cli/Program.cs）。
+
+      ★【1.0.76】windows.backgroundTasks 与 vpnClient 任务：以前挂在第二个
+        <Application Id="Plugin"> 上，现在合并到这一个入口下。
+        · 官方 sample 之所以拆两个 Application，是为了<b>进程隔离</b>
+          （"keep them running in two separate processes, so if one is closed,
+            it won't terminate the other"）。合并后这一条的依据换了，见下方
+          【进程隔离的实测依据】—— 注册形态已核，"关前台会不会带走隧道"仍待拨号验证。
+        · 拆成第二个 Application 的代价才是真的：它没有 UI，只能靠
+          AppListEntry="none" 隐藏，而那个属性触发「无权创建无头应用」
+          （1.0.72 就是因此被迫放弃隐藏，见 Docs/25）。
+        · <uap:Task Type="vpnClient" />：装包即由 VPN 平台自动注册，
+          <b>不需要</b>自己 BackgroundTaskBuilder.Register（官方 sample 注释）。
+        · Extension 上的 Executable / EntryPoint 才是激活信息来源，
+          EntryPoint 必须与 Package 级 ActivatableClassId <b>逐字相同</b>。
+
+      【进程隔离的实测依据（1.0.77 真拨号取证，Docs/31 §4.3）】
+        插件宿主由 VPN 平台（RasMan / svchost）按 Package 级 inProcessServer
+        LoadLibrary 拉起，与入口数量无关。装机后注册表给出的<b>形态</b>证据：
+          HKCU\Software\Classes\Extensions\ContractId\Windows.BackgroundTasks\
+          PackageId\8B8CC4F4.ClashUWP_1.0.76.0_x64__4tjvwvefxrz66\ActivatableClassId
+          下面挂着<b>三个不同的 App.AppX&lt;hash&gt;.mca</b>（CustomProperties 的
+          Capabilities 掩码各不相同）。
+        ★ 但"三个 mca 身份"只等于"平台可以分开激活"，<b>不等于运行时必然分进程</b>。
+          实测：前台在跑时 vpnClient 激活被单实例语义路由进<b>同一个 pid</b>（插件日志与
+          app 日志同为前台 pid）；关掉前台窗口后平台先 Canceled 旧会话，再<b>另起一个后台
+          宿主进程</b>重拨，隧道自己回来 —— 所以"关掉界面隧道仍在"成立，
+          代价是一次约 2s 的平台重拨间隙。
+        ⇒ 不要为此上 uap10:SupportsMultipleInstances：那会让 windows.appService 的连接
+          另开实例、CLI 通道不再命中界面进程（Docs/13 的设计要重写），换来的只是省掉那次间隙。
     -->
     <Application Id="App"
       Executable="$targetnametoken$.exe"
@@ -87,6 +126,14 @@
         <uap:Extension Category="windows.appService">
           <uap:AppService Name="ClashUWP.Debug" />
         </uap:Extension>
+        <!-- VPN 插件后台任务声明（宿主进程身份见上方【进程隔离的实测依据】） -->
+        <Extension Category="windows.backgroundTasks"
+          Executable="$targetnametoken$.exe"
+          EntryPoint="ClashUWP.Vpn.VpnBackgroundTask">
+          <BackgroundTasks>
+            <uap:Task Type="vpnClient" />
+          </BackgroundTasks>
+        </Extension>
         <!--
           ★【1.0.53】协议激活：浏览器"一键导入 Clash 订阅"的入口。
           【为什么要注册两条】
@@ -117,48 +164,6 @@
         </uap:Extension>
       </Extensions>
     </Application>
-
-    <!--
-      VPN 插件宿主。★ 单独一个 Application = 单独进程。
-      【官方 sample 清单内注释】："keep them running in two separate processes, so if one
-      is closed, it won't terminate the other"
-      → 关掉前台 UI 不会把隧道一起带走。
-
-      AppListEntry="none"：不出现在开始菜单 / 应用列表（它只是宿主，没有 UI）。
-      ★ 位置很关键：它是 <uap:VisualElements> 的属性，不是 <Application> 的属性。
-      挂在 <Application> 上部署会直接失败：
-        0xC00CE015 未在 DTD/架构中定义元素 '{...}Application' 的属性 '{...uap...}AppListEntry'
-      （实测踩过一次，见 AppXDeploymentServer/Operational 事件 404）
-
-      注意 Application 本身不写 Executable / EntryPoint —— 官方 sample 两个版本
-      （CSharp / CppWinRT）的 Plugin Application 都没有，激活信息由 <Extension> 提供。
-
-      <uap:Task Type="vpnClient" />：声明本包提供 VPN 客户端插件。
-      【官方 sample 注释】："When your application is installed this background task will
-      automatically be registered by the VPN platform."
-      → 装包即注册，<b>不需要</b>自己 BackgroundTaskBuilder.Register。
-    -->
-    <Application Id="Plugin"
-      Executable="$targetnametoken$.exe"
-      EntryPoint="ClashUWP.Vpn.VpnBackgroundTask">
-      <uap:VisualElements
-        DisplayName="ClashUWP"
-        Square150x150Logo="Assets\Square150x150Logo.png"
-        Square44x44Logo="Assets\Square44x44Logo.png"
-        Description="ClashUWP VPN Plugin"
-        BackgroundColor="transparent">
-        <uap:DefaultTile/>
-      </uap:VisualElements>
-      <Extensions>
-        <Extension Category="windows.backgroundTasks"
-          Executable="$targetnametoken$.exe"
-          EntryPoint="ClashUWP.Vpn.VpnBackgroundTask">
-          <BackgroundTasks>
-            <uap:Task Type="vpnClient" />
-          </BackgroundTasks>
-        </Extension>
-      </Extensions>
-    </Application>
   </Applications>
 
   <Capabilities>
@@ -172,8 +177,14 @@
       【官方】VpnChannel / IVpnPlugIn / VpnManagementAgent / VpnPlugInProfile 的
       Windows requirements 均列 *App capabilities: networkingVpnProvider*。
 
-      上架需微软审批（sample README："The VPN apps in Windows are curated"），
-      侧载 / 自签部署不受此限。
+    ★【1.0.76 更正】这段与"协议激活/商店审批"的口径：
+      受限能力<b>不再需要提前联系微软</b>。现在官方流程是：上传包时平台检测到清单里
+      声明了受限能力，就要求你在 Partner Center 的 Submission options →
+      Restricted capabilities 页填写"怎么用、为什么必须"，认证人员据此判定；
+      批了才继续走后续认证，后续更新一般不用重复申请（除非新增能力）。
+      侧载 / 自签部署不受此限（官方原文：Store approval isn't required to sideload）。
+      networkingVpnProvider 在受限能力表里<b>没有</b>"不建议声明 / 多数情况不批"那句
+      附加语（有那句的是 userPrincipalName、screenDuplication、walletSystem 那几个）。
     -->
     <rescap:Capability Name="networkingVpnProvider" />
   </Capabilities>
@@ -184,19 +195,19 @@
 
     这是后台任务能被 WinRT 激活的注册点：
       · ActivatableClassId 必须与上面 <uap:Task Type="vpnClient"/> 那条
-        Extension 的 EntryPoint <b>逐字相同</b>；
-      · Path 是宿主模块。本项目走「全 AOT + merge」形态：主工程开了
-        CsWinRTMergeReferencedActivationFactories=true，被引用的组件 ClashUWP.Vpn
-        被合并进主工程自己的 native 模块，由该模块统一导出 DllGetActivationFactory
-        并转发激活调用。OutputType=WinExe 下 CsWinRT 把主工程 native 产物切成
-        共享库 ClashUWP.dll（另配极小 ClashUWP.exe 桩），所以这里填 ClashUWP.dll。
-        （托管组件形态填 WinRT.Host.dll；组件 AOT 自包含但不合并时填 ClashUWP.Vpn.dll；
-          更老的 .NET Native 填 CLRHost.dll。）
+        Extension 的 EntryPoint <b>逐字相同</b>；1.0.76 合并工程后这个字符串没变，
+        因为 VpnBackgroundTask 的命名空间保持 ClashUWP.Vpn（文件搬到 ClashUWP\Vpn\ 而已）。
+      · Path 是宿主模块。本项目走「全 AOT + 单模块」形态：本工程自己就是 CsWinRT
+        授权组件（CsWinRTComponent=true），native 产物由 CsWinRTMergeReferencedActivationFactories
+        触发切成共享库 ClashUWP.dll（另配极小 ClashUWP.exe 桩），
+        由该模块导出 DllGetActivationFactory，所以这里填 ClashUWP.dll。
+        （托管组件形态填 WinRT.Host.dll；更老的 .NET Native 填 CLRHost.dll。）
       · ThreadingModel="both"：VpnChannel.ProcessEventAsync 的回调线程不保证。
 
     ★ 打包要求：msix 里必须有 ClashUWP.dll（原生，导出 DllGetActivationFactory，
       内含 VpnBackgroundTask 激活工厂）+ 旁边的 ClashUWP.exe 桩。
-      全 AOT 合并后不再需要 ClashUWP.Vpn.dll / WinRT.Host.* / WinRT.Runtime.dll。
+      全 AOT 单模块后不需要 ClashUWP.Vpn.dll / WinRT.Host.* / WinRT.Runtime.dll；
+      授权过程生成的 ClashUWP.winmd 只落在 obj/bin，<b>不该</b>出现在包里。
   -->
   <Extensions>
     <Extension Category="windows.activatableClass.inProcessServer">

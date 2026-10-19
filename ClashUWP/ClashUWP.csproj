@@ -19,30 +19,76 @@
          泛型 WinRT 接口跨 ABI 需要生成的 unsafe 代码，AOT 下必须开。 -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
-    <!-- 组件 ClashUWP.Vpn 已 AOT 成原生 dll，主工程拿不到它的托管类型；
-         这里指定从组件 winmd 生成 VpnPluginConfig 的 C# 投影，
-         供 VpnProfileSetup 序列化自定义 XML（前台与插件之间的配置契约）。 -->
-    <CsWinRTIncludes>ClashUWP.Vpn</CsWinRTIncludes>
+    <!--
+      ★【1.0.76】本工程自己就是 CsWinRT 授权组件（写插件类必需）。
+
+      【为什么以前不需要、现在必需】
+        VpnBackgroundTask 住在独立组件工程时，注册激活工厂的是那个工程；
+        插件类搬进本工程后，必须由本工程自己产出 winmd + 导出 DllGetActivationFactory，
+        否则平台按清单 ActivatableClassId 去 LoadLibrary 时拿不到工厂
+        （部署报 0x80080204，根因就是非组件工程里 Generator.cs 的
+         `if (!IsCsWinRTComponent() && !ShouldGenerateWinMDOnly()) return;` 这条早退）。
+      【谁才是真门槛】
+        不是平台"exe 工程不能当插件宿主"，是 CsWinRT 生成器只给组件形态的工程注册类型
+        —— 这条属性就是那个开关，对 OutputType 没有门禁（targets 按属性无条件 import
+        Authoring.targets），WinExe 一样能用。
+
+      ★ 副作用一：授权器只扫 public 类型，规则 CsWinRT1001/1003/1004/1005/1006 以
+        Error 阻断构建 ⇒ 本工程 public 面必须只剩 VpnBackgroundTask
+        （`public sealed class … : IBackgroundTask`，成员只有 Run(IBackgroundTaskInstance)）。
+        App（基类是泛型闭合 ReactorApplication&lt;MainComponent&gt;）、
+        MainComponent（基类 Microsoft.UI.Reactor.Component 不可投影）、
+        VpnProfileSetup（Task&lt;string&gt;）全转 internal；
+        转 internal 不影响前台激活 —— AOT 下入口是 CustomNativeMain 的 __managed__Main，
+        平台不按 EntryPoint 反射托管类型。
+
+      ★ 副作用二（★ 这条曾被静态判断错过一次，下面是 1.0.76 实测的口径）：
+        Authoring.targets 把 $(AssemblyName).winmd 与 ProjectPri 作为 <c>&lt;Content&gt;</c>
+        项加进来，只带 Pack 元数据、没有 CopyToOutputDirectory —— 看上去进不了 payload。
+        但同文件还把<b>组件工程的 GetTargetPath 覆盖成"只返回那份 winmd"</b>，而本项目
+        走 IncludePublishItemsOutputGroup=true 的 publish 打包路线，那个 GetTargetPath
+        正好是发布项的来源 ⇒ winmd 照样进了 @(PackagingOutputs)，而它此刻还躺在 obj
+        生成目录里（复制到 TargetDir 挂在 AfterBuild，排在打包之后），第一次 Build 直接：
+            error APPX0702: Payload file '…\win-x64\ClashUWP.winmd' does not exist
+        ⇒ 下方 ClashUwpDropAuthoringPackagingArtifacts 不是保险，是必需。
+
+      ★ 副作用三：依赖 winmd 自动探测默认开着，会把 NuGet 依赖里的 winmd（Reactor.Uwp）
+        卷进授权元数据链。这里显式关掉。
+    -->
+    <CsWinRTComponent>true</CsWinRTComponent>
+    <CsWinRTDetectDependentAuthoringWinMDs>false</CsWinRTDetectDependentAuthoringWinMDs>
 
     <!--
-      ★ 两边都 AOT 的关键开关（CsWinRT 官方属性）：
-        让 AOT 场景下 native DllGetActivationFactory 把激活调用转发给被引用的 WinRT
-        组件，从而把组件与主工程合并进同一个 native 模块。
+      ★★ 这个开关现在的作用和以前不一样，但<b>绝对不能删</b>。
 
-      为什么必须开：组件 AOT 后不再单独产出 ClashUWP.Vpn.dll；若主模块不导出/转发
-      激活工厂，平台按清单 Path 去 LoadLibrary 会 0x8007007E。开此开关后主工程自己
-      native 模块也导出 DllGetActivationFactory 并转发给组件。
+        组件时代：它让主模块的 native DllGetActivationFactory 转发给被引用的组件，
+                  把组件与主工程合并进同一个 native 模块。
+        合并之后：本工程自己就是组件（上面 CsWinRTComponent），没有"被引用组件"可转发了，
+                  但它仍然是 BeforeMicrosoftNetSdk.targets 里唯一设置
+                  NativeLib=Shared + CustomNativeMain + 生成 ClashUWP.exe 桩的开关：
 
-      ★ 副作用（CsWinRT 自动处理）：OutputType=WinExe 时它把 NativeLib 置为 Shared +
-        CustomNativeMain=true，native 主模块变成 ClashUWP.dll，另生成极小 ClashUWP.exe
-        桩（wmain 跳 __managed__Main）。清单 Executable 仍是 ClashUWP.exe，
-        但 inProcessServer 的 Path 必须填 ClashUWP.dll。
+                    Condition="'$(CsWinRTMergeReferencedActivationFactories)' == 'true'
+                               AND (OutputType == Exe OR WinExe)"
+
+        删掉它的后果：NativeAOT 直接产出单一 ClashUWP.exe，平台无法把 exe 当模块
+        LoadLibrary 取 DllGetActivationFactory ⇒ inProcessServer 失效，插件起不来
+        （0x8007007E 那一类）。清单 inProcessServer 的 Path 依旧填 ClashUWP.dll。
     -->
     <CsWinRTMergeReferencedActivationFactories>true</CsWinRTMergeReferencedActivationFactories>
 
     <!--
       ★ 签名 + 单项目 MSIX 打包（等价 VS 里「项目 → 生成/发布 → 创建应用包」写入的项）。
-      manifest 的 Publisher=CN=gold，这里指定同名自签证书与其指纹完成签名。
+      manifest 的 Publisher 现在是商店关联身份 CN=A19C62A9-…，这里指定同名商店 key
+      （Docked AI_StoreKey.pfx）完成签名。
+      ★★ 1.0.76 实测到的两件事，装机前必须知道：
+        1) 构建期真正签上去的证书<b>不是</b>这张 pfx 里的 CBDB46DF…，而是
+           A4A67B07997027F8B755CA627F0CC66E252B7771（Subject 与 Publisher 的 CN 一致，
+           本机证书库里没有这张 ⇒ `Get-AuthenticodeSignature` = UnknownError，
+           怀疑是 GenerateTemporaryStoreCertificate=True 生成的临时商店证书顶掉了 pfx）。
+        2) 已装的 1.0.75 家族 `…_4tjvwvefxrz66` 是用本机受信的 FB3309A6… 重签装出来的
+           （换签名证书 = 换包家族哈希，见 Docs/30 §5）。所以侧发流程是固定两步：
+           构建 → 按 Docs/30 用 FB3309A6… 重签 → Add-AppxPackage（PS 5.1）。
+           跳过重签会变成并排新家族，LocalState 与已注册 profile 全不继承。
       ★ AOT 打包两个坑（已用下方 IncludePublishItemsOutputGroup=true 一并解决）：
         1) BuildTools.MSIX 只会在 GenerateAppxPackageOnBuild=true 时自动收集 AOT
            发布产物；走 PublishAppxPackage 路线必须显式开 IncludePublishItemsOutputGroup，
@@ -79,27 +125,58 @@
   </ItemGroup>
 
   <!--
-    ★ 组件必须用 PackageReference 消费（本地 feed 见本目录 nuget.config），不能用
-      ProjectReference：CsWinRT 在 Authoring.targets 里覆盖了组件工程 GetTargetPath，
-      只暴露 .winmd。主工程 AOT 编译因此只拿到 winmd 投影壳、拿不到组件实现 IL，
-      CsWinRTMergeReferencedActivationFactories 无对象可合并 → 主模块没有插件代码。
-      nupkg 的 lib\...\ClashUWP.Vpn.dll 正是组件实现 IL，作为普通编译引用流进主工程、
-      被 AOT 编入主模块，merge 才有对象可转发。
+    ★【1.0.76】组件工程 ClashUWP.Vpn 已回收进本工程（插件源码在 ClashUWP\Vpn\，
+      命名空间保持 ClashUWP.Vpn 不变 —— 这样清单里的 ActivatableClassId 一个字都不用改）。
 
-    ★ 组件形态：PublishAot + NativeLib=Shared（见 ClashUWP.Vpn.csproj），CsWinRT 自动置
-      CsWinRTAotExportsEnabled=true。合并后主工程自身导出 DllGetActivationFactory，
-      清单 inProcessServer 的 Path 填主工程自己的模块 ClashUWP.dll（不是 WinRT.Host.dll）。
+    以前必须用 PackageReference（本地 feed nuget.config）而不是 ProjectReference，
+    真实原因不是平台，是 CsWinRT：Authoring.targets 覆盖了组件工程的 GetTargetPath，
+    只暴露 .winmd，主工程 AOT 编译因此拿不到组件实现 IL，merge 无对象可合并。
+    现在同一 assembly、同一份源码被 AOT 编进主模块，这条约束连 feed 一起消失：
+    nuget.config 与 artifacts\packages（41 个 nupkg）删除，双版本号轨结束，
+    "插件源码改了必须重新 pack 并跳版本号否则吃旧 nupkg"这条纪律不再需要存在。
 
-    历史教训：不要用 Content 手工把 ClashUWP.Vpn.dll / WinRT.Runtime.dll 塞进包。
+    清单 inProcessServer 的 Path 依旧填本工程自己的原生模块 ClashUWP.dll
+    （NativeLib=Shared 由上面那个合并开关触发），不需要 WinRT.Host.* / ClashUWP.Vpn.dll。
+
+    历史教训：不要用 Content 手工把托管组件 DLL 塞进包。
   -->
-  <ItemGroup>
-    <!-- 1.0.7：黑洞主修换轨 —— 建隧道恒走 V2 StartWithTrafficFilter 且
-         trafficFilterAssignment 传 null（先遣项目 docs/76 三态单变量 A/B：空对象=默认 deny，
-         TCP 直接 WSAEACCES 10013 / ICMP General failure，本地瞬败而非超时；
-         V1 Start() 又静默不装 inclusion 路由）。1.0.6 的校验和补齐与采样一并保留。
-         ★ 插件源码改了就必须重新 pack 并抬版本号，否则主工程吃的还是旧 nupkg。 -->
-    <PackageReference Include="ClashUWP.Vpn" Version="1.0.43" />
-  </ItemGroup>
+
+  <!--
+    ★【1.0.76】本工程开了 CsWinRTComponent 之后必须补这一段。
+
+      CsWinRT 的 Authoring.targets 把组件工程的 GetTargetPath 覆盖成
+      "只返回 $(TargetDir)$(AssemblyName).winmd"（Authoring.targets:157，
+      那是给 ProjectReference 消费方和 C++ 用的）。对本工程这种
+      "自己就是宿主、没人引用自己"的 AOT 应用，这条覆盖会让授权生成的 winmd
+      混进 GetPackagingOutputs 的 payload 清单，而文件此刻还躺在 obj 的生成目录里
+      （Copy 到 TargetDir 那步挂在 BeforeTargets=AfterBuild，排在打包之后），于是：
+
+          error APPX0702: Payload file '...\bin\...\win-x64\ClashUWP.winmd' does not exist
+
+      【为什么不干脆让它进包】
+        平台是纯清单驱动激活的：读 ActivatableClassId + Path，LoadLibrary(ClashUWP.dll)，
+        取 DllGetActivationFactory —— 不查 winmd（清单"事实 2"）。
+        而现在这个包里根本没有 winmd，1.0.75 装得好好的 ⇒ 前台激活也不依赖包内 winmd。
+        往里加一个"只声明 VpnBackgroundTask、不声明 EntryPoint 那个 ClashUWP.App"的 winmd，
+        等于给部署校验引入一条从没验证过的新路径，不值得。
+      ⇒ 从 payload 清单里摘掉它，包内容与合并前逐字一致。
+        （Content 与 ContentWithTargetPath 一并摘：Authoring.targets:263
+         CsWinRTIncludeHostDlls 注入的 winmd / pri / transitive .targets 三个 Content 项
+         只该用于 nupkg 打包，不该参与 msix。）
+  -->
+  <Target Name="ClashUwpDropAuthoringPackagingArtifacts"
+          AfterTargets="CsWinRTIncludeHostDlls;GetPackagingOutputs"
+          BeforeTargets="_ComputeAppxPackagePayload">
+    <ItemGroup>
+      <Content Remove="$(TargetDir)$(AssemblyName).winmd" />
+      <Content Remove="$(ProjectPriFullPath)" />
+      <Content Remove="$(AuthoringTransitiveTargets)" />
+      <ContentWithTargetPath Remove="$(TargetDir)$(AssemblyName).winmd" />
+      <ContentWithTargetPath Remove="$(ProjectPriFullPath)" />
+      <ContentWithTargetPath Remove="$(AuthoringTransitiveTargets)" />
+      <PackagingOutputs Remove="$(TargetDir)$(AssemblyName).winmd" />
+    </ItemGroup>
+  </Target>
 
   <!--
     ★ 路线 A 数据面：Go c-shared 原生 DLL（Tools\mihomo-bridge 编译产物）。

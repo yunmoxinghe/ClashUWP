@@ -27,7 +27,7 @@ namespace ClashUWP
     /// （事件日志是 Application Error 1000 / Faulting module coreclr.dll）。
     /// 要换页面就换 <c>ReactorApplication&lt;T&gt;</c> 的 T，或走框架自己的导航。
     /// </summary>
-    public sealed partial class App : ReactorApplication<MainComponent>
+    internal sealed partial class App : ReactorApplication<MainComponent>
     {
         public static void Main(string[] args)
         {

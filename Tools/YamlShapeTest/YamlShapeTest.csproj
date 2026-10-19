@@ -20,11 +20,11 @@
     <NoWarn>$(NoWarn);CS8632;CS1591</NoWarn>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\..\ClashUWP.Vpn\KernelConfig.cs" Link="KernelConfig.cs" />
-    <Compile Include="..\..\ClashUWP.Vpn\AppSplit.cs" Link="AppSplit.cs" />
-    <Compile Include="..\..\ClashUWP.Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
-    <Compile Include="..\..\ClashUWP.Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
-    <Compile Include="..\..\ClashUWP.Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\KernelConfig.cs" Link="KernelConfig.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\AppSplit.cs" Link="AppSplit.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
     <Compile Include="..\..\ClashUWP\Backend\Mihomo\MihomoController.cs" Link="MihomoController.cs" />
     <Compile Include="..\..\ClashUWP\Backend\Mihomo\KernelView.cs" Link="KernelView.cs" />
     <Compile Include="..\..\ClashUWP\Backend\Mihomo\SubscriptionView.cs" Link="SubscriptionView.cs" />

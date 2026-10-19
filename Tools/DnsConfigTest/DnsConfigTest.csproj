@@ -13,8 +13,8 @@
     <AssemblyName>DnsConfigTest</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\..\ClashUWP.Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
-    <Compile Include="..\..\ClashUWP.Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
-    <Compile Include="..\..\ClashUWP.Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
+    <Compile Include="..\..\ClashUWP\Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
   </ItemGroup>
 </Project>

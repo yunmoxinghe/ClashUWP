@@ -15,11 +15,12 @@ namespace ClashUWP.Vpn
     ///   绝不能在前台另写一份改写逻辑：那会跟插件侧的口径分叉，重演 run 24「常驻热重载把
     ///   fake-ip 覆盖回 redir-host」的黑洞（Docs/08 §9）。
     ///
-    /// ★ 必须是 <c>public</c>：前台通过 nupkg 引用本组件，只能看到 winmd 投影出来的 public 成员；
-    ///   <see cref="KernelConfig"/> / <see cref="LocalSettings"/> 都是 internal，前台调不到，
-    ///   所以把"重新生成内核配置"这一个动作封成 public 入口，组件改了就 repack+bump（本项目纪律）。
+    /// ★ 可见性：合并进主工程（1.0.76）后本类转 internal 了 —— 以前它必须 public，
+    ///   是因为前台跨 nupkg 只看得见 winmd 投影出来的 public 成员；现在前台与插件同一 assembly，
+    ///   直接调即可，而 CsWinRT 授权器只扫 public 类型，少一个 public 就少一处投影约束。
+    ///   <see cref="KernelConfig"/> / <see cref="LocalSettings"/> 一直就是 internal。
     /// </summary>
-    public static class SubscriptionReload
+    internal static class SubscriptionReload
     {
         /// <summary>
         /// 读 <c>config.yaml</c> → 按 FakeIp 改写 → 落 <c>config.kernel.yaml</c> → 返回热重载路径。不抛。

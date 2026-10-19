@@ -58,7 +58,7 @@ namespace ClashUWP.Frontend
     ///   ④ 删掉 1.0.48 遗留的脚手架：<c>"Reactor.Uwp 已接管（N）"</c> 那行标题与
     ///      <c>点一下</c> 计数器 —— 接管验证早就过了，留着只会挡在主页最上面。
     /// </summary>
-    public sealed class MainComponent : Component
+    internal sealed class MainComponent : Component
     {
         // ==================== 外壳：侧边栏四项 ====================
 

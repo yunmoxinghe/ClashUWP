@@ -21,7 +21,7 @@ namespace ClashUWP.Vpn
     /// 也是它自己造的，由它那份 1704 行的 CustomConfiguration.cs 解析 —— 没有任何官方约束，
     /// 所以这里不照抄它的字段名。
     /// </summary>
-    public sealed class VpnPluginConfig
+    internal sealed class VpnPluginConfig
     {
         // ── 官方硬上限（VpnChannel.Start 的 Remarks / 参数文档原文） ──────────────
         // mtuSize     : "should be configured to be at most 1400"

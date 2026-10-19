@@ -7,10 +7,11 @@ using Windows.Storage;
 namespace ClashUWP.Vpn
 {
     /// <summary>
-    /// 一条应用分流规则（G9）。三个字段全是字符串，是为了让它在 CsWinRT 投影里
-    /// 保持最普通的形状（前台写、插件读，两边共用这一份模型，不再有两套解析器）。
+    /// 一条应用分流规则（G9）。三个字段全是字符串，是为了让形状保持最普通
+    /// （CsWinRT 组件时代它还得能被投影；1.0.76 合并进主工程后这条约束没了，
+    /// 但"前台写、插件读，两边共用这一份模型，不再有两套解析器"这条理由不变）。
     /// </summary>
-    public sealed class AppSplitRule
+    internal sealed class AppSplitRule
     {
         /// <summary><c>name</c> = 进程名（<c>chrome.exe</c>）；<c>path</c> = 可执行文件全路径。</summary>
         public string Kind { get; set; } = "name";
@@ -74,7 +75,7 @@ namespace ClashUWP.Vpn
     /// 必须等有组名校验之后再做。<c>DIRECT</c> / <c>REJECT</c> 是内核内建、恒存在，
     /// 恰好覆盖"旁路"和"屏蔽"这两个真实需求。
     /// </summary>
-    public sealed class AppSplit
+    internal sealed class AppSplit
     {
         /// <summary>名单文件名（与 <c>settings.txt</c> 同目录，故意<b>不</b>混进那个把手文件：
         /// 它是取证通道的命门，写坏一行等于一整批实验臂失效，见 Docs/19 §6）。</summary>
