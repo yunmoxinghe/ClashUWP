@@ -84,6 +84,18 @@ namespace ClashUWP.Vpn
         private static bool s_bridgeResident;
         /// <summary>上一次连接用的内核配置，用于判断订阅是否变了（变了才热重载）。</summary>
         private static string s_lastConfigFingerprint = "";
+        // ★【1.0.38 · G6】重绑要"重放同一次 start"，所以 start 的三个入参必须留档。
+        //   为什么留参数而不是留别的什么：Go 侧的 rebindInterface() 只存在于
+        //   <c>Bridge.Start</c> 的两条路径里（首次 <c>core.go:153</c>、已启动分支
+        //   <c>core.go:135</c>），而"已启动"分支<b>不解析配置</b>（直接 return
+        //   <c>ErrAlreadyStarted</c>）⇒ 传什么配置都不影响内核状态，只需要<b>不是空串</b>
+        //   （<c>clash_bridge_start</c> 对 len<=0 先返回 -1 参数非法，走不到 rebindInterface）。
+        /// <summary>最近一次成功喂给 <c>clash_bridge_start</c> 的配置原文（G6 重绑重放用，见上）。</summary>
+        private static string s_lastBridgeConfig = "";
+        /// <summary>同上：那次 start 用的 mihomo home（<c>KernelHome.Ensure()</c> 的返回值）。</summary>
+        private static string s_lastBridgeMmdbDir = "";
+        /// <summary>同上：那次 start 用的 MTU。</summary>
+        private static int s_lastBridgeMtu = 1400;
 
         // ── 数据面取证采样（黑洞定位用）────────────────────────────────────
         // 每个方向只留前 MaxTunSamples 个包的头部摘要，写进 LocalState\tun-sample.txt。
@@ -695,6 +707,16 @@ namespace ClashUWP.Vpn
                 //     这条判"物理网络是否还活着"（探 114.114.114.114，绕开隧道）。
                 //     两条都指向同一个拆隧道动作，用 Interlocked 门闩保证只有一个动手。
                 PhysicalNetworkWatchdog.Start();
+
+                // 步 8.6 · ★【1.0.38 · G6】跟随网络变化（换 Wi-Fi / 有线 / 热点）。
+                //   ★ 为什么放在桥与两条看门狗之后：它读的基线里有 <c>bound_iface</c>
+                //     （桥此刻绑到哪张物理网卡），桥没起来时读到空串，基线就没意义。
+                //   ★ 为什么默认只观测（netFollow=1）：订阅事件这件事在 vpnClient 后台任务
+                //     进程里到底收不收得到<b>没有实测</b>，而动作臂要再调一次 clash_bridge_start
+                //     —— 两条都是 Docs/22 的待验项，代码全写完、默认不动桥。
+                //   ★ 它是<b>尽力而为</b>：Start 内部订阅失败只进 channel=net-follow 日志，
+                //     绝不让"跟随网络"这个附加能力把整条连接拖垮（见 NetworkFollow.Start 的 catch）。
+                NetworkFollow.Start(BoundIfaceNow());
 
                 // 步 9 · ★【1.0.66】通知中心那条常驻的"实时上下行"（对齐安卓 DynamicNotificationModule）。
                 //   放在最后：隧道、桥、两条看门狗都装好之后再发 —— 通知讲的是"隧道正在跑"这件事，
@@ -1639,6 +1661,10 @@ namespace ClashUWP.Vpn
             //   判死之后会做一次多余的拆隧道动作。
             PhysicalNetworkWatchdog.Stop("平台回调 Disconnect");
 
+            // ★【1.0.38 · G6】跟随网络的事件订阅同样要退：会话结束后还挂着，
+            //   下一次换网的事件会落在一个已经没有隧道的进程状态上（日志里看起来像"幽灵跟随"）。
+            NetworkFollow.Stop("平台回调 Disconnect");
+
             // ★【1.0.66】状态通知同样要撤：它讲的就是"隧道正在跑"，
             //   会话都结束了还留着，就是一条永久谎报（通知中心里显示已连接、其实接口早没了）。
             StatusToast.Stop("平台回调 Disconnect");
@@ -1756,6 +1782,13 @@ namespace ClashUWP.Vpn
                 //   两条都必须能在这一份档案里当场分辨，不能只活在滚动日志的时间轴里。
                 $"AppSplit={_splitNote}\r\n" +
                 $"SessionReset={SessionReset.LastNote}\r\n" +
+                // ★【1.0.38 · G6】跟随网络的两行证据：
+                //   NetFollow = 最近一次评估（事件名 / 指纹变没变 / bound_iface 前后值 / 动作），
+                //   NodeCache = 排除路由缓存的落盘时间与"是否已作废待重解析"
+                //   （换网后若这里一直是"已作废"，说明下次连接的强制重解析一直没成功 ——
+                //    那正是"节点域名解析到了旧网络的 IP"的证据）。
+                $"NetFollow={NetworkFollow.LastNote}\r\n" +
+                $"NodeCache={NodeRoutes.DescribeCacheAge()}\r\n" +
                 $"OuterTarget={_outerTargetUsed}:{LocalSettings.OuterPort} (要求={LocalSettings.OuterTarget}) fakeIp={(LocalSettings.FakeIp ? "on" : "off")}\r\n" +
                 $"IncludeMode={LocalSettings.IncludeMode} inclusion=[{string.Join(",", (LocalSettings.IncludeMode.Equals("narrow", StringComparison.OrdinalIgnoreCase) ? NarrowInclusionRoutes() : _config.IncludeRoutes))}]\r\n" +
                 $"SessionSeconds={ElapsedSeconds():F0}\r\n" +
@@ -1981,6 +2014,12 @@ namespace ClashUWP.Vpn
                 }
 
                 s_lastConfigFingerprint = Fingerprint(config);
+                // ★【1.0.38 · G6】留档三个入参：网络变化后的"重绑"就是拿它们再调一次
+                //   <c>clash_bridge_start</c>，命中 Go 侧"已启动 → rebindInterface()"分支。
+                //   只存不解析：已启动分支根本不读这份配置（见字段注释）。
+                s_lastBridgeConfig = config;
+                s_lastBridgeMmdbDir = mmdbDir;
+                s_lastBridgeMtu = (int)_config.Mtu;
 
                 // ★【1.0.35 · G5】会话开始这一臂：桥已经就绪（冷启动成功或复用常驻都算），
                 //   此时清缓存的语义是"这次连接从干净状态开始"（对齐安卓进入时那次 reset）。
@@ -2127,7 +2166,15 @@ namespace ClashUWP.Vpn
                     // ★ 同步进滚动日志：_bridgeDiag 只在会话快照里，而快照是"下一次断开"
                     //   才落盘的文件；热重载是不是真的生效，得能在 plugin.log 里当场查到。
                     if (resp.IsSuccessStatusCode)
+                    {
                         RollingLog.Info("hot-reload", $"PUT /configs?force=true -> {code}");
+                        // ★【1.0.38 · G6】"热重载会把防自环绑定清空"这件事必须在这里补回来：
+                        //   ApplyConfig 无条件执行 dialer.DefaultInterface.Store(general.Interface)
+                        //   （executor.go:412），而我们生成的配置没有 interface-name（空串）。
+                        //   补法走 PATCH /configs 的同一个 Store（configs.go:366-368），
+                        //   用的是桥侧记录的原名字，不重探测、不改 Go。
+                        await RestoreInterfaceBindingAsync("hot-reload");
+                    }
                     else
                         RollingLog.Warn("hot-reload", $"PUT /configs?force=true -> {code} {body}");
                     try { channel.LogDiagnosticMessage($"ClashUWP: 配置热重载 HTTP {code}"); }
@@ -2139,6 +2186,180 @@ namespace ClashUWP.Vpn
                     RollingLog.Error("hot-reload", configPath ?? "", ex);
                 }
             });
+        }
+
+        // ══ G6 跟随网络（1.0.38）════════════════════════════════════════════
+        // 这一块的三个成员只被 NetworkFollow 与 TryHotReload 调用，为什么不放进 NetworkFollow：
+        //   重绑要碰 s_bridgeGate / s_lastBridge* / s_bridgeGlobal —— 它们都是本类的状态，
+        //   跨类搬过去只会多一层"谁负责拿锁"的模糊。
+
+        /// <summary>桥侧记录的绑定网卡名（空 = 未绑定/桥没起）。绝不抛。</summary>
+        internal static string BoundIfaceNow()
+        {
+            try { return MihomoBridge.BoundInterface() ?? ""; }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 请求桥重新探测并绑定物理网卡（G6 档 2 的动作臂）。
+        /// ★ 立即返回、动作在后台线程：调用点是 <c>NetworkInformation</c> 的平台事件线程，
+        ///   那里最多允许读属性 + 写日志，不允许等锁/等 native。
+        /// </summary>
+        /// <returns>提交结果的人读句子（写进 <see cref="NetworkFollow.LastNote"/> 与快照）。</returns>
+        internal static string RequestBridgeRebind(string reason)
+        {
+            if (!s_bridgeGlobal)
+            {
+                RollingLog.Warn("net-follow", $"重绑跳过（{reason}）：桥未运行");
+                return "跳过：桥未运行";
+            }
+            if (s_lastBridgeConfig.Length == 0)
+            {
+                RollingLog.Warn("net-follow", $"重绑跳过（{reason}）：无 start 参数留档");
+                return "跳过：无 start 参数";
+            }
+            _ = Task.Run(() => RebindBridgeCore(reason));
+            return "已提交重绑";
+        }
+
+        /// <summary>
+        /// 重绑的执行体：拿 <c>s_bridgeGate</c> → 再调一次 <c>clash_bridge_start</c>。
+        ///
+        /// 【为什么"再 start 一次"就是重绑】Go 侧 <c>bridge/core.go:132-137</c>：
+        ///   栈已在 ⇒ <c>b.rebindInterface()</c> 后返回 <c>ErrAlreadyStarted</c>（rc=-2）。
+        ///   <c>rebindInterface()</c> 会重新枚举 UP 网卡、排除名为 <c>ClashUWP</c> 的
+        ///   自家 L3 接口与虚拟网卡，把新名字 <c>dialer.DefaultInterface.Store(...)</c>。
+        ///   而"已启动"分支<b>不 Parse 配置、不 ApplyConfig</b> ⇒ 不会动规则/节点/TUN，
+        ///   也不会再撞 <c>hub.ApplyConfig</c> 的 9090 端口（那条是本项目记录过的 wedging 形态）。
+        ///
+        /// 【失败只记日志】这是网络事件触发的最佳努力动作：重绑失败不等于数据面坏了
+        ///   （旧绑定可能仍然可用），绝不能因为"跟随网络"这个附加能力去拆隧道。
+        /// </summary>
+        private static void RebindBridgeCore(string reason)
+        {
+            bool lockTaken = false;
+            try
+            {
+                if (!s_bridgeGlobal)
+                {
+                    RollingLog.Info("net-follow", $"重绑放弃（{reason}）：桥已停止");
+                    return;
+                }
+                if (!Monitor.TryEnter(s_bridgeGate, TimeSpan.FromSeconds(10)))
+                {
+                    RollingLog.Warn("net-follow", $"重绑放弃（{reason}）：取 s_bridgeGate 超时 10s（上一任收尾仍卡在 native）");
+                    return;
+                }
+                lockTaken = true;
+
+                string before = BoundIfaceNow();
+                string cfg = s_lastBridgeConfig;
+                int mtu = s_lastBridgeMtu;
+                string mmdb = s_lastBridgeMmdbDir;
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var task = Task.Run(() => MihomoBridge.Start(cfg, mtu, mmdb));
+                bool timedOut = !task.Wait(TimeSpan.FromSeconds(20));
+                int rc = timedOut ? -99 : task.Result;
+                string err = MihomoBridge.LastError();
+                string after = BoundIfaceNow();
+
+                // rc=0 只可能出现在"桥其实已经没了"的竞态里（我们的 start 重新把栈建起来了）。
+                // 不把它当成功、也不拆会话：泵还在轮询，put_packet 的 -1 计数会把真相留在快照里。
+                string verdict = timedOut ? "超时 20s"
+                    : rc == 0 ? "意外冷启动 rc=0"
+                    : (rc == -2 && err.IndexOf("already started", StringComparison.OrdinalIgnoreCase) >= 0)
+                        ? "已启动→已重绑"
+                        : $"rc={rc} {err}";
+
+                string line = $"重绑（{reason}）结果={verdict} rc={rc} " +
+                              $"bound={(before == after ? after : $"{before}→{after}")} " +
+                              $"用时={sw.ElapsedMilliseconds}ms";
+                if (verdict == "已启动→已重绑")
+                    RollingLog.Info("net-follow", line);
+                else
+                    RollingLog.Warn("net-follow", line);
+                LogSession($"evt=net-rebind reason={reason} rc={rc} " +
+                           $"bound={before}->{after} ms={sw.ElapsedMilliseconds}");
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Error("net-follow", $"重绑异常（{reason}）: {ex.GetType().Name}: {ex.Message}", ex);
+            }
+            finally
+            {
+                if (lockTaken)
+                {
+                    try { Monitor.Exit(s_bridgeGate); } catch { /* 理论上不会发生 */ }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 热重载成功后把防自环绑定写回去（<c>PATCH /configs</c>）。
+        /// ★ 为什么用桥侧记录的名字而不是重新探测：那个名字是 Go 侧
+        ///   <c>detectDefaultInterface</c> 的输出，和 <c>iface.ResolveInterface</c> 的口径<b>同一套</b>；
+        ///   在 C# 里另写一份探测等于制造两套命名，出分歧时反而更难查。
+        /// ★ 调用点只有 TryHotReload 成功分支：PATCH 的 tun/端口等字段全都是"未提供 =
+        ///   沿用上次值"（configs.go:145-285 的 pointerOrDefault*），
+        ///   且 <c>listener.ReCreateTun</c> 对相同配置走 <c>Equal(LastTunConf)</c> 提前返回
+        ///   （listener/listener.go:509-514），所以这次 PATCH 只改 interface-name 一项。
+        /// </summary>
+        internal static async Task RestoreInterfaceBindingAsync(string via)
+        {
+            string iface = BoundIfaceNow();
+            if (iface.Length == 0)
+                iface = s_boundIfaceSnapshot;
+            if (iface.Length == 0)
+            {
+                // 桥没绑上（探测失败）时无值可恢复：这本身就是要留档的证据，
+                // 下一次连接时 Start 会再试一次，不能凭空编一个网卡名写进内核。
+                RollingLog.Warn("iface-bind", $"{via}: 无 bound_iface 可恢复，防自环绑定仍为空");
+                return;
+            }
+
+            try
+            {
+                using var http = new System.Net.Http.HttpClient(
+                    new System.Net.Http.HttpClientHandler { UseProxy = false });
+                http.Timeout = TimeSpan.FromSeconds(3);
+
+                string json = "{\"interface-name\":\"" + EscapeJson(iface) + "\"}";
+                using var req = new System.Net.Http.HttpRequestMessage(
+                    System.Net.Http.HttpMethod.Patch,
+                    SessionReset.ControllerBase + "/configs")
+                {
+                    Content = new System.Net.Http.StringContent(json, Encoding.UTF8, "application/json")
+                };
+                using System.Net.Http.HttpResponseMessage resp = await http.SendAsync(req);
+                int code = (int)resp.StatusCode;
+                if (code >= 200 && code < 300)
+                    RollingLog.Info("iface-bind", $"{via}: PATCH interface-name={iface} -> {code}");
+                else
+                    RollingLog.Warn("iface-bind", $"{via}: PATCH interface-name={iface} -> {code}");
+                LogSession($"evt=iface-bind via={via} iface={iface} code={code}");
+            }
+            catch (Exception ex)
+            {
+                // 绑定没恢复 ≠ 隧道立刻坏：现有连接已经建立，受影响的是<b>下一次</b>拨号。
+                RollingLog.Warn("iface-bind", $"{via}: 恢复绑定失败={ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>手写 JSON 字符串转义（本组件 Native AOT，反射版序列化会抛）。</summary>
+        private static string EscapeJson(string s)
+        {
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char ch in s)
+            {
+                if (ch is '"' or '\\') sb.Append('\\').Append(ch);
+                else if (ch == '\n') sb.Append("\\n");
+                else if (ch == '\r') sb.Append("\\r");
+                else if (ch == '\t') sb.Append("\\t");
+                else if (ch < 0x20) sb.Append($"\\u{(int)ch:x4}");
+                else sb.Append(ch);
+            }
+            return sb.ToString();
         }
 
         /// <summary>配置指纹（长度 + 简单散列），够判断"订阅换没换"。</summary>

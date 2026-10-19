@@ -397,6 +397,39 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal static int SessionReset = 0;
 
+        /// <summary>
+        /// ★【1.0.38 · G6】跟随物理网络变化的档位。默认 <b>1 = 只观测</b>。
+        ///
+        /// 【对齐的是谁】安卓 <c>NetworkObserveModule.kt:63-69</c> 监听
+        ///   <c>onLinkPropertiesChanged</c>，把新链路 DNS 推给内核（<c>:119-127</c>）、
+        ///   退出时清空（<c>:147-152</c>）、按 wifi&gt;eth&gt;… 挑 DNS（<c>:100-117</c>）。
+        ///   我们此前 <c>NetworkInformation</c> 出现 <b>0 次</b>（Docs/12 §2 G6）：
+        ///   会话中途换网络，内核的出站网卡绑定（<c>dialer.DefaultInterface</c> =
+        ///   桥侧 <c>rebindInterface()</c> 在 <c>Bridge.Start</c> 里存的那个<b>网卡名</b>）
+        ///   一直是连接那一刻的旧值。
+        ///
+        /// 【三档】
+        ///   0 = 完全不订阅 = 本批改动之前逐字一致。
+        ///   1 = ★ 默认。订阅 <c>NetworkStatusChanged</c>（本机 winmd 里
+        ///       <c>NetworkInformation</c> 唯一的事件，见 <see cref="NetworkFollow"/> 类注释），
+        ///       比对"物理网络指纹"（适配器身份 + IANA 类型 + 本机 IPv4/IPv6 地址；
+        ///       ★ 不含 DNS —— <c>NetworkAdapter</c> 没有枚举 DNS 的成员，如实写在这里），
+        ///       变化就作废节点路由缓存（换网后上一个网络里解析出的节点 IP 不可信）并记
+        ///       <c>channel=net-follow</c>；<b>不动桥、不发 HTTP</b>。
+        ///   2 = 在 1 之上，指纹真变了就<b>请求桥重绑</b>：再调一次
+        ///       <c>clash_bridge_start</c>，走 Go 侧"已启动"分支
+        ///       （<c>core.go:132-137</c> 就是为这条路写了 <c>rebindInterface()</c>）。
+        ///
+        /// ★【为什么默认不是 2】两条前提都没读回来（细节见 <see cref="NetworkFollow"/> 类注释）：
+        ///   ① 这个事件在 <b>vpnClient 后台任务进程</b>里收不收得到 —— Docs/12 §6 只证明了
+        ///      winmd 里有（"文档级结论，未实测"）；
+        ///   ② "同进程第二次 <c>clash_bridge_start</c>"在本项目有前科（Docs/05 §2④：
+        ///      桥常驻就是为了绕开它）。
+        ///   ⇒ 档 1 的"证据行"正是把①读回来的手段；②被验之前不抬默认
+        ///     （口径同 <see cref="EncapReturn"/> 的档 5、<see cref="SessionReset"/> 的档 1/2）。
+        /// </summary>
+        internal static int NetFollow = 1;
+
         internal static void Load()
         {
             // 先恢复默认，避免上一次连接的值残留到本次
@@ -423,6 +456,7 @@ namespace ClashUWP.Vpn
             FailFast = true;
             // ★ 默认 0 = 不清（理由见字段注释：两个未验前提）。字段初始值与这里必须一致。
             SessionReset = 0;
+            NetFollow = 1;
             Source = "默认值";
 
             try
@@ -457,6 +491,7 @@ namespace ClashUWP.Vpn
                 FakeIp = ReadBool(map, "fakeIp", FakeIp);
                 FailFast = ReadBool(map, "failFast", FailFast);
                 SessionReset = ReadInt(map, "sessionReset", SessionReset, 0, 2);
+                NetFollow = ReadInt(map, "netFollow", NetFollow, 0, 2);
                 Source = "settings.txt";
             }
             catch
@@ -466,7 +501,7 @@ namespace ClashUWP.Vpn
 
             // ★ 这一行是发布版最值钱的日志：把<b>本次真正生效</b>的开关原样打出来。
             //   之前出过一次只有这里能抓到的事故 —— ReadInt 硬编码 0..2 上界，
-            //   settings.txt 写 encapReturn=4 却被静默回落 2，"实验臂看着切换了、
+            //   settings.txt 写 encapReturn=4 却被静默落回 2，"实验臂看着切换了、
             //   其实没切"。光看 settings.txt 永远发现不了，必须看读到什么。
             //   同时记 log=...：日志自己丢了多少行，决定这行以下还能不能信。
             RollingLog.Info("settings",
@@ -477,6 +512,7 @@ namespace ClashUWP.Vpn
                 $"fakeIp={(FakeIp ? 1 : 0)} failFast={(FailFast ? 1 : 0)} " +
                 $"watchdog={(SessionWatchdog ? 1 : 0)} statusToast={(StatusToast ? 1 : 0)} " +
                 $"sessionReset={SessionReset} " +
+                $"netFollow={NetFollow} " +
                 $"{RollingLog.Diag()}");
         }
 

@@ -63,13 +63,24 @@ namespace ClashUWP.Vpn
             try
             {
                 HashSet<string> hosts = ExtractHosts(configYaml);
-                Dictionary<string, List<string>> map = LoadOrCreateCache(out bool fresh);
+                Dictionary<string, List<string>> map = LoadOrCreateCache(out bool fresh, out bool stale);
 
-                if (!fresh && hosts.Count > 0)
-                    RefreshBlocking(map, hosts);
+                // ★【1.0.38 · G6】stale（文件里的 Stale= 行，或进程内 _staleReason）优先级高于 TTL：
+                //   它的语义是"这批结果是在上一个网络里量出来的"。见 Invalidate 的注释。
+                bool forceAll = stale || _staleReason.Length > 0;
+                bool allOk = true;
+                if (forceAll || (!fresh && hosts.Count > 0))
+                    allOk = RefreshBlocking(map, hosts, forceAll);
+
+                // 只有"这一轮真的把所有人都重解析成功"才清掉作废标记：
+                //   预算用完 / 个别域名解析失败时保留旧值，同时把标记留到下一次连接 ——
+                //   否则 SaveCache 会写一个新的 Time=，失败的那几条就要再等 6 小时才会重试。
+                _staleReason = (forceAll && !allOk)
+                    ? (_staleReason.Length > 0 ? _staleReason : "上轮重解析未全部成功")
+                    : "";
 
                 // 落盘（尽力而为，写失败不影响本次连接）
-                SaveCache(map);
+                SaveCache(map, _staleReason);
 
                 var cidrs = new List<string>();
                 var seen = new HashSet<string>();
@@ -89,6 +100,81 @@ namespace ClashUWP.Vpn
             {
                 return new List<string>();
             }
+        }
+
+        /// <summary>
+        /// ★【1.0.38 · G6】作废这份缓存 —— 换网络之后，"节点域名/IP → 可达 IPv4"这个映射
+        /// 是在<b>上一个网络</b>里量出来的，不能接着信（不同运营商对同一域名给的答案可以完全不同，
+        /// 而排除路由错一条就是节点拨号包被自家隧道抓回去）。
+        ///
+        /// 【为什么只打标记、不删文件】本类注释里那条口径不能丢：
+        ///   "刷新失败一律回退上一份缓存 —— 少几条排除路由远好于插件抛异常导致连接失败"。
+        ///   删掉文件 = 下一次连接如果解析失败，连"旧值"这个兜底都没有。
+        ///   所以这里写一行 <c>Stale=原因</c> 进缓存文件：
+        ///   <see cref="LoadOrCreateCache"/> 读到它就把<b>所有</b> host 重新解析一遍
+        ///   （<see cref="RefreshBlocking"/> 的 <c>forceAll</c>），
+        ///   解析失败的 host 保留旧值，成功后连这行标记一起清掉。
+        ///
+        /// 【为什么不在这里立刻重解析】解析必须在<b>隧道外</b>做才可信（类注释同一句），
+        ///   而调用点是会话<b>中途</b>的网络变化事件 —— 此刻解析走的是隧道，
+        ///   结果比旧值更不可信（memory「VPN forensics metric traps」那条口径）。
+        ///   所以本方法只是把"下一次连接必须重量"这件事写进档案，不动网络。
+        /// ★ 进程内也同时记一份：文件写不了（极少见）时，本进程的下次连接仍会重解析。
+        /// </summary>
+        internal static void Invalidate(string reason)
+        {
+            _staleReason = string.IsNullOrWhiteSpace(reason) ? "未记原因" : reason.Replace("\r", " ").Replace("\n", " ");
+            try
+            {
+                StorageFile file = ApplicationData.Current.LocalFolder
+                    .GetFileAsync(CacheFileName).AsTask().GetAwaiter().GetResult();
+                string text = FileIO.ReadTextAsync(file).AsTask().GetAwaiter().GetResult();
+
+                // 把旧的 Stale= 行去掉，新的插在开头（读的时候只看第一处，保持一行一个键的形态）。
+                var sb = new StringBuilder();
+                sb.AppendLine($"Stale={_staleReason}");
+                foreach (string raw in text.Replace("\r\n", "\n").Split('\n'))
+                {
+                    string l = raw.Trim();
+                    if (l.StartsWith("Stale=", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (l.Length > 0)
+                        sb.AppendLine(l);
+                }
+                FileIO.WriteTextAsync(file, sb.ToString()).AsTask().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                // 标记写不进去不影响进程内那份，只是"进程重建后可能沿用旧缓存"，
+                // 这条得留在日志里，不然就成了静默失效。
+                RollingLog.Warn("node-routes", $"作废标记写入失败={ex.GetType().Name}（进程内标记仍有效：{_staleReason}）");
+            }
+        }
+
+        private static string _staleReason = "";
+
+        /// <summary>缓存档案的头两行（<c>Time=…</c> / 有没有 <c>Stale=…</c>），诊断快照用。</summary>
+        internal static string DescribeCacheAge()
+        {
+            try
+            {
+                StorageFile file = ApplicationData.Current.LocalFolder
+                    .GetFileAsync(CacheFileName).AsTask().GetAwaiter().GetResult();
+                string text = FileIO.ReadTextAsync(file).AsTask().GetAwaiter().GetResult();
+                string time = "无时间戳";
+                bool stale = false;
+                foreach (string raw in text.Split('\n'))
+                {
+                    string l = raw.Trim();
+                    if (stale && time != "无时间戳") break;
+                    if (l.StartsWith("Time=", StringComparison.OrdinalIgnoreCase))
+                        time = l.Substring(5);
+                    else if (l.StartsWith("Stale=", StringComparison.OrdinalIgnoreCase))
+                        stale = true;
+                }
+                return time + (stale ? " (已作废待重解析)" : "");
+            }
+            catch { return _staleReason.Length > 0 ? "无缓存（进程内已标作废）" : "无缓存"; }
         }
 
         /// <summary>从 YAML 文本里抠出所有 server 字段值（去重、去空）。</summary>
@@ -124,13 +210,18 @@ namespace ClashUWP.Vpn
 
         private static bool IsIpv6(string v) => v.Contains(':') && v.IndexOf('.') < 0;
 
-        private static void RefreshBlocking(Dictionary<string, List<string>> map, HashSet<string> hosts)
+        /// <param name="forceAll">
+        /// true = 缓存就算没过期也重解析（换网后的作废标记）；false = 只补缓存里缺的。
+        /// </param>
+        /// <returns>true = 所有待解析 host 都拿到了结果；false = 有失败/预算用完（保留旧值）。</returns>
+        private static bool RefreshBlocking(Dictionary<string, List<string>> map, HashSet<string> hosts, bool forceAll)
         {
-            // 需要解析的：缓存里没有的、或值里含 IPv4 的无需解析。
+            // 需要解析的：缓存里没有的；forceAll 时连缓存里有的也重来。
             var pending = new List<string>();
             foreach (string host in hosts)
             {
-                if (map.TryGetValue(host, out List<string>? cached) && cached.Count > 0)
+                if (!forceAll &&
+                    map.TryGetValue(host, out List<string>? cached) && cached.Count > 0)
                     continue;
 
                 if (IPAddress.TryParse(host, out IPAddress? literal))
@@ -149,19 +240,26 @@ namespace ClashUWP.Vpn
 
             // 缓存里已有的 IPv4 字面量条目不重复解析；只补差集。
             if (pending.Count == 0)
-                return;
+                return true;
 
+            bool allOk = true;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             foreach (string host in pending)
             {
                 int left = ResolveBudgetMs - (int)sw.ElapsedMilliseconds;
                 if (left <= 200)
+                {
+                    allOk = false;
                     break; // 预算用完：剩下的沿用旧值/空缺，下次连接再补
+                }
                 try
                 {
                     var task = Dns.GetHostAddressesAsync(host);
                     if (!task.Wait(left))
+                    {
+                        allOk = false;
                         break; // 超时说明本网段解析已经不通，继续也没意义
+                    }
                     List<string> v4 = task.Result
                         .Where(a => a.AddressFamily == AddressFamily.InterNetwork)
                         .Select(a => a.ToString())
@@ -172,13 +270,16 @@ namespace ClashUWP.Vpn
                 catch
                 {
                     // 解析失败保留旧值（不覆盖成空，避免一次抖动把排除路由全丢掉）
+                    allOk = false;
                 }
             }
+            return allOk;
         }
 
-        private static Dictionary<string, List<string>> LoadOrCreateCache(out bool fresh)
+        private static Dictionary<string, List<string>> LoadOrCreateCache(out bool fresh, out bool stale)
         {
             fresh = false;
+            stale = false;
             var map = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             try
             {
@@ -195,6 +296,13 @@ namespace ClashUWP.Vpn
                             fresh = true;
                         continue;
                     }
+                    // ★【1.0.38 · G6】作废标记：只置位、不当 host 解析
+                    //   （否则 map 里会多出一条 "Stale = 网络变化:…"，它还会被当成节点 IP 拼成路由）。
+                    if (l.StartsWith("Stale=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        stale = true;
+                        continue;
+                    }
                     if (l.Length == 0 || !l.Contains('='))
                         continue;
                     int idx = l.IndexOf('=');
@@ -208,17 +316,22 @@ namespace ClashUWP.Vpn
             catch
             {
                 fresh = false;
+                stale = false;
                 map.Clear();
             }
             return map;
         }
 
-        private static void SaveCache(Dictionary<string, List<string>> map)
+        private static void SaveCache(Dictionary<string, List<string>> map, string staleReason)
         {
             try
             {
                 var sb = new StringBuilder();
                 sb.AppendLine($"Time={DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                // ★【1.0.38 · G6】重解析没全部成功时，把这行原样写回去
+                //   —— Time= 是"上次成功落盘时间"，它不能替 Stale= 表达"结果还是旧网络的"。
+                if (!string.IsNullOrEmpty(staleReason))
+                    sb.AppendLine($"Stale={staleReason}");
                 foreach (KeyValuePair<string, List<string>> kv in map.OrderBy(k => k.Key))
                     sb.AppendLine($"{kv.Key}={string.Join(",", kv.Value)}");
 
