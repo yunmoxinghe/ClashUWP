@@ -15,6 +15,14 @@
 
     ★ 本工程不碰 VPN 隧道本身:它只是把一行命令发给主进程,
       命令语义与纪律(碰隧道的命令必须由人明确下发)与 debug-cmd 文件回路一致。
+      1.0.2 起这条纪律落成了代码而不是注释:CommandCatalog 给每条命令标 read/state/tunnel,
+      connect/recreate/probe 不带 force 开关会被本地拦下并返回退出码 7;
+      disconnect 刻意不拦 —— 它是把网络还回去的逃生口。
+
+    ★ 文件划分(1.0.2):Program.cs 只做路由,命令表 / 通道 / 探测 / guard / doctor / selftest
+      各自成文件。理由很实在:以前命令清单只活在 Usage() 的一行字符串里,
+      和主应用 DebugCommandLoop 的注释各说各话,不知道命令的人必须先读 app 源码才敢下发。
+      现在 help、commands 的 json 输出、本地参数校验、危险闸门读同一张表。
   -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -27,7 +35,7 @@
     <DefaultLanguage>zh-CN</DefaultLanguage>
     <Platforms>x64;arm64</Platforms>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
 
     <!--
       ★ Native AOT —— 官方对"可执行文件/CLI"的推荐发布形态
@@ -37,7 +45,7 @@
                                      且目标机必须装了 .NET 10 运行时才能跑;
         Native AOT              = clashuwp-cli.exe 单文件 4.17 MB,零运行时依赖。
 
-      ★ AOT 会不会把 WinRT 投影跑挂?已用 selftest 命令(见 Program.cs)实测:
+      ★ AOT 会不会把 WinRT 投影跑挂?已用 selftest 命令(见 SelfTest.cs)实测:
         ValueSet 读写 / AppServiceConnection 构造与属性回读 / PackageManager 枚举(236 个包) /
         OpenAsync 异步跨 ABI 通路(不存在包→AppNotInstalled,干净返回) —— 4 项全 PASS。
         注:AOT 编译<b>通过</b>并不代表投影可用,这类泛型接口(IDictionary<string,object>)
@@ -49,6 +57,10 @@
         是把布局目录整个塞进包,留着就等于把符号表打进可分发的 msix。
         Debug 配置仍然生成 pdb(排障要用)。
       RuntimeIdentifier 按 Platform 映射,让 `dotnet publish -c Release` 不带 -r 也能出 AOT。
+
+      ★ 别把 CommandCatalog.JsonText() 改成 System.Text.Json 序列化对象:
+        AOT 下反射式序列化要么裁剪告警要么运行时炸(source-gen 又要引包)。
+        那张表就是一维数组,手写两个 StringBuilder 就出来了,而且零运行时风险。
     -->
     <PublishAot>true</PublishAot>
     <StripSymbols>true</StripSymbols>

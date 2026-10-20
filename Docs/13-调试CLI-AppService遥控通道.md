@@ -65,6 +65,12 @@ OnBackgroundActivated
 
 ## 4. 客户端 `clashuwp-cli`（`ClashUWP.Cli\Program.cs`）
 
+> **1.0.2 起本节只讲通道**。客户端已从单文件 `Program.cs` 拆成
+> 命令表 / 通道 / 探测 / guard / doctor / selftest 六个文件，新增自说明书（`help`、
+> `--commands --json`）、危险命令 `--force` 闸门、`doctor` 六阶段体检与 `guard` 连通性兜底，
+> 并以 `ClashUWP.Cli_1.0.2.0_x64.msix` 重新打包 —— 见 Docs/28。
+> 下面这段协议描述仍然有效：两条通道（AppService 与 `debug-cmd.txt`）共用一张命令表。
+
 协议与文件回路逐字对齐：请求 `ValueSet{["cmd"]=单行命令}`，响应 `ValueSet{["out"]=原文}` 或 `["error"]=原因`；命令行剩余参数用**一个空格**拼回单行，所以带空格的节点名加引号照抄即可。
 
 ```

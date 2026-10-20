@@ -26,13 +26,13 @@
   <Identity
     Name="ClashUWP.Cli"
     Publisher="CN=gold"
-    Version="1.0.1.0" />
+    Version="1.0.2.0" />
 
   <Properties>
     <DisplayName>ClashUWP.Cli</DisplayName>
     <PublisherDisplayName>gold</PublisherDisplayName>
     <!-- ★ 官方指南 4.4 要求 Properties 里写 Description（Store 提交与设置页"应用信息"读它）。 -->
-    <Description>Debug CLI for ClashUWP: sends one-line commands to the app over AppService.</Description>
+    <Description>Self-documenting CLI for ClashUWP: read-only remote control, doctor health check and guard connectivity fallback over AppService.</Description>
     <Logo>Assets\StoreLogo.png</Logo>
     <uap10:PackageIntegrity>
       <uap10:Content Enforcement="on"/>
