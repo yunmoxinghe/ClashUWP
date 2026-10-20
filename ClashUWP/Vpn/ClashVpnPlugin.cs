@@ -83,6 +83,26 @@ namespace ClashUWP.Vpn
         /// <summary>进程级桥是否刻意留在跑动状态（内核常驻策略，见 Disconnect 的注释）。</summary>
         private static bool s_bridgeResident;
         /// <summary>
+        /// ★【1.0.79 · 实测根因】本进程<b>真的</b>把 mihomo 内核起来过（<c>clash_bridge_start</c>
+        /// 返回 0，或 Go 侧回 <c>already started</c>）且尚未成功 <c>stop</c>。
+        ///
+        /// 【为什么必须和 <see cref="s_bridgeResident"/> 分开】
+        /// <c>s_bridgeResident</c> 的语义是"策略上把内核留给下一次连接复用"，可它在两条
+        /// <b>从没起过内核</b>的路径上也会被置真：① 会话收尾（<c>TearDownAsync</c>）只看
+        /// <c>residentBridge</c> 开关，不看这次会话到底走到没走到步 7；② <c>Start</c> 失败的
+        /// catch 同理。于是"空壳不拨号"这类在建桥之前就 abort 的会话，会把一个<b>不存在的
+        /// 常驻内核</b>留给下一次连接。
+        /// 2026-10-20 06:50:54→06:52:44（pid=19060）实测的形状就是这条：
+        /// 第一次 abort（<c>会话结束，存活 0s encap=0 inj=0</c>）→ 第二次连接
+        /// <c>复用常驻内核（排空 0 包）</c> 起了泵却没起内核 ⇒ 整段会话
+        /// <c>inj=0</c>、<c>fake-ip=NO:解析超时</c>、<c>内核=HttpRequestException</c>，
+        /// 58 s 后被插件看门狗判死删 profile —— 看门狗是对的，被它杀掉的是一条<b>必然死</b>的隧道。
+        /// 自此：<c>s_bridgeResident = s_kernelStarted && 常驻开关</c>，
+        /// "复用"只能以"确实起过"为前提；万一状态仍与实情不符，Go 侧的
+        /// <c>already started</c>（rc=-2）仍是兜底。
+        /// </summary>
+        private static bool s_kernelStarted;
+        /// <summary>
         /// ★【1.0.70 · G7】当前常驻内核的 gvisor 栈是否<b>以 v6 形态</b>建起来的
         /// （= 最近一次全量 Start 时 <c>ipv6</c> 档为 2）。
         ///
@@ -906,12 +926,17 @@ namespace ClashUWP.Vpn
                         try { s_boundIfaceSnapshot = MihomoBridge.BoundInterface(); } catch { }
                         MihomoBridge.clash_bridge_stop();
                         s_bridgeResident = false;
+                        s_kernelStarted = false;
                         s_bridgeKernelV6 = false;
                     }
                     else
                     {
                         DrainBridgeQueue();
-                        s_bridgeResident = true;
+                        // ★【1.0.79】这里曾经是<b>无条件</b> s_bridgeResident = true，
+                        //   而这条 catch 有一半情况是"步 7 之前"就失败了（空壳不拨号 / Start 抛），
+                        //   内核根本没起过 ⇒ 下一次连接会去复用一个不存在的常驻内核。
+                        //   现在以"确实起过"为前提（见 <see cref="s_kernelStarted"/>）。
+                        s_bridgeResident = s_kernelStarted;
                     }
                 }
                 if (ReferenceEquals(s_activeChannel, channel))
@@ -1892,15 +1917,25 @@ namespace ClashUWP.Vpn
 
                 if (LocalSettings.ResidentBridge)
                 {
-                    s_bridgeResident = true;
-                    _bridgeDiag += $"｜会话结束，内核常驻（排空回程 {drained} 包）";
+                    // ★【1.0.79 · 实测根因】曾经这里是<b>无条件</b> <c>true</c>：这条收尾对
+                    //   "会话到底走到没走到步 7"一无所知。空壳不拨号 / Start 之前任何 abort
+                    //   都会走到这里，于是把"没起过的内核"标成常驻留给下一次连接 ——
+                    //   下一次连接跳过 clash_bridge_start，隧道照装、泵照挂，但<b>没有内核</b>：
+                    //   实测 <c>encap=281 inj=0</c> + <c>fake-ip=NO:解析超时</c> +
+                    //   <c>内核=HttpRequestException</c>，58 s 后被插件看门狗判死删 profile。
+                    //   口径同 <see cref="s_kernelStarted"/>：策略只能建立在事实之上。
+                    s_bridgeResident = s_kernelStarted;
+                    _bridgeDiag += $"｜会话结束，内核{(s_bridgeResident ? "常驻" : "（本进程没起过内核）")}" +
+                                   $"（排空回程 {drained} 包）";
                     channel.LogDiagnosticMessage(
-                        $"ClashUWP: 回程泵已退出、排空 {drained} 包，mihomo 内核保持常驻.");
+                        $"ClashUWP: 回程泵已退出、排空 {drained} 包，" +
+                        (s_bridgeResident ? "mihomo 内核保持常驻." : "本进程未曾起内核，下次连接将全量启动."));
                 }
                 else
                 {
                     MihomoBridge.clash_bridge_stop();
                     s_bridgeResident = false;
+                    s_kernelStarted = false;
                     s_bridgeKernelV6 = false;
                     channel.LogDiagnosticMessage("ClashUWP: mihomo 内核随会话停止（residentBridge=0）.");
                 }
@@ -2107,6 +2142,7 @@ namespace ClashUWP.Vpn
                         RollingLog.Error("bridge-start", "为重建 v6 栈停桥抛异常: " + ex.Message, ex);
                     }
                     s_bridgeResident = false;
+                    s_kernelStarted = false;
                     s_bridgeGlobal = false;
                 }
 
@@ -2185,6 +2221,10 @@ namespace ClashUWP.Vpn
                 {
                     // 桥已在跑（常驻或残留）：泵改挂到当前 channel，数据面继续可用。
                     s_bridgeResident = true;
+                    // ★【1.0.79】走到这里只有两种可能：上一会话确实起过内核并留着，
+                    //   或 Go 侧刚回过 already started —— 两者都等于"内核确实活着"，
+                    //   所以事实位跟策略位一起置真（见 <see cref="s_kernelStarted"/>）。
+                    s_kernelStarted = true;
                     s_bridgeGlobal = true;
                     _bridgeDiag = $"复用常驻内核（排空 {drained} 包" +
                                   (configChanged ? "，配置已变 → 尝试热重载" : "，配置未变") + "）";
@@ -2216,6 +2256,7 @@ namespace ClashUWP.Vpn
                 {
                     s_bridgeGlobal = true;
                     s_bridgeResident = true;
+                    s_kernelStarted = true;   // ★【1.0.79】clash_bridge_start 返回 0：内核事实存在
                     // ★【1.0.70 · G7】栈的地址族在这一刻定死，供下一轮判断要不要重建。
                     s_bridgeKernelV6 = LocalSettings.Ipv6 >= 2;
                     _bridgeDiag = $"本进程首次启动（排空 {drained} 包，v6栈={(s_bridgeKernelV6 ? "on" : "off")}）";

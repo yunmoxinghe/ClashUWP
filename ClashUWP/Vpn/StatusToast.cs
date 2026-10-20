@@ -75,6 +75,22 @@ namespace ClashUWP.Vpn
     ///   因为只要隧道还在跑，这条状态通知就会一直被补回来 —— 想清静只有从设置入手。
     ///   限流两条：<c>MaxReRaise</c> 次之后这个会话就放手（划 4 次还在来是骚扰）；
     ///   引导通知记在 <c>LocalState\toast-guide.txt</c>，同一天不重发。
+    ///   ★★【1.0.79 · Docs/30 §8-E 实测订正】上面这段写完时<b>整机没验过</b>，验下来是错的：
+    ///     ① 系统会把这条通知按自己的寿命撤下，原因是 <c>TimedOut</c> —— 那不是"用户划掉"，
+    ///       可旧逻辑把它一起计进 <c>MaxReRaise</c>，实测 <b>5 秒</b>就把额度烧光、
+    ///       从此这个会话不再刷状态通知（"常驻"从未成立），还顺手给每个会话发一条引导横幅。
+    ///     ② "设 <c>ExpirationTime</c> 就能常驻"也已被官方文档证伪：那个属性的 Remarks 是
+    ///       "<i>Windows attempts to raise toast notifications immediately after you call Show,
+    ///       so this property is rarely used</i>"，"到点移除"那句只适用于 Windows Phone 8.x。
+    ///     现在的口径（<b>1.0.80 定稿</b>）：<b>只有 <c>UserCanceled</c> 算划掉</b>（计额度、发引导）；
+    ///     <c>TimedOut</c> 对 <c>SuppressPopup</c> 的静默通知而言是<b>立刻就会来的正常回调</b>，
+    ///     它只记账、<b>不清 <c>_shown</c>、不补发</b>，循环继续对同一条 <c>Update</c> 原地刷新
+    ///     （1.0.79 实测：把 TimedOut 当"没了" ⇒ <b>42 次 / 44 秒</b>的每秒重发自我循环）；
+    ///     真离场的原因（<c>Expired</c> / <c>ApplicationHidden</c> / <c>SystemCanceled</c> /
+    ///     <c>PassiveDismissed</c> / <c>update:NotificationNotFound</c>）才走
+    ///     <c>ReRaiseThrottleSeconds</c>=30 s 节流补发 ——
+    ///     通知在通知中心能留多久归系统/用户设置管，我们只负责"它真不在了才补回来"，
+    ///     并且把每一次补发原因如实记进日志（不再用"常驻"这个词骗自己）。
     ///
     /// 【纪律】这里<b>不碰隧道、不碰网络、不碰内核</b>：只读计数、只发通知。
     ///   会话结束（<c>Disconnect</c>）时 <see cref="Stop"/> 会把常驻那条撤掉（<c>Hide</c>），
@@ -92,8 +108,28 @@ namespace ClashUWP.Vpn
         /// <summary>一拍 1 s，与安卓 <c>ticker(TimeUnit.SECONDS.toMillis(1))</c> 同频。</summary>
         private const int IntervalMs = 1000;
 
-        /// <summary>一个会话内最多补发几次；超过就撤掉循环，这个会话不再刷状态通知。</summary>
+        /// <summary>
+        /// 一个会话内，<b>被用户划掉</b>最多补发几次；超过就放手（划 4 次还在来是骚扰）。
+        /// ★【1.0.79 · Docs/30 §8-E】这条额度以前把 <c>TimedOut</c> 也计进来了 ——
+        ///   而 TimedOut 是 toast 的<b>正常寿命</b>（横幅到点自己收），实测每个会话都在
+        ///   5 秒内被它烧光额度并"放弃刷状态通知"，还顺手给所有人发一条会出横幅的引导通知。
+        ///   现在只有 <c>UserCanceled</c> 计额度。
+        /// </summary>
         private const int MaxReRaise = 3;
+
+        /// <summary>
+        /// ★【1.0.79 · Docs/30 §8-E】<b>真离场</b>原因的补发限流（秒）：我们从 <c>Update</c>
+        ///   返回值只知道"它不在了"（<c>NotificationNotFound</c>，分不清谁干的），
+        ///   或平台给了 <c>Expired</c> / <c>ApplicationHidden</c> / <c>SystemCanceled</c> /
+        ///   <c>PassiveDismissed</c> —— 这些都要补发，但仍然要节流：
+        ///   实测这类回调会在 1–2 秒内连续命中，不限流就变成每秒重 Show 一次。
+        ///   ★【1.0.80】<c>TimedOut</c> <b>不再走这里</b>：静默通知（SuppressPopup）Show 之后
+        ///     它立刻就回来，而通知其实还在通知中心 —— 把它当"没了"就是 1.0.79 那个
+        ///     每秒一条 Show 的自我循环（42 次 / 44 秒）。现在它只记账，见 <c>HandleDismissed</c>。
+        ///   30 s 的口径：隧道一跑就是几分钟到半小时，通知中心里那条"在不在"用户不看细节，
+        ///   但也不能像 1.0.78 那样 5 秒就永久放手。
+        /// </summary>
+        private const int ReRaiseThrottleSeconds = 30;
 
         // 绑定名：XML 里写成 {key}，NotificationData.Values 用同名（官方绑定的就是这套占位）。
         private const string KeyTitle = "statusTitle";
@@ -113,6 +149,9 @@ namespace ClashUWP.Vpn
         private static int _dismissCount;
         private static int _guideSentThisSession;
         private static bool _gaveUp;
+
+        /// <summary>★【1.0.79】上一次静默补发的时刻（限流用，UTC；只在循环线程读写）。</summary>
+        private static DateTime _lastReRaiseUtc = DateTime.MinValue;
 
         // Dismissed 事件在<b>平台回调线程</b>上触发，动手的却是循环线程（只有一个线程改 _shown）。
         // 所以回调只立牌子：先写原因，再 Volatile.Write 置位 —— 与本仓其它跨线程标记同一口径。
@@ -164,6 +203,7 @@ namespace ClashUWP.Vpn
             _guideSentThisSession = 0;
             _gaveUp = false;
             _showFailCount = 0;
+            _lastReRaiseUtc = DateTime.MinValue;
             _dismissWhy = "";
             Volatile.Write(ref _dismissPending, 0);
 
@@ -191,8 +231,20 @@ namespace ClashUWP.Vpn
                     var n = _notifier;
                     if (n != null)
                     {
-                        Hide(n);
-                        RollingLog.Info("toast", $"已撤下状态通知（{why}）");
+                        // ★【1.0.79 · Docs/30 §8-E】只在"我们认为它还在"时才 Hide：
+                        //   官方对 Hide 的前提是这条通知当前挂着，实测在通知已被系统按寿命撤下、
+                        //   循环早已放手之后再 Hide，平台直接回
+                        //   <c>COMException: 通知无法隐藏，除非它已经显示</c> ——
+                        //   那是一条纯噪音的 Error 级日志，会把真问题盖住。
+                        if (_shown != null)
+                        {
+                            Hide(n);
+                            RollingLog.Info("toast", $"已撤下状态通知（{why}）");
+                        }
+                        else
+                        {
+                            RollingLog.Info("toast", $"无需撤下（通知早已不在，{why}）");
+                        }
                     }
                     _notifier = null;
                     _shown = null;
@@ -274,8 +326,14 @@ namespace ClashUWP.Vpn
                     if (!ReferenceEquals(_cts, own)) return;
 
                     // 快通道：Dismissed 回调只立牌子，动手在这里（保证只有一个线程改 _shown）。
-                    if (Interlocked.Exchange(ref _dismissPending, 0) == 1)
-                        HandleDismissed(notifier, _dismissWhy, rate, total);
+                    // ★【1.0.80】"它在不在"这件事<b>全部交给 HandleDismissed 判定</b>，这里不再
+                    //   抢先清 <c>_shown</c> —— 牌子只有原因字符串，而"这个原因等不等于没了"
+                    //   是 HandleDismissed 的职责（见它的方法注释）。两处各判一次，
+                    //   1.0.79 实测就是这样把一条明明还在通知中心的通知每秒重发一次。
+                    bool dismissedNow = Interlocked.Exchange(ref _dismissPending, 0) == 1;
+                    string dismissWhy = _dismissWhy;
+                    if (dismissedNow)
+                        HandleDismissed(notifier, dismissWhy, rate, total);
 
                     if (_gaveUp)
                     {
@@ -287,6 +345,10 @@ namespace ClashUWP.Vpn
 
                     if (_shown == null)
                     {
+                        // ★ 节流闸门：上一次引发不满 ReRaiseThrottleSeconds 就不再试
+                        //   （用户划掉那条例外 —— HandleDismissed 里已经当场补过发了）。
+                        if ((DateTime.UtcNow - _lastReRaiseUtc).TotalSeconds < ReRaiseThrottleSeconds)
+                            continue;
                         ShowSilent(notifier, rate, total);
                         continue;
                     }
@@ -323,34 +385,89 @@ namespace ClashUWP.Vpn
         /// <summary>
         /// 处理"通知已经不在通知中心"：静默补发（限流）+ 引导通知（会话一次 / 一天一次）。
         /// 只在循环线程上调用（两个入口 —— Dismissed 牌子、Update 返回值 —— 都汇到这里）。
+        ///
+        /// ★【1.0.79 · Docs/30 §8-E】原因必须<b>分类</b>，不能一律当"用户划掉"：
+        ///   官方对 <c>ToastDismissedReason</c> 的口径里 <c>TimedOut</c> = "通知到期了"，
+        ///   那是 toast 的<b>正常寿命</b>（横幅显示完自动收起），不是用户在表达"别烦我"。
+        ///   实测（Docs/30 §8-E 与 1.0.78 复现）：从"启动"到"本会话不再刷状态通知"
+        ///   总共 <b>5 秒</b>、用户一次没碰，四条全是 <c>dismissed:TimedOut</c> ——
+        ///   于是"常驻 ↑↓"从来没常驻过，人人都还收到一条本该只给"反复划掉的人"的引导横幅。
+        /// ★【1.0.80 · §8-E 实测把机制钉死】<c>TimedOut</c> <b>不等于"通知没了"</b>：
+        ///   我们这条是 <c>SuppressPopup=true</c> 的静默通知 —— 它<b>从来不弹横幅</b>，
+        ///   Show 之后系统只是把它放进通知中心，于是"显示时机结束"（= TimedOut）
+        ///   几乎<b>立刻</b>就回来了。1.0.79 装机实测：<c>07:13:46</c> 起
+        ///   <b>42 次 / 44 秒</b>，全是 <c>dismissed:TimedOut</c>，用户一次没碰 ——
+        ///   因为旧逻辑把它当成"没了"，清掉 <c>_shown</c> 又立刻重新 Show，
+        ///   新那条再 TimedOut……形成<b>每秒一条 Show 的自我循环</b>（比 1.0.78 的
+        ///   "5 秒烧光额度后彻底放手"更吵，而且一直在写平台）。
+        ///   ⇒ 现在：<c>TimedOut</c> 只<b>记账</b>，<b>不动 <c>_shown</c>、不补发</b>，
+        ///     循环继续对它 <c>Update</c> 原地刷新（这才是安卓版那条 ticker 的等价物）。
+        ///     通知到底还在不在，由 <c>Update</c> 的返回值说了算（<c>NotificationNotFound</c>
+        ///     /Failed 才当真没了）—— 这条判据不依赖事件、也不依赖我们的猜测。
+        ///
+        /// 【现在的分法】只有 <c>UserCanceled</c> 计 <see cref="MaxReRaise"/> 额度并发引导通知；
+        ///   真正离场的原因（<c>Expired</c> / <c>ApplicationHidden</c> / <c>SystemCanceled</c> /
+        ///   <c>PassiveDismissed</c>、以及 <c>update:NotificationNotFound</c>）
+        ///   清 <c>_shown</c> 并走 <see cref="ReRaiseThrottleSeconds"/> 限流补发；
+        ///   <c>TimedOut</c> 按上一段只记账。
+        ///
+        /// ★ 关于"想常驻就设 <c>ExpirationTime</c>"这条：已按官方文档<b>证伪</b> ——
+        ///   <see cref="ToastNotification.ExpirationTime"/> 的 Remarks 写的是
+        ///   "<i>Windows attempts to raise toast notifications immediately after you call Show,
+        ///   so this property is rarely used</i>"，而"到点从动作中心移除"那句被限定在
+        ///   "<i>For Windows Phone 8.x app</i>"。⇒ 它不是桌面端的常驻开关，本类不设它。
+        ///   toast 在通知中心能留多久由系统的通知设置决定（用户可清、可关），不在我们手里；
+        ///   所以我们能做、也只是做对的事 = <b>用 Update 的返回值判生死，发现它真不在了
+        ///   才按节流补回来</b>，并把这件事如实写进日志（不再假装"常驻"）。
         /// </summary>
         private static void HandleDismissed(ToastNotifier notifier, string why, string rate, string total)
         {
             int which = Interlocked.Increment(ref _dismissCount);
-            _shown = null;   // 平台说它不在了 ⇒ 我们也不再当它在（后续 Show 会重建并重新挂事件）
-            RollingLog.Info("toast", $"状态通知已消失（第 {which} 次，{why}）");
+            bool userCanceled = why.EndsWith(":UserCanceled", StringComparison.Ordinal);
+            bool timedOut = why.EndsWith(":TimedOut", StringComparison.Ordinal);
+            string kind = userCanceled ? "用户划掉：计补发额度"
+                : timedOut ? "横幅显示时机到期（静默通知必然立刻到期）：只记账，通知仍在通知中心"
+                : "非用户划掉：只按节流补发，不计额度";
+            RollingLog.Info("toast", $"状态通知回调（第 {which} 次，{why}，{kind}）");
 
-            if (_reRaised >= MaxReRaise)
+            // ★【1.0.80】横幅到期 ⇒ 对象还活着，什么都不动（下一拍照常 Update 它）。
+            if (timedOut && !userCanceled) return;
+
+            // 到这里的都是"平台说它不在了"：我们也不再当它在（后续 Show 会重建并重新挂事件）。
+            _shown = null;
+
+            if (userCanceled)
             {
-                _gaveUp = true;
+                if (_reRaised >= MaxReRaise)
+                {
+                    _gaveUp = true;
+                    RollingLog.Info("toast",
+                        $"用户已连续划掉 {which} 次，达到上限 {MaxReRaise} ⇒ 本会话放手，不再补发");
+                    return;
+                }
+                _reRaised++;
+                _lastReRaiseUtc = DateTime.UtcNow;
+                ShowSilent(notifier, rate, total);
+
+                if (Interlocked.Exchange(ref _guideSentThisSession, 1) == 0 && TryClaimGuideToday())
+                {
+                    try
+                    {
+                        ShowGuide(notifier);
+                        RollingLog.Info("toast", "已发引导通知（普通横幅 +「打开通知设置」按钮）");
+                    }
+                    catch (Exception ex)
+                    {
+                        RollingLog.Warn("toast",
+                            $"引导通知发不出 err={ex.GetType().Name}: {ex.Message}");
+                    }
+                }
                 return;
             }
-            _reRaised++;
-            ShowSilent(notifier, rate, total);
 
-            if (Interlocked.Exchange(ref _guideSentThisSession, 1) == 0 && TryClaimGuideToday())
-            {
-                try
-                {
-                    ShowGuide(notifier);
-                    RollingLog.Info("toast", "已发引导通知（普通横幅 +「打开通知设置」按钮）");
-                }
-                catch (Exception ex)
-                {
-                    RollingLog.Warn("toast",
-                        $"引导通知发不出 err={ex.GetType().Name}: {ex.Message}");
-                }
-            }
+            // 系统自己撤下的（TimedOut / ApplicationHidden）或从 Update 返回值分不清原因的
+            // （NotificationNotFound）：这里<b>只记账不补发</b> —— 补发统一由循环的节流闸门
+            // （_shown==null 那条）按 ReRaiseThrottleSeconds 决定，否则一秒一条 Show。
         }
 
         /// <summary>静默引发常驻那条：SuppressPopup + silent audio ⇒ 只进通知中心，不出横幅。</summary>
@@ -372,6 +489,10 @@ namespace ClashUWP.Vpn
 
                 notifier.Show(toast);
                 _shown = toast;
+                // ★【1.0.79 · §8-E】每一次"真的动了平台"都记时刻：循环那边的节流闸门读它。
+                //   失败路径<b>不</b>更新（失败要按 MaxShowFailures 连续计数尽快放手，
+                //   不该被节流拖成 5 次×30 秒）。
+                _lastReRaiseUtc = DateTime.UtcNow;
                 // 记下这一拍渲染的内容 —— "变了才刷"的比较基准必须包含 Show 带进去的那一份初值，
                 // 否则下一拍会拿旧基准做一次没意义的 Update。
                 _lastRate = rate;
