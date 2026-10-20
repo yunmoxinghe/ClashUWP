@@ -166,6 +166,17 @@ namespace ClashUWP.Backend
                     id, SystemProfileName(self, list));
                 if (activate)
                 {
+                    // ★【1.0.79 · Docs/30 §8-D】先把正文复制到内核实际读的 config.yaml，再记生效、再热重载。
+                    //   【曾经的坑】这一路只写了 subscriptions\{id}.yaml，config.yaml 是
+                    //   <see cref="ActivateAsync"/> 才写的 —— 而紧接着的
+                    //   <c>ReloadActiveConfigAsync</c> → <c>SubscriptionReload.RegenerateEffectiveFile()</c>
+                    //   第一句就是"读 config.yaml，不存在返回 null"。
+                    //   于是"拉取并启用"自己把热重载喂了个空，结果串末尾永远挂着那句
+                    //   "没有可重载的生效配置：config.yaml 不存在…"，用户看到的就是
+                    //   "拉下来了，但得再点一次启用才生效"（实测时间戳见 Docs/30 §8-D：
+                    //   fetch 落盘 03:07:58 → config.yaml 直到 03:09:27 才出现）。
+                    //   口径与 ActivateAsync 完全一致：同一份 text、同一个 ActiveName。
+                    await WriteAllTextAsync(ActiveName, text);
                     await SetActiveAsync(id);
                     // ★ UX 对齐 Verge：拉取并启用后原地热重载，不必断重连。
                     var reload = await ReloadActiveConfigAsync();

@@ -46,6 +46,59 @@ namespace ClashUWP.Vpn
         private static string PackageFamilyName => Windows.ApplicationModel.Package.Current.Id.FamilyName;
 
         /// <summary>
+        /// ★【1.0.79 · Docs/30 §8-F】这条 profile 的<b>名字</b>是否属于我们的产品族。
+        /// 唯一定义在 <see cref="GracefulTeardown.IsOurName"/>，这里只是转发 ——
+        /// 收尾侧和管理侧必须用同一把尺子，两处各写一遍早晚会漂移。
+        /// </summary>
+        private static bool IsOurName(string? name) => GracefulTeardown.IsOurName(name);
+
+        /// <summary>是不是<b>当前包家族</b>建的（官方 sample 的口径，最优先）。</summary>
+        private static bool IsCurrentFamily(VpnPlugInProfile pp) =>
+            pp.VpnPluginPackageFamilyName == PackageFamilyName;
+
+        /// <summary>
+        /// ★【1.0.79 · Docs/30 §8-F】"是不是我们的 profile" = <b>当前家族</b> 或 <b>我们的名字族</b> 任一命中。
+        ///
+        /// 【为什么不能只看家族】包家族后缀是<b>由签名证书算出来的</b>：同 CN 换一张证书，
+        /// 清单身份合法、数据面上却是另一个产品 —— 老 profile 的
+        /// <c>VpnPluginPackageFamilyName</c> 不再等于当前包家族，于是启动对账看不见它们、
+        /// prune 也清不掉它们 ⇒ 快速设置面板里挂着上一代产品的幽灵条目，当前代又新建一份同名的，
+        /// 用户看到两条都以为能连（本轮实测形状：`启动对账：订阅 0 份 + 基础 profile 1 条，新增 1`，
+        /// 而日志里 `profile 数=0`）。Docs/30 §5 记的那次重签（家族变成
+        /// <c>8B8CC4F4.ClashUWP_4tjvwvefxrz66</c>）就是把这条踩实的。
+        ///
+        /// 【为什么还要"优先当前家族"】命中旧家族是为了<b>看得见了就能收尾</b>（迁移式清理），
+        /// 不是为了拿它去连接 —— 旧家族的 <c>VpnPluginPackageFamilyName</c> 指向可能已注销的包，
+        /// 平台能否拉起插件没有实测背书。所以所有"取一条来用"的地方走
+        /// <see cref="PickOurs"/>：先同家族，取不到才退到名字族，并把这次"退路"记进日志。
+        /// </summary>
+        private static bool IsOurs(VpnPlugInProfile pp) =>
+            IsCurrentFamily(pp) || IsOurName(pp.ProfileName);
+
+        /// <summary>
+        /// 从一堆 profile 里按"先同家族、后名字族"取第一条命中 <paramref name="match"/> 的。
+        /// 命中旧家族时返回它并把 <c>tookForeign=true</c> 报出来 —— 调用方要能如实说
+        /// "这条不是本包装的，是上一代签名身份的残留"（能力边界要可见，口径同 Docs/12 §6）。
+        /// </summary>
+        private static VpnPlugInProfile? PickOurs(
+            IReadOnlyList<IVpnProfile> profiles,
+            Func<VpnPlugInProfile, bool> match,
+            out bool tookForeign)
+        {
+            tookForeign = false;
+            foreach (IVpnProfile p in profiles)
+                if (p is VpnPlugInProfile pp && IsCurrentFamily(pp) && match(pp))
+                    return pp;
+            foreach (IVpnProfile p in profiles)
+                if (p is VpnPlugInProfile pp && IsOurs(pp) && match(pp))
+                {
+                    tookForeign = true;
+                    return pp;
+                }
+            return null;
+        }
+
+        /// <summary>
         /// 找出属于我们这个包的 plugin profile。
         ///
         /// 【官方 sample 的做法】<c>GetMatchingProfilesAsync</c>：
@@ -53,23 +106,26 @@ namespace ClashUWP.Vpn
         /// results of this call."</i>
         /// 它按<b>包 family name</b> 过滤，而不是只比名字 ——
         /// 因为系统里可能同时存在别的 VPN app 建的同名 profile。
+        /// ★【1.0.79 · Docs/30 §8-F】在此之上再加"名字族"这条退路，且<b>同家族优先</b>：
+        ///   换签名证书＝换包家族哈希，只按家族匹配会让老条目彻底隐形（详见 <see cref="IsOurs"/>）。
+        ///   同名冲突的风险由"同家族优先 + 必须再按名字锁定主 profile"两层挡住。
         /// </summary>
         private static async Task<VpnPlugInProfile?> FindOurProfileAsync()
         {
             IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
-            foreach (IVpnProfile profile in profiles)
+            VpnPlugInProfile? ours = PickOurs(profiles, pp => pp.ProfileName == ProfileName, out bool foreign);
+
+            // sample 原文：var pluginProfile = profile as VpnPlugInProfile;
+            if (ours != null)
             {
-                // sample 原文：var pluginProfile = profile as VpnPlugInProfile;
-                if (profile is VpnPlugInProfile pluginProfile &&
-                    pluginProfile.VpnPluginPackageFamilyName == PackageFamilyName)
-                {
-                    // ★ 必须再按名字锁定主 profile：探测会在同一包下留下
-                    //   ClashUWP-Probe / ClashUWP-Dataface，只按 family 匹配会
-                    //   「删错对象」（2026-10-15 实测：recreate 删掉了残留 Probe，
-                    //   主 profile 反而没被重建）。
-                    if (pluginProfile.ProfileName == ProfileName)
-                        return pluginProfile;
-                }
+                if (foreign)
+                    RollingLog.Warn("profile-find",
+                        $"主 profile 命中的是旧签名家族的残留条目 family={ours.VpnPluginPackageFamilyName}");
+                // ★ 必须再按名字锁定主 profile：探测会在同一包下留下
+                //   ClashUWP-Probe / ClashUWP-Dataface，只按 family 匹配会
+                //   「删错对象」（2026-10-15 实测：recreate 删掉了残留 Probe，
+                //   主 profile 反而没被重建）。
+                return ours;
             }
             // 主 profile 不存在就返回 null，让调用方走「新建」；绝不把探测杂 profile
             // 当主 profile 交出去。
@@ -528,7 +584,14 @@ namespace ClashUWP.Vpn
                 foreach (IVpnProfile p in all)
                 {
                     if (p is not VpnPlugInProfile pp) continue;
-                    if (pp.VpnPluginPackageFamilyName != PackageFamilyName) continue;
+                    // ★【1.0.79 · Docs/30 §8-F】曾经这里是 `!= PackageFamilyName → continue`，
+                    //   于是换签名证书（＝换包家族哈希）之后，上一代自己建的 profile 对 prune
+                    //   <b>完全隐形</b>：面板里挂着幽灵条目，当前代又新建一份同名的。
+                    //   现在"名字族命中"也纳入清理（迁移式）。旧家族的条目到底删得掉删不掉
+                    //   <b>未实测</b>，所以每条都在结果串里标 [旧家族]，删除返回值如实进日志。
+                    if (!IsOurs(pp)) continue;
+                    if (!IsCurrentFamily(pp) && !IsOurName(pp.ProfileName)) continue;
+                    bool foreign = !IsCurrentFamily(pp);
 
                     string subId = VpnPluginConfig.Parse(pp.CustomConfiguration).SubId;
                     if (subId.Length == 0) continue;          // 基础 profile / 探测残留
@@ -556,7 +619,8 @@ namespace ClashUWP.Vpn
                     if (del == VpnManagementErrorStatus.Ok)
                     {
                         removed++;
-                        sb.Append($"\n删除[{pp.ProfileName}] subId={subId}");
+                        sb.Append($"\n删除[{pp.ProfileName}] subId={subId}" +
+                                  (foreign ? " [旧家族]" : ""));
                     }
                     else
                     {
@@ -577,19 +641,21 @@ namespace ClashUWP.Vpn
             return msg + (removed + skipped == 0 ? "" : sb.ToString());
         }
 
-        /// <summary>★【1.0.62】按 subId 找我们的订阅 profile：遍历同 PFN 的 profile，解析 CustomConfiguration 里的 subId。</summary>
+        /// <summary>
+        /// ★【1.0.62】按 subId 找我们的订阅 profile：遍历同 PFN 的 profile，解析 CustomConfiguration 里的 subId。
+        /// ★【1.0.79 · Docs/30 §8-F】口径改为 <see cref="IsOurs"/>（同家族优先，名字族兜底）：
+        ///   只按家族匹配时，换证书之后这条会"找不到 profile"，而面板里明明挂着那条订阅。
+        /// </summary>
         private static async Task<VpnPlugInProfile?> FindProfileBySubIdAsync(string subId)
         {
             IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
-            foreach (IVpnProfile p in profiles)
-            {
-                if (p is VpnPlugInProfile pp && pp.VpnPluginPackageFamilyName == PackageFamilyName)
-                {
-                    if (VpnPluginConfig.Parse(pp.CustomConfiguration).SubId == subId)
-                        return pp;
-                }
-            }
-            return null;
+            VpnPlugInProfile? pp = PickOurs(profiles,
+                p => VpnPluginConfig.Parse(p.CustomConfiguration).SubId == subId,
+                out bool foreign);
+            if (pp != null && foreign)
+                RollingLog.Warn("profile-find",
+                    $"订阅 subId={subId} 命中的是旧签名家族的条目 family={pp.VpnPluginPackageFamilyName}");
+            return pp;
         }
 
         /// <summary>
@@ -632,23 +698,23 @@ namespace ClashUWP.Vpn
         /// ★【1.0.62】找"当前已连接"的那条我们的 profile（基础或某条订阅），
         /// 供断开/状态兜底用。排除探测 profile（ClashUWP-Probe / ClashUWP-Dataface）。
         /// 没连着的就回基础 profile。
+        /// ★【1.0.79 · Docs/30 §8-F】筛选从"只看包家族"改成 <see cref="PickOurs"/>
+        ///   （同家族优先 → 名字族兜底）：换签名证书后，正在连的那条很可能是<b>旧家族</b>的，
+        ///   只按家族匹配会让前台读成 <c>Profile缺失</c>（状态、断开、已连接订阅三项一起骗人）。
+        ///   这条被 3 秒轮询调用，所以<b>不</b>在这里记日志（噪音），旧家族条目由
+        ///   <see cref="ListOurProfilesAsync"/> 打标、由 <see cref="PruneOrphanProfilesAsync"/> 清理。
         /// </summary>
         private static async Task<VpnPlugInProfile?> FindConnectedProfileAsync()
         {
             IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
-            VpnPlugInProfile? baseProfile = null;
-            foreach (IVpnProfile p in profiles)
-            {
-                if (p is VpnPlugInProfile pp && pp.VpnPluginPackageFamilyName == PackageFamilyName)
-                {
-                    if (pp.ProfileName == "ClashUWP-Probe" || pp.ProfileName == "ClashUWP-Dataface")
-                        continue;
-                    if (pp.ProfileName == ProfileName) baseProfile = pp;
-                    if (pp.ConnectionStatus.ToString() == "Connected")
-                        return pp;
-                }
-            }
-            return baseProfile;
+            bool NotProbe(VpnPlugInProfile pp) =>
+                pp.ProfileName is not ("ClashUWP-Probe" or "ClashUWP-Dataface");
+
+            VpnPlugInProfile? connected = PickOurs(profiles,
+                pp => NotProbe(pp) && pp.ConnectionStatus.ToString() == "Connected", out _);
+            if (connected != null) return connected;
+
+            return PickOurs(profiles, pp => NotProbe(pp) && pp.ProfileName == ProfileName, out _);
         }
 
         /// <summary>我们 profile 的当前连接状态文本；profile 不存在返回 "Profile缺失"。</summary>
@@ -690,12 +756,16 @@ namespace ClashUWP.Vpn
             int n = 0;
             foreach (IVpnProfile p in profiles)
             {
-                if (p is not VpnPlugInProfile pp || pp.VpnPluginPackageFamilyName != PackageFamilyName)
+                if (p is not VpnPlugInProfile pp || !IsOurs(pp))
                     continue;
                 n++;
                 string subId = VpnPluginConfig.Parse(pp.CustomConfiguration).SubId;
                 bool probe = pp.ProfileName is "ClashUWP-Probe" or "ClashUWP-Dataface";
-                sb.Append($"\n{(probe ? "[探测残留] " : "")}{pp.ProfileName} | " +
+                // ★【1.0.79 · Docs/30 §8-F】旧签名家族的条目也要看得见（只按家族匹配时它隐形，
+                //   而面板里那条幽灵条目就是它）—— 打标不隐藏。
+                string tag = (probe ? "[探测残留] " : "") +
+                             (IsCurrentFamily(pp) ? "" : "[旧家族] ");
+                sb.Append($"\n{tag}{pp.ProfileName} | " +
                           $"subId={(subId.Length == 0 ? "(基础)" : subId)} | " +
                           $"系统UI={pp.RequireVpnClientAppUI} | 状态={pp.ConnectionStatus}");
             }

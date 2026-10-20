@@ -60,6 +60,29 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal const string ProfileName = "ClashUWP";
 
+        /// <summary>
+        /// ★【1.0.79 · Docs/30 §8-F】这条 profile 的<b>名字</b>是否属于我们的产品族。唯一定义在此，
+        ///   <c>VpnProfileSetup.IsOurName</c> 只是转发 —— 两处各写一遍早晚会漂移。
+        ///   我们写的名字只有三类：基础 <c>ClashUWP</c>、订阅 <c>ClashUWP · {显示名}</c>、
+        ///   探测残留 <c>ClashUWP-Probe</c> / <c>ClashUWP-Dataface</c>。
+        ///
+        /// 【为什么需要"按名字认"这条退路】包家族后缀是<b>由签名证书算出来的</b>，
+        ///   换一张证书 = 换家族哈希 = 老 profile 的 <c>VpnPluginPackageFamilyName</c>
+        ///   不再等于当前包家族。只按家族匹配的各处逻辑会集体失效：启动对账看不见它们、
+        ///   prune 清不掉它们、状态读成 <c>Profile缺失</c>，面板里留下永久疤。
+        /// 【为什么要"同家族优先"】按名字命中只用于<b>看得见、能收尾</b>（迁移式清理、状态如实读），
+        ///   旧家族的条目能不能被平台拉起插件没有实测背书，所以取对象时永远先取同家族的。
+        /// </summary>
+        internal static bool IsOurName(string? name) =>
+            name != null &&
+            (name == ProfileName
+             || name.StartsWith(ProfileName + " · ", StringComparison.Ordinal)
+             || name.StartsWith(ProfileName + "-", StringComparison.Ordinal));
+
+        /// <summary>★【1.0.79 · Docs/30 §8-F】是不是我们建的：<b>当前家族</b> 或 <b>我们的名字族</b> 任一命中。</summary>
+        internal static bool IsOurs(VpnPlugInProfile pp, string family) =>
+            (family.Length > 0 && pp.VpnPluginPackageFamilyName == family) || IsOurName(pp.ProfileName);
+
         /// <summary>等平台收尾的最长轮询时间（秒）。</summary>
         internal const int WaitSeconds = 20;
 
@@ -82,6 +105,12 @@ namespace ClashUWP.Vpn
         ///   —— 探测会留下 <c>ClashUWP-Probe</c> / <c>ClashUWP-Dataface</c>。
         ///   2026-10-15 实测过只按 family 匹配的后果：recreate 删掉的是残留 Probe，
         ///   主 profile 反而没被重建。收尾删的是"谁"直接决定会不会留下残留，所以这里一条都不能省。
+        /// ★【1.0.79 · Docs/30 §8-F】再加一条<b>名字族兜底</b>（同家族优先取不到才用它）：
+        ///   换签名证书＝换包家族哈希，只按家族匹配会让上一代自己建的条目在这里彻底隐形，
+        ///   于是"删不掉、看不见、面板里挂着幽灵"。兜底只在 want 本身就是我们的命名形状
+        ///   （<c>ClashUWP</c> / <c>ClashUWP · </c> / <c>ClashUWP-</c>）时生效，命中必留日志。
+        ///   ⚠️ 平台是否允许我们删除<b>别的包家族</b>建的 profile 未实测 —— 真删不动时
+        ///   返回值会如实是错误状态，这条退路不假装成功。
         /// </summary>
         internal static async Task<VpnPlugInProfile?> FindProfileAsync(string? name = null)
         {
@@ -93,11 +122,25 @@ namespace ClashUWP.Vpn
 
             string want = name ?? ProfileName;
             IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            VpnPlugInProfile? byNameOnly = null;   // ★【1.0.79 · §8-F】旧家族但名字是我们的
             foreach (IVpnProfile p in profiles)
             {
-                if (p is VpnPlugInProfile pp && pp.ProfileName == want &&
-                    pp.VpnPluginPackageFamilyName == family)
-                    return pp;
+                if (p is VpnPlugInProfile pp && pp.ProfileName == want)
+                {
+                    if (pp.VpnPluginPackageFamilyName == family)
+                        return pp;                                    // 同家族优先，无条件是我们的
+                    if (IsOurName(want) && byNameOnly == null)
+                        byNameOnly = pp;
+                }
+            }
+            if (byNameOnly != null)
+            {
+                // 收尾是"删对象"的动作，走到这条退路必须留痕：它意味着这台机器上
+                // 存在上一代签名身份建的条目（Docs/30 §8-F 的疤）。
+                RollingLog.Warn("teardown-find",
+                    $"按名字命中旧家族条目 want={want} family={byNameOnly.VpnPluginPackageFamilyName}" +
+                    $"（当前={family}）");
+                return byNameOnly;
             }
             return null;
         }
