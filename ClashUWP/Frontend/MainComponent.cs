@@ -224,6 +224,12 @@ namespace ClashUWP.Frontend
                     //   贸然回填只会把书本账改错。
                     string lastConnectedSub = "";
                     bool firstPoll = true;
+                    // ★【1.0.80】轮询异常要出声，但<b>只在"错误类型变了"时出声</b>：
+                    //   这里是 3 秒一次的循环，每轮都记就成了刷屏（滚动日志的行格式是
+                    //   看门狗的机器契约，热路径禁记）。旧写法是裸 <c>catch { }</c>，
+                    //   症状和 1.0.79 的前台哨兵一模一样 —— 状态文本悄悄停在最后一次成功
+                    //   的读数上，界面看着"Connected"，实际早就读不出来了，日志里查不到任何痕迹。
+                    string lastPollError = "";
 
                     while (!cts.IsCancellationRequested)
                     {
@@ -271,8 +277,27 @@ namespace ClashUWP.Frontend
                                         $"系统侧连接已断开（此前 {prev}），生效订阅保持不变");
                                 }
                             }
+
+                            // 恢复也要出声一次：否则"只剩失败行"会被读成"到现在还瞎着"。
+                            if (lastPollError.Length > 0)
+                            {
+                                RollingLog.Info("ui-poll", "轮询已恢复");
+                                lastPollError = "";
+                            }
                         }
-                        catch { /* 一次失败不该停掉轮询 */ }
+                        catch (Exception ex)
+                        {
+                            // ★ 一次失败不该停掉轮询（这句老注释的语义没变），但"失败"本身
+                            //   必须能查到 —— 只在错误类型<b>变化</b>时记一行，避免 3 秒刷屏。
+                            //   1.0.79 实机教训：前台哨兵整条静默而日志零痕迹，
+                            //   这种"保护自己死了没人知道"比漏判一次严重得多。
+                            string kind = $"{ex.GetType().Name}: {ex.Message}";
+                            if (kind != lastPollError)
+                            {
+                                RollingLog.Warn("ui-poll", $"本轮刷新失败（同类不再重复记）：{kind}");
+                                lastPollError = kind;
+                            }
+                        }
                         try { await Task.Delay(3000, cts.Token); }
                         catch { break; }
                     }
