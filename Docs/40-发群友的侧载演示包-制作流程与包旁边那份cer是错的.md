@@ -12,10 +12,10 @@
 ## 一、成品在哪
 
 ```
-D:\fluentapps\share\ClashUWP-demo-1.0.91\
-├── ClashUWP_1.0.91.0_x64.msix          51,618,732 字节（重签后）
-├── ClashUWP_1.0.91.0_x64.cer              812 字节  ← 必须是签名那张（见 §三）
-├── Dependencies\
+D:\fluentapps\share\ClashUWP-demo-1.0.91\          （同级另有 ClashUWP-demo-1.0.91.zip，54.6 MB）
+├── ClashUWP_1.0.91.0_x64.msix          51,618,732 字节（重签后，与 AppPackages 那份同一个字节流）
+├── ClashUWP_1.0.91.0_x64.cer              812 字节  ← **已被换成签名那张**（见 §三）
+├── Dependencies\x64\                   只留 x64 这两个（arm/arm64/Win32/x86 六份 20 MB 已裁掉）
 │   ├── Microsoft.UI.Xaml.2.8.appx         4.70 MB
 │   └── Microsoft.VCLibs.x64.14.00.appx    0.86 MB
 ├── Add-AppDevPackage.ps1               VS 官方安装脚本（未改一字）
@@ -24,7 +24,8 @@ D:\fluentapps\share\ClashUWP-demo-1.0.91\
 └── 安装说明.md                          给群友看的那份
 ```
 
-整包 56 MB。**不含**任何订阅地址、节点、私钥（`.pfx` 一个都没拷，`.cer` 是公钥导出）。
+整包 56 MB（`.appxsym` 87 KB 那份符号文件没拷，群友用不上）。**不含**任何订阅地址、节点、私钥
+（`.pfx` 一个都没拷，`.cer` 是公钥导出）。
 
 ---
 
@@ -85,6 +86,20 @@ $src = Get-ChildItem Cert:\LocalMachine\Root | Where-Object Thumbprint -eq "FB33
 "重签"，没写"重签后要换 .cer"），并且把这两张同主体证书固定成唯一签名身份 ——
 `Docs/30 §8` 那条"运维上固定签名证书"的债至今没还。
 
+### 三之五、★ 顺手记下自己犯的第二条：裁依赖不能把 `x64` 那层抹平
+
+为了瘦身只留 x64，我先把 `Dependencies\x64\*` 上提成 `Dependencies\*` —— **这一步是错的**，
+现读那份脚本 `:428-443` 的注释把目录结构写成机器契约：
+
+```
+<current dir>\Dependencies\<架构无关的 .appx>
+                  \x86\  \x64\  \arm\  \arm64\
+```
+
+`:452-456` 确实会把 `Dependencies\*.appx` 当**架构无关**依赖安装（所以抹平后本机不会立刻出问题），
+但这两个包是 **x64 专属**的框架包 ⇒ 抹平等于告诉 arm64 的机器"你也装这个"。已改回 `Dependencies\x64\`，
+`安装说明.md` §三 手动命令里的路径也才因此对得上。**结论：裁依赖只删兄弟目录，不许压平层级。**
+
 ---
 
 ## 四、给群友的那份说明里，逐条出处
@@ -115,10 +130,13 @@ $src = Get-ChildItem Cert:\LocalMachine\Root | Where-Object Thumbprint -eq "FB33
 1. **第二台机器上的安装流程一次都没跑过** —— §三 那两条判据是**读脚本读出来的**，不是实跑出来的。
    我能证的只有"包签名 Valid + .cer 与签名逐字相同"，证不了群友机器上 Win11 的侧载策略与
    `certutil -addstore TrustedPeople` 的交互。
+   ★ 想让它变成一手，只有一条路：找一台干净机器（或新开的本地账户）实跑 `Add-AppDevPackage.ps1`。
+   在本机 `Remove-Item` 掉证书存储去"模拟"是不成立的 —— 装包与本机 Root 的交互正是被测对象本身。
 2. **1.0.91 没拨过一次号**：与 1.0.90 的差集只有 `LocalStatePaths` 那一搬（不在拨号路径上），
    凭据是**操作清单自证**。拨号一手在 1.0.88/1.0.89（`Docs/38 §十三/§十四`）。
 3. **诊断里同屏出现的 `✗ REST API 不可达 (127.0.0.1:9090)`** 是内核没跑（未连接），预期；
-   但它意味着"群友装完第一次点诊断会看到一个 ✗"，README 里没解释这条 —— 要发之前值得补一句。
+   已按这条在 `安装说明.md` §四 补了一句解释（"没连时那一行 ✗ 不是坏了，看下面两行 ✓"）
+   —— **补的是文笔，不是代码，也没重打包**：这句只在说明里，包体与 §一 那份 msix 是同一个。
 4. 用户报的那个症状（一条连着时点另一条卡在「正在连接中」）**三轮仍未复现**
    （`Docs/38 §14.5`），所以"demo 里别当着群友的面切第二条 profile"这句我**没写进 README**，
    要不要写由用户定。
