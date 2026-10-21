@@ -88,15 +88,20 @@ internal static class CommandCatalog
         new("subupdate", "", Danger.State,
             "按当前生效 profile 的 URL 重拉一次",
             ["update"]),
-        new("subuse", "<id>", Danger.State,
-            "切到某份 profile(复制到 config.yaml)。先用 sublist 拿 id",
-            ["subswitch"]),
         new("subdel", "<id>", Danger.State,
             "删一份 profile(不允许删当前生效的那条)"),
 
         // ── 碰隧道 ──────────────────────────────────────────────────────
         new("connect", "[订阅id]", Danger.Tunnel,
             "拨号：不带参=连基础 profile，带参=连该订阅专属系统 profile(等价于在快速设置里点那条订阅)。慢，可能几十秒"),
+        // ★【1.0.86 · Docs/36 A 案】级别从 state 提到 tunnel，并挪进本分组：
+        //   已连接时 subuse 不再只是"复制到 config.yaml"，它会先断旧订阅的 profile 会话、
+        //   等收尾收干净，再拨新订阅那条 —— 失败形态和其它 tunnel 命令一样是整机断网。
+        //   留在 state 里就是让自动化可以不带 --force 悄悄换隧道，正是 memory
+        //   「Never hog the machine's network」要防的那类事。
+        new("subuse", "<id>", Danger.Tunnel,
+            "切到某份 profile：复制 config.yaml + 热重载 + 把隧道会话串行切到该订阅的 profile(已连接时会先断再拨)。先用 sublist 拿 id",
+            ["subswitch"]),
         new("disconnect", "", Danger.Tunnel,
             "拆隧道、把网络还给物理网卡 —— 这是兜底逃生口，本 CLI 不要求 --force"),
         new("recreate", "", Danger.Tunnel,
@@ -108,8 +113,10 @@ internal static class CommandCatalog
     /// <summary>
     /// tunnel 级里<b>需要 --force</b> 的命令。
     /// disconnect 不在这里：它是恢复网络的出口，拦它等于把断网时的远程自救也锁死。
+    /// ★【1.0.86】加 <c>subuse</c>：它现在会断旧会话再拨新会话（Docs/36 A 案），
+    ///   和 connect 同属"发起拨号"，不能因为名字里带 sub 就当成改文件。
     /// </summary>
-    private static readonly string[] ForcedCommands = ["connect", "recreate", "probe"];
+    private static readonly string[] ForcedCommands = ["connect", "recreate", "probe", "subuse"];
 
     public static bool NeedsForce(string name) => ForcedCommands.Contains(name, StringComparer.OrdinalIgnoreCase);
 
@@ -227,7 +234,14 @@ internal static class CommandCatalog
         sb.AppendLine("  clashuwp-cli list                        只打印目标包 PFN");
         sb.AppendLine();
         sb.AppendLine("开关:");
-        sb.AppendLine("  --force            放行 tunnel 级命令（connect/recreate/probe）");
+        // ★【1.0.89 · Docs/38 §十四 · F5 同族的第二处漂移】这一行原先把命令名<b>手抄</b>成
+        //   "（connect/recreate/probe）"，而真正拦人的那张表是上面的 <see cref="ForcedCommands"/>
+        //   （<c>:119</c>，1.0.86 起就多了一条 <c>subuse</c>）。
+        //   ⇒ 装机读到的 help 教人"三条"，本地闸按四条拦：照 help 敲 <c>clashuwp-cli subuse <id></c>
+        //     会拿到退出码 7（"tunnel 命令未加 --force"），而在 help 里查不到 subuse 属于哪一类 ——
+        //     这正是本仓已经认过一次账的形状（1.0.84 对 <c>KernelView.Find</c> 的订正：两处各写一遍早晚分叉）。
+        //     所以不补字面量，改成<b>由那张表生成这一行</b>，以后加命令不必再记得改说明。
+        sb.AppendLine($"  --force            放行 tunnel 级命令（{string.Join("/", ForcedCommands)}）");
         sb.AppendLine("  --timeout <秒>     命令应答超时，默认 120（connect 拨号可能慢）");
         sb.AppendLine("  --pfn <PFN>        指定主应用包家族名，默认按包名反查");
         sb.AppendLine();

@@ -11,7 +11,11 @@
 //      不用猜哪条危险、也不用猜退出码；
 //   3. 参数明显写错时<b>本地</b>就拒绝，并把「先跑哪条」说清楚，
 //      省掉「发出去 → 等服务端报错 → 再回来读日志」这一整轮；
-//   4. 碰隧道的三条（connect/recreate/probe）必须 --force；
+//   4. 碰隧道的<b>四条</b>（connect/recreate/probe/subuse）必须 --force；
+//      ★【1.0.3 · Docs/38 §3.4 F5】原来这句写成"三条"、漏了 subuse —— 而表里
+//      <c>CommandCatalog.ForcedCommands</c> 一直是四条（<c>:119</c>），
+//      <c>--help</c>/<c>help &lt;命令&gt;</c> 输出的「需要 --force」又是从那张表算的（<c>:288</c>），
+//      于是"顶部说明书"和"逐条输出"互相打脸。改注释跟表走，不反过来。
 //      disconnect 刻意不拦 —— 它是把网络还回去的逃生口，拦它等于自锁；
 //   5. 每条失败都带「下一步」。找不到包 → 去跑 doctor；通道不通 → 走文件回路。
 //
@@ -192,7 +196,7 @@ internal static class Program
 
     /// <summary>
     /// 把一行命令发给主应用。这里集中了「发出去之前先拦一道」的全部理由：
-    ///   · 危险闸门：tunnel 级（connect/recreate/probe）与<b>本表没登记的名字</b>都要 --force；
+    ///   · 危险闸门：tunnel 级（connect/recreate/probe/subuse）与<b>本表没登记的名字</b>都要 --force；
     ///   · 参数校验：只挡服务端一定会拒、或语义一定歧义的形态（详见 CommandCatalog.Validate 注释）。
     /// 未登记的名字按 Tunnel 处理是刻意的 fail-closed：主应用以后加了命令而这张表没跟上时，
     /// 宁可多要一次 --force，也不能把"没见过"当成"安全"。

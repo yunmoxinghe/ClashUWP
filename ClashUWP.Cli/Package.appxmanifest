@@ -26,7 +26,7 @@
   <Identity
     Name="ClashUWP.Cli"
     Publisher="CN=gold"
-    Version="1.0.2.0" />
+    Version="1.0.4.0" />
 
   <Properties>
     <DisplayName>ClashUWP.Cli</DisplayName>

@@ -11,7 +11,15 @@
 
     ★ 为什么仍打成 MSIX(winapp package):
       有包身份后走 runFullTrust 桌面桥形态,连 AppService 的路径与未打包完全一致,
-      但安装/卸载/签名有了正规通道,且与主包同发布者(CN=gold)便于机器上识别。
+      但安装/卸载/签名有了正规通道。
+      ★【1.0.89 · Docs/38 §十四 · 订正】这行原来写的是"且与主包同发布者(CN=gold)"——<b>现在不成立了</b>：
+        主清单的 Publisher 已改成 <c>CN=A19C62A9-1AA6-44AB-9F57-2DE6C380D9C9</c>
+        （现读 <c>ClashUWP\Package.appxmanifest:47</c>），本工程仍是 <c>CN=gold</c>
+        （<c>ClashUWP.Cli\Package.appxmanifest:28</c>）。后果就是两个家族的发布者 hash 后缀<b>不同</b>：
+        主包 <c>8B8CC4F4.ClashUWP_4tjvwvefxrz66</c>、本包 <c>ClashUWP.Cli_y0tg80em3rma2</c>。
+        ★ 这条正是 F5 那个坑能活下来的原因之一：<c>AppServiceChannel</c> 里那份过期的主包身份
+        <c>421769c5-…_y0tg80em3rma2</c> 后缀和本包一样，看上去"没漂"，其实主包早就改名换证了。
+        跨包身份一律现查（<c>--list</c> / <c>doctor</c> 阶段1），不要照抄后缀。
 
     ★ 本工程不碰 VPN 隧道本身:它只是把一行命令发给主进程,
       命令语义与纪律(碰隧道的命令必须由人明确下发)与 debug-cmd 文件回路一致。
@@ -35,7 +43,7 @@
     <DefaultLanguage>zh-CN</DefaultLanguage>
     <Platforms>x64;arm64</Platforms>
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
-    <Version>1.0.2</Version>
+    <Version>1.0.4</Version>
 
     <!--
       ★ Native AOT —— 官方对"可执行文件/CLI"的推荐发布形态

@@ -29,11 +29,22 @@ internal static class AppServiceChannel
     public const string ServiceName = "ClashUWP.Debug";
 
     /// <summary>
-    /// 主应用 Package.appxmanifest 的 Identity Name。
-    /// 它是包的固定标识（GUID 形态），不随重装变化 —— 变的只是 FamilyName 的发布者
-    /// hash 后缀，所以这里存 Name、运行时反查 PFN，而不是把 PFN 写死。
+    /// 主应用 Package.appxmanifest 的 Identity <b>Name</b>（现读为证：
+    /// <c>ClashUWP/Package.appxmanifest:45</c> 与装机 <c>Get-AppxPackage</c> 都是
+    /// <c>8B8CC4F4.ClashUWP</c>，家族 <c>8B8CC4F4.ClashUWP_4tjvwvefxrz66</c>）。
+    /// 存 Name、运行时反查 PFN 而不是把 PFN 写死，是因为<b>只有</b> FamilyName 的发布者 hash
+    /// 后缀会随签名证书变；换证书时不必来改这里。
+    /// ★【1.0.2 → 1.0.3 · Docs/38 §3.4 F5 · 现读 git 历史为证】这里原先写死的是
+    ///   <c>421769c5-17f4-4287-b6c1-193222d21e14</c>，<b>在它写下来那天是对的</b>：主清单的
+    ///   Identity Name 一直到 <c>3b11f69</c>（1.0.74→1.0.75 那笔）才从那个 GUID 改成
+    ///   <c>8B8CC4F4.ClashUWP</c>（顺带换了包家族哈希 ⇒ 老包与新包是两个家族，LocalState 不互通）。
+    ///   ⇒ 真根因不是"当初抄错"，是<b>改名那次没有把 CLI 的发现逻辑一起改</b>，
+    ///     于是 <c>clashuwp-cli profiles</c> / <c>status</c> 这类不带 <c>--pfn</c> 的命令
+    ///     从 1.0.75 起<b>一律</b>走到"找不到目标包"（退出码 4），只有手工传 <c>--pfn</c> 才能用 ——
+    ///     本工具宣称的"拿过来就会用"这条设计目标从那时起就没成立过，而 <c>Docs/13:93</c>
+    ///     那句"主包 Identity Name 是那个 GUID"也从此是<b>历史形态</b>。
     /// </summary>
-    public const string TargetPackageName = "421769c5-17f4-4287-b6c1-193222d21e14";
+    public const string TargetPackageName = "8B8CC4F4.ClashUWP";
 
     /// <summary>连接阶段固定超时（秒）：覆盖主应用冷启动，又不放任平台无限挂起。</summary>
     private const int OpenTimeoutSec = 15;
