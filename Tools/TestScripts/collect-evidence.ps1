@@ -41,12 +41,17 @@ Add-Ev ("PowerShell=" + $PSVersionTable.PSVersion + "  Admin=" + $isAdmin)
 
 # ---------------------------------------------------------------- 包与 LocalState
 Add-Section "包"
-$pkgName = "421769c5-17f4-4287-b6c1-193222d21e14"
-$pkg = Get-AppxPackage -Name $pkgName -ErrorAction SilentlyContinue |
-       Sort-Object Version -Descending | Select-Object -First 1
+# ★【1.0.89 · Docs/38 §十四 · F5 同族】这里原先写死 <c>$pkgName = "421769c5-…"</c>，而 <c>3b11f69</c>
+#   那笔（1.0.74→1.0.75）把主清单 Identity Name 换成了 <c>8B8CC4F4.ClashUWP</c> ⇒ 这个取证脚本从改名那天起
+#   <b>每次</b>都走"未安装包"那一支，后面的 LocalState 一律为空 —— 不是"这台机没装"，是脚本在找一个不存在的包。
+#   改成按"名字里含 ClashUWP 且不是 CLI 那个包"反查：改名不再需要回来补字面量，本机同时装的
+#   <c>ClashUWP.Cli</c> 也不会被误当主应用。
+$pkg = Get-AppxPackage | Where-Object {
+    ($_.Name -like "*ClashUWP*") -and ($_.Name -notlike "*.Cli")
+} | Sort-Object Version -Descending | Select-Object -First 1
 $localState = ""
 if ($null -eq $pkg) {
-    Add-Ev ("  未安装包：" + $pkgName)
+    Add-Ev "  未安装包（按 *ClashUWP* 且非 *.Cli 反查，没命中）"
 } else {
     Add-Ev ("  Name=" + $pkg.Name + "  Version=" + $pkg.Version + "  Arch=" + $pkg.Architecture)
     Add-Ev ("  Family=" + $pkg.PackageFamilyName)
