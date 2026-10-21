@@ -28,6 +28,13 @@ AppPackages/
 publish*.log
 publish-*.log
 build-log*.txt
+# ★【1.0.90】上面三条盖不住这条线新用的命名（clashuwp-build-1090.log / clashuwp-cli-publish-103.log）
+clashuwp-build-*.log
+clashuwp-cli-publish-*.log
+
+# ★【1.0.90】VS "Associate with Store" 生成的关联文件：含保留名与本机商店账户绑定，
+#   换机/换账户就会漂，且不属于源码。要入库得先确认里面没有账户凭据引用。
+ClashUWP/Package.StoreAssociation.xml
 
 # 本地临时脚本与抓取产物
 check-logs.ps1
