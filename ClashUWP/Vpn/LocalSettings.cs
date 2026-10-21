@@ -211,7 +211,8 @@ namespace ClashUWP.Vpn
         ///   1 = 摘出来 + <c>AppendVpnSendPacketBuffer</c>、不 Flush。
         ///       ★ 已被 run 33 <b>否证</b>（ret==encap==7188 仍停摆），仅作证据保留；
         ///   2 = Append + <c>FlushVpnSendPacketBuffers</c>。
-        ///       ★★ <b>当前默认，也是唯一被实测证明能持续工作的形态</b>（run 35 / 1.0.32）：
+        ///       ★★ 1.0.32~1.0.86 的产品默认，也是<b>至今唯一被实测证明能持续工作</b>的形态
+        ///         （run 35 / 1.0.32）：
         ///         <c>Encapsulated=18202</c>（越过停摆线 7188 的 2.5 倍）、会话 497 s、
         ///         38 轮心跳每轮 <c>google=204</c> + <c>fake-ip=OK:198.18.0.10</c>、
         ///         <c>returned=flushed=18202、retFail=0</c>、国内直连全程正常、
@@ -253,14 +254,30 @@ namespace ClashUWP.Vpn
         ///       也是先遣项目 docs/13:216 那句"攒批只能攒在 Append 到 Flush 之间"的正解。
         ///       与档 2 的<b>唯一</b>差别是 Flush 的调用次数（N 次 → 每批 1 次）：
         ///       归还的包数、外层 UDP 重复量都不变，省下的是每包一次 Flush 的开销。
-        ///       ★ 未实测，且<b>不作为默认</b>：run 35 只证明了"每包 Flush"能持续工作，
-        ///         批边界会不会让平台少回收，必须用 <c>ret/flush/left</c> 三列实测对出来。
+        ///       ★ 1.0.34~1.0.86 期间<b>未实测、不作默认</b>；<b>1.0.87 起按用户决定抬为默认</b>，
+        ///         run 35 只证明了"每包 Flush"能持续工作，批边界会不会让平台少回收，
+        ///         必须用 <c>ret/flush/left</c> 三列实测对出来 —— 判据与回退条件见本字段末尾。
         ///
+        /// ★【1.0.87 · 默认档 2 → 5】用户 2026-10-21 决定抬档，理由是热路径开销：
+        ///   档 2 每摘一个包就 <c>FlushVpnSendPacketBuffers()</c> 一次，等于每个出站包付一次
+        ///   平台提交；档 5 是同一条链只在批末提交一次，<b>归还总量与外层重复量逐字不变</b>，
+        ///   唯一变量就是 Flush 的调用次数 ⇒ 它是对"卡"的最小可解释改动，也是官方 sample 的形态。
+        ///   ✅ <b>1.0.87 已实测成立（Docs/37 §5.3）</b>：长会话存活 213 s、encap=21985（= 7188 的 3.06 倍）
+        ///   不停摆，全程 <c>ret==encap</c>、<c>left=0</c>、<c>retFail=0</c>，拆线后 nrpt=0 / 幽灵路由=0。
+        ///   ★ 同轮测出的<b>否定结论</b>（Docs/37 §5.3.1）：平台一批基本只交 1~2 个包
+        ///     （<c>encap/calls ≈ 1.75~2.2</c>，<c>flush</c> 与 <c>calls</c> 逐字相等），
+        ///     所以抬档只省掉 43% 的 Flush 调用（21985 包 → 12606 次提交），<b>"卡"不是 Flush 次数造成的</b> ——
+        ///     别再用这个开关治卡顿，下一轮要在"内核转发 / 回程泵 / 节点 RTT"之间定位。
+        ///   装机判据（任一条不成立就写回 2 并记进 Docs）：
+        ///     ① <c>ret</c> 与 <c>encap</c> 同步涨、<c>flush</c> 每批 +1（不再是每包 +1）；
+        ///     ② <c>left</c>（在借未还）不单调上涨；
+        ///     ③ <b>长跑必须越过 7188 不停摆</b>（档 1 的死法就是批边界让平台少回收）；
+        ///     ④ 收尾 <c>nrpt=0</c> 与幽灵路由=0 与基线逐字相同。
         /// ★ 若走"摘出来"的档（0/1/2/5），归还必须对<b>每一个</b>摘出来的 buffer 执行，
         ///   包括我们刻意丢弃的组播/广播包（<c>IsNonUnicastDestination</c> 那条分支）——
         ///   旧代码在 <c>continue</c> 之前同样没归还，那才是最先开始借池子的地方。
         /// </summary>
-        internal static int EncapReturn = 2;
+        internal static int EncapReturn = 5;
 
         /// <summary>
         /// 回程注入（<c>Inject</c>）什么时候调 <c>FlushVpnReceivePacketBuffers</c>。
@@ -513,9 +530,9 @@ namespace ClashUWP.Vpn
             OuterTarget = "auto";
             OuterPort = "9";
             IncludeMode = "narrow";
-            // ★ 默认档必须与字段初始值一致（run 35 实测成立的那一档），
+            // ★ 默认档必须与字段初始值一致（1.0.87 起为档 5，见字段注释的抬档理由与判据），
             //   否则 settings.txt 缺失/解析失败时会掉回另一条数据面路径。
-            EncapReturn = 2;
+            EncapReturn = 5;
             ReceiveBatch = 0;
             // ★ 1.0.52：删掉 injectGetBuffer / sendGetBuffer 两个开关及其旧臂 ——
             //   旧臂吃的 VpnDataPathType 被官方标 "not supported and may be altered or

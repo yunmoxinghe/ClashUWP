@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 
 using Microsoft.UI.Reactor;
@@ -25,6 +26,9 @@ namespace ClashUWP.Frontend
     ///   ① <b>滚动</b>：整页放进 <c>ScrollViewer</c>（Reactor 0.1.0-alpha.13 有
     ///      <c>ScrollViewerHandler</c>），日志/连接/节点列表不再被顶出屏幕；
     ///   ② <b>选节点</b>：组 → 节点两级列表，点一下就 <c>PUT /proxies/{组}</c>（G2 的 UI 化）；
+    ///      两级在 1.0.84 按安卓版收成正好两层：<b>顶部一排 = 组页签</b>，<b>下面一块 = 该组那一页</b>
+    ///      （标题就是组名），页内一列混排、按订阅原序，组行用加粗 + 灰字副标题与节点行拉开层级
+    ///      （<c>MemberList</c>）；
     ///   ③ <b>连接视图</b>：活动连接的目标/链路/上下行，3 秒一次自动刷新（G3/G4）；
     ///   ④ <b>运行态</b>：mode / log-level / interface-name 常驻显示（G8 的 UI 化）；
     ///   ⑤ <b>日志窗</b>：可滚动的日志尾部。
@@ -109,6 +113,9 @@ namespace ClashUWP.Frontend
         private SubscriptionManager.ActiveInfo _subActive = new("", "");
         private Action<SubscriptionManager.ActiveInfo> _setSubActive = _ => { };
 
+        // ---- 隧道实际连接的订阅 id（★【1.0.86 · Docs/36 B 案】分歧必须看得见）----
+        private Action<string> _setConnectedSub = _ => { };
+
         // ---- 应用分流（G9）----
         // ★ 状态里存的是<b>规范化后的名单行</b>（<c>kind|标识|去向</c>），不是 AppSplit 对象：
         //   每次增删都换一个<b>新的 List</b> 交给 UseState ——  Reactor 的 UseState 靠
@@ -151,6 +158,7 @@ namespace ClashUWP.Frontend
             var (subUrl, setSubUrl) = UseState("");
             var (subProfiles, setSubProfiles) = UseState(new List<SubscriptionManager.Profile>());
             var (subActive, setSubActive) = UseState(new SubscriptionManager.ActiveInfo("", ""));
+            var (connectedSub, setConnectedSub) = UseState("");
 
             // ---- 应用分流（G9）状态 ----
             var (splitLines, setSplitLines) = UseState(new List<string>());
@@ -176,6 +184,7 @@ namespace ClashUWP.Frontend
             _setSubUrl = setSubUrl;
             _setSubProfiles = setSubProfiles;
             _setSubActive = setSubActive;
+            _setConnectedSub = setConnectedSub;
             _setSplitLines = setSplitLines;
             _setSplitNote = setSplitNote;
             _setSplitMsg = setSplitMsg;
@@ -211,17 +220,18 @@ namespace ClashUWP.Frontend
                 var cts = new System.Threading.CancellationTokenSource();
                 _ = Task.Run(async () =>
                 {
-                    // ★★【1.0.72 修复 · 回填改成"边沿触发"】
-                    //   1.0.62~1.0.71 每轮都拿 connectedSub 与 _subActive.Id 比，
-                    //   不等就 Adopt —— 但 app 内切订阅（ActivateAsync）只热重载配置、
-                    //   不重连 profile，于是"连着的仍是 A、生效已改成 B"是<b>正常中间态</b>。
-                    //   旧逻辑每 3 秒都把 A 回填成生效，用户的切换被自己撤销
-                    //   （本机 1.0.64 日志：profile-sub-adopt 连续刷了几分钟）。
-                    //   ⇒ 只在<b>轮询观察到 connectedSub 发生变化</b>时才回填：
-                    //     变化只能来自系统侧（快速设置连接/断开），那才是需要跟账的事件。
-                    //   首轮只取基线、不判定：启动时"生效 B / 隧道 A"可能是上一次会话的
-                    //   残留（例如切到 B 后 app 被系统关掉），此时隧道里跑的未必是 A 的正文，
-                    //   贸然回填只会把书本账改错。
+                    // ★★【1.0.86 · Docs/36】回填判据从"边沿触发"改回<b>电平触发</b>。
+                    //   【1.0.72 当初为什么改成边沿】那时 app 内切订阅（ActivateAsync）只热重载、
+                    //     不重连 profile，于是"隧道仍是 A、生效已改成 B"被当成<b>正常中间态</b>；
+                    //     电平逻辑每 3 秒把 A 回填成生效，用户刚点的切换被自己撤销
+                    //     （本机 1.0.64 日志：profile-sub-adopt 连续刷了几分钟）。
+                    //   【这条前提现在已不成立】A 案让 ActivateAsync 真正把会话切到新 profile，
+                    //     "账本与隧道长期分叉"不再是正常态；而边沿触发为此付出的代价是致命的：
+                    //     它只看 connectedSub 变没变，分叉时那个值一次都没变 ⇒
+                    //     唯一能发现错位的观察者失明（Docs/36 E10：整份 app.log 零条 adopt）。
+                    //   【1.0.72 那条撤销坑怎么防】改为"切换进行中让路"（VpnSession.SwitchInProgress），
+                    //     而不是"长期不比对"。首轮也不再只记基线不判定 —— 启动时"生效 B / 隧道 A"
+                    //     现在就是要按隧道（真相）跟账的形状，不再当残留放过。
                     string lastConnectedSub = "";
                     bool firstPoll = true;
                     // ★【1.0.80】轮询异常要出声，但<b>只在"错误类型变了"时出声</b>：
@@ -237,44 +247,69 @@ namespace ClashUWP.Frontend
                         {
                             var s = await KernelView.LoadAsync();
                             _setSnap(s);
+
+                            // ★【1.0.81 · Q4】内核刚起来（边沿触发，每轮只回放一次）→
+                            //   回放上次记下的节点选择，弥补 home 只读导致的跨重启不持久。
+                            string replayMsg = await MihomoController.ReplaySelectionsAsync();
+                            if (replayMsg.Length > 0)
+                                RollingLog.Info("selection-replay", replayMsg);
                             // ★ 同时刷新 VPN 连接状态：系统快速设置发起的连接绕过了我们的
                             //   按钮，前台没有回调，只能靠轮询反映真实 ConnectionStatus。
                             string status = await VpnSession.StatusAsync();
                             _setVpnStatus(status);
 
-                            // ★★ 快速面板切订阅的「账要跟上」：系统侧连接目标变了才回填。
-                            //   隧道本身早就在跑那份配置（插件 Connect 自己读的文件），
-                            //   这里补的只是 config.yaml + 生效 id 这份书本账。
+                            // ★★【1.0.86 · Docs/36 B 案】回填改成<b>电平触发</b>。
+                            //   【为什么边沿不够】边沿只看"connectedSub 变没变"，而 Docs/36 那次
+                            //   分叉里 connectedSub 从头到尾都是同一条（旧订阅），一次都没变 ⇒
+                            //   唯一能发现"账本≠隧道"的观察者结构性失明（实测：整份 app.log
+                            //   零条 profile-sub-adopt）。现在只要"隧道连着 X、账本记着 Y"就跟上。
+                            //   【判据为什么是"隧道为准"】插件把 subId 钉在 profile 的
+                            //   CustomConfiguration 上，每次（重）拨号都按它覆写 config.kernel.yaml
+                            //   ⇒ profile 是真相，config.yaml 只是账本，账本跟隧道走。
+                            //   【为什么要让路给切换】A 案的切换有几秒窗口：账本已改成新订阅、
+                            //   旧会话还没断干净，这一刻闯进来就会把用户刚点的切换撤销
+                            //   （= 1.0.72 那条坑换个方向复发）。切换进行中一律不动账本。
                             string connectedSub = await VpnSession.ConnectedSubAsync();
+                            _setConnectedSub(connectedSub);
+
+                            // 并发观测仍按边沿：只在读数变化时查一次，不每 3 秒查一遍。
+                            bool changed = connectedSub != lastConnectedSub;
                             if (firstPoll)
                             {
                                 firstPoll = false;
-                                lastConnectedSub = connectedSub;
-                                if (connectedSub.Length > 0 && connectedSub != _subActive.Id)
-                                    RollingLog.Info("profile-sub-adopt",
-                                        $"启动基线：隧道连着 {connectedSub}，生效记为 {_subActive.Id}；不自动回填");
-                            }
-                            else if (connectedSub != lastConnectedSub)
-                            {
-                                string prev = lastConnectedSub;
-                                lastConnectedSub = connectedSub;
                                 if (connectedSub.Length > 0)
+                                    RollingLog.Info("profile-sub-adopt",
+                                        $"启动基线：隧道连着 {connectedSub}，生效记为 {_subActive.Id}" +
+                                        "（电平判定，本轮起按隧道跟账）");
+                            }
+                            else if (changed)
+                            {
+                                // ★【快速面板改造】切换瞬间顺带看一眼有没有"两条同时 Connected"：
+                                //   平台对同插件并行没有实测背书，这里只记日志不拆会话。
+                                string parallel = await VpnSession.ParallelConnectedAsync();
+                                if (parallel.Length > 0)
+                                    RollingLog.Warn("profile-parallel",
+                                        $"多条 profile 同时 Connected：{parallel}（并发行未实测，仅记录）");
+                                if (connectedSub.Length == 0)
+                                    RollingLog.Info("profile-sub-adopt",
+                                        $"系统侧已断开（此前 {lastConnectedSub}），生效订阅保持不变");
+                            }
+                            lastConnectedSub = connectedSub;
+
+                            if (connectedSub.Length > 0
+                                && !VpnSession.SwitchInProgress
+                                && !string.Equals(connectedSub, _subActive.Id,
+                                                  StringComparison.OrdinalIgnoreCase))
+                            {
+                                var adopt = await SubscriptionManager.AdoptAsync(connectedSub);
+                                if (adopt.Ok)
                                 {
-                                    var adopt = await SubscriptionManager.AdoptAsync(connectedSub);
-                                    if (adopt.Ok)
-                                    {
-                                        _setActionHint(adopt.Message);
-                                        await RefreshSubscriptionsAsync();
-                                    }
-                                    else
-                                    {
-                                        RollingLog.Warn("profile-sub-adopt", adopt.Message);
-                                    }
+                                    _setActionHint(adopt.Message);
+                                    await RefreshSubscriptionsAsync();
                                 }
                                 else
                                 {
-                                    RollingLog.Info("profile-sub-adopt",
-                                        $"系统侧连接已断开（此前 {prev}），生效订阅保持不变");
+                                    RollingLog.Warn("profile-sub-adopt", adopt.Message);
                                 }
                             }
 
@@ -287,6 +322,9 @@ namespace ClashUWP.Frontend
                         }
                         catch (Exception ex)
                         {
+                            // ★【1.0.81 · Q4】内核掉线 → 复位回放边沿，下次起来再回放一次。
+                            MihomoController.MarkKernelUnreachable();
+
                             // ★ 一次失败不该停掉轮询（这句老注释的语义没变），但"失败"本身
                             //   必须能查到 —— 只在错误类型<b>变化</b>时记一行，避免 3 秒刷屏。
                             //   1.0.79 实机教训：前台哨兵整条静默而日志零痕迹，
@@ -377,12 +415,12 @@ namespace ClashUWP.Frontend
             //   （轮询挂在挂载时的那次渲染上，切页只换 content 子树。）
             Element body = page switch
             {
-                PageProxy => ProxyPage(snap, activeGroup, selectedGroup, actionHint),
+                PageProxy => ProxyPage(snap, activeGroup, actionHint),
                 PageSubscription => SubscriptionPage(subInfo, subProfiles, subActive, subUrl, actionHint),
                 PageSettings => SettingsPage(actionHint, logOpen, logText, material, setMaterial,
                         splitLines, splitNote, splitMsg, probeText, splitKind, splitIdentity, splitTarget,
                         dnsText, dnsMsg, dnsSnapshot),
-                _ => HomePage(vpnStatus, actionHint, snap),
+                _ => HomePage(vpnStatus, actionHint, snap, subActive, connectedSub),
             };
 
             return NavigationView(
@@ -459,15 +497,32 @@ namespace ClashUWP.Frontend
         /// 主页：先把"隧道在不在、点哪三下"讲完，再给运行态与活动连接。
         /// ★ 这三块共用 3 秒轮询那份快照，切到别的页轮询照跑（见 <c>Render</c> 里的挂载 effect）。
         /// </summary>
-        private Element HomePage(string vpnStatus, string actionHint, KernelView.Snapshot snap) =>
+        private Element HomePage(string vpnStatus, string actionHint, KernelView.Snapshot snap,
+            SubscriptionManager.ActiveInfo subActive, string connectedSub) =>
             Page(
                 Section("VPN 控制",
                     TextBlock($"当前状态：{vpnStatus}"),
+                    // ★★【1.0.86 · Docs/36 B 案兜底】隧道与账本对不上时，这句话必须画在界面上。
+                    //   A 案负责让它一致，这一行负责在它不一致时<b>不骗人</b> ——
+                    //   本项目纪律：静默或指错的失败一律算没修。
+                    DivergenceLine(subActive, connectedSub),
                     actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty(),
                     HStack(8,
                         Button("建/重建 profile", () => _ = RunAsync(_setActionHint, "重建中…", VpnSession.RecreateAsync)),
-                        Button("连接 VPN", () => _ = RunAsync(_setVpnStatus, "连接中…", () => VpnSession.ConnectAsync())),
-                        Button("断开 VPN", () => _ = RunAsync(_setVpnStatus, "断开中…", VpnSession.DisconnectAsync)))),
+                        // ★【快速面板改造】按钮从"连基础 profile"改为"连<b>当前生效订阅</b>的
+                        //   系统 profile"——与用户在快速设置里点那条订阅是同一条平台路径，
+                        //   连完快速面板亮的就是那条订阅（基础条目已隐藏，不再出现
+                        //   "app 里点了连接、面板亮的是裸 ClashUWP"的错位）。
+                        //   没有生效订阅就禁用（哥哥的拍板）：基础 profile 只留给诊断路径，
+                        //   不再当用户的连接入口。
+                        Button("连接 VPN", () => _ = RunAsync(_setVpnStatus, "连接中…",
+                                () => VpnSession.ConnectAsync(subActive.Id)))
+                            .IsEnabled(subActive.Id.Length > 0),
+                        Button("断开 VPN", () => _ = RunAsync(_setVpnStatus, "断开中…", VpnSession.DisconnectAsync))),
+                    subActive.Id.Length == 0
+                        ? TextBlock("尚未设置生效订阅：先到「订阅」页拉取并启用一份，再连接")
+                            .Foreground(Theme.SecondaryText)
+                        : Empty()),
 
                 Section("内核运行态", KernelStatusPanel(snap)),
 
@@ -480,7 +535,7 @@ namespace ClashUWP.Frontend
         ///   现在每次点选的结果（含失败原因、自动组的说明）都落在页顶。
         /// </summary>
         private Element ProxyPage(KernelView.Snapshot snap, string activeGroup,
-                                  string selectedGroup, string actionHint) =>
+                                  string actionHint) =>
             Page(
                 actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty(),
 
@@ -490,9 +545,23 @@ namespace ClashUWP.Frontend
                         Button("mode global", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("global"))),
                         Button("mode direct", () => _ = RunAsync(_setActionHint, "切换中…", () => MihomoController.RunModeAsync("direct"))))),
 
-                Section("代理组", GroupPicker(snap, selectedGroup)),
+                // ★【1.0.84】这里传 <c>activeGroup</c> 而不是 <c>selectedGroup</c>：
+                //   前者才是"下面那块真的在显示哪个组"（selectedGroup 初次为空、或组消失时
+                //   会被 ResolveGroup 回落）。以前 ▶ 打在别的组上、节点区显示的却是另一个组，
+                //   "谁是谁"对不上，正好是这一轮要治的那个毛病的另一半。
+                Section("代理组", GroupPicker(snap, activeGroup)),
 
-                Section("节点", MemberList(snap, activeGroup)));
+                // ★【1.0.84 按安卓版】这一块的<b>标题就是当前那个组名</b>——安卓是"一组一页"，
+                //   每页顶部写着这页是谁；我们以前固定叫"节点"，切了组标题也不变，
+                //   于是"我现在看的到底是哪个组"全靠上面那排按钮里的 ▶ 猜。
+                //   没连上内核（一个组都没有）时退回"节点"，不给空标题。
+                Section(activeGroup.Length > 0 ? activeGroup : "节点",
+                    MemberList(snap, activeGroup)),
+
+                // ★【1.0.81 · M7/Q10】订阅源（提供方）状态面板：让 provider 级
+                //   「刷没刷到、拉了多少节点、流量剩多少」可见（此前只能看到被提升到
+                //   /proxies 的节点），对齐官方 GET /providers/proxies 能力。
+                Section("订阅源（提供方）", ProviderPanel(snap)));
 
         /// <summary>订阅页：元信息 + 已存 profile + 拉取/更新/热重载。</summary>
         private Element SubscriptionPage(SubscriptionView.Info info,
@@ -656,13 +725,50 @@ namespace ClashUWP.Frontend
             return VStack(4, items.ToArray());
         }
 
-        /// <summary>选中的组；快照里没有就退回第一个（换订阅/组消失时不至于空白）。</summary>
+        /// <summary>选中的组；快照里没有就退回第一个（换订阅/组消失时不至于空白）。
+        /// ★【1.0.84】匹配走 <c>KernelView.Find</c>（Ordinal 原样比）—— 与"进组"用的是同一份
+        ///   名字判据，两处各写一个 foreach 早晚会分叉。</summary>
         private static string ResolveGroup(KernelView.Snapshot s, string selected)
         {
             if (s.Groups.Count == 0) return "";
-            foreach (var g in s.Groups)
-                if (string.Equals(g.Name, selected, StringComparison.Ordinal)) return g.Name;
-            return s.Groups[0].Name;
+            KernelView.Group? hit = KernelView.Find(s.Groups, selected);
+            return hit?.Name ?? s.Groups[0].Name;
+        }
+
+        /// <summary>
+        /// 订阅 id → 给人看的名字。<b>复用 <see cref="SubscriptionManager.DisplayName"/>（列表里
+        /// 重名才追加 host）</b>，不在界面上另写一套取名规则 —— 口径同应用分流那块
+        /// （"界面显示的与实际注入的必须是同一次解析的结果"）。
+        /// 找不到（订阅清单还没读出来）就原样回 id，绝不回空串把分歧伪装成"没连着"。
+        /// </summary>
+        private string SubLabel(string subId)
+        {
+            if (subId.Length == 0) return "(无)";
+            var p = _subProfiles.FirstOrDefault(x =>
+                string.Equals(x.Id, subId, StringComparison.OrdinalIgnoreCase));
+            return p != null ? SubscriptionManager.DisplayName(p, _subProfiles) : subId;
+        }
+
+        /// <summary>
+        /// 「生效账本 ≠ 隧道实际连接」那一行。一致/未连接时返回 <see cref="Empty"/>，
+        /// 不制造常态噪音；一旦分叉就直说两边各是谁，并交代本轮已按隧道回填。
+        /// ★ 这里<b>不</b>写"已自动修正"这种话：回填可能因正文缺失而失败（<c>AdoptAsync</c>
+        ///   返回失败时上面那行 hint 就是失败原因），说成已修正是又一次谎报。
+        /// ★ 这里<b>不</b>设前景色刷：Docs/19 §4 记过资源键缺失时 Reactor 发的是<b>透明画刷</b>
+        ///   —— 不抛异常、直接看不见。这行的使命是"必须被看见"，拿一个可能查不到的键去着色，
+        ///   等于把整条兜底押在资源表上。默认前景本来就是主文本色，靠 <c>FontWeight(600)</c>
+        ///   和 ⚠ 字形区分，任何情况下都不会画成隐形。
+        /// </summary>
+        private Element DivergenceLine(SubscriptionManager.ActiveInfo subActive, string connectedSub)
+        {
+            if (connectedSub.Length == 0) return Empty();
+            if (string.Equals(connectedSub, subActive.Id, StringComparison.OrdinalIgnoreCase))
+                return Empty();
+
+            return TextBlock(
+                    $"⚠ 隧道实际连的是「{SubLabel(connectedSub)}」，" +
+                    $"生效记为「{SubLabel(subActive.Id)}」—— 正在按隧道跟账，见下方提示")
+                .FontWeight(new Windows.UI.Text.FontWeight(600));
         }
 
         /// <summary>运行态三要素。没连上内核时显示"未连接"，不显示成空白或报错堆。</summary>
@@ -703,62 +809,204 @@ namespace ClashUWP.Frontend
         }
 
         /// <summary>
-        /// 成员表：Selector 组点一下就切；自动组只读。
-        /// ★ 组名/节点名<b>原样透传</b>（中文、带 emoji、带前导空格）——
-        ///   任何 trim / 规范化都会让内核找不到那个组。
-        /// ★【1.0.75 对齐安卓】三件事一起改：
-        ///   ① <b>每行带类型副标题</b>：嵌套组显示 <c>Selector(现值)</c>、内置策略与真节点
-        ///      显示协议类型（CMFA 的 <c>subTitle</c> 就是这个），
-        ///      这样"成员其实是个组"在界面上看得出来；
-        ///   ② <b>延迟只在测过的时候显示</b>（CMFA：<c>delay in 0..Short.MAX_VALUE</c> 才画胶囊），
-        ///      原先一律写"未测"，在 <c>lazy: true</c> 的订阅里等于整屏贴同一句废话；
-        ///   ③ <b>自动组不给点</b>（CMFA 只对 <c>type == "Selector"</c> 接点行动作）——
-        ///      url-test 手选会被下一轮测速改回去，那不是"选上了"，是"点了会自己变"。
+        /// 成员区 = <b>安卓的"一组一页"里那一页</b>：页头一句"这页是谁"，正文一列混排。
+        ///
+        /// ★【1.0.84 按安卓版原样收回】上一版把成员拆成"子组 / 真节点 / 内置策略"三块、
+        ///   还加了「进组」「选它走整组」两个按钮 —— 那是我自己发明的，安卓没有：
+        ///   安卓的代理页是 <c>ProxyPageFactory</c> 给每个组开一页（顶部页签横滑），
+        ///   <b>页内是一列卡片</b>（<c>ProxyView</c> 自绘：title + subtitle + 延迟胶囊），
+        ///   嵌套组照样排在这一列里、按 <b>内核给的订阅原序</b>（<c>QueryProxyGroup</c> 的
+        ///   <c>Default</c> 排序），只是<b>卡片样式与节点不同</b>；点卡片 = <c>patchSelector</c>，
+        ///   要换组是去点<b>顶部页签</b>。所以这一版：分块与双按钮全部撤掉，
+        ///   组行改成"<b>加粗标题 + 灰字副标题 + 明确的『选它』</b>"，与节点行不再是同款。
+        /// ★ 为什么组行是 <c>TextBlock + Button</c> 而不是"整行一个可点卡片"：
+        ///   WinUI 2.8 没有 Fluent 的卡片底色键，<c>.Background(Theme.CardBackground)</c>
+        ///   查不到键时<b>返回透明笔刷且不抛</b>（Docs/19 §4），安卓那层"组卡有底色"在这儿画不出来，
+        ///   只能靠字重 + 灰字副标题 + 记号（■/◇）拉开层级；<c>ProviderPanel</c> 的
+        ///   "文字 + 按钮"同一行本来就是本包已验证可用的行形态。
+        /// ★ 组名/节点名<b>原样透传</b>（中文、带 emoji、带前导空格）——任何 trim / 规范化
+        ///   都会让内核找不到那个组（<c>KernelView.Find</c> 同为 Ordinal）。
+        /// ★ 延迟只在测过的时候显示（CMFA：<c>delay in 0..Short.MAX_VALUE</c> 才画胶囊）。
         /// </summary>
         private Element MemberList(KernelView.Snapshot s, string groupName)
         {
             if (s.Groups.Count == 0) return Empty();
 
-            KernelView.Group? g = null;
-            foreach (var x in s.Groups)
-                if (string.Equals(x.Name, groupName, StringComparison.Ordinal)) { g = x; break; }
-            if (g == null) return TextBlock("(组不存在)");
+            KernelView.Group? found = KernelView.Find(s.Groups, groupName);
+            if (found == null) return TextBlock("(组不存在)");
+            KernelView.Group parent = found;   // 给闭包用：可空局部进 lambda 会招 CS8602
 
             var items = new List<Element>();
-            if (!g.IsUserSelectable)
+
+            // ── 页头：这一页是谁、什么类型、现在走谁、几个真节点 + 那枚 ⚡ ──
+            //   ★ 测速按钮放页头而不是每个节点一行：安卓就是这个位置
+            //     （<c>ProxyActivity</c> 右上角 ⚡ = <c>healthCheck(当前组)</c>，
+            //     一次拨完这组所有成员），且自动组的赢家本来就是测速决定的，逐点没意义。
+            items.Add(HStack(8,
+                TextBlock($"{parent.Type}　现值 {(parent.Now.Length > 0 ? parent.Now : "（未选）")}" +
+                          $"　真节点 {parent.RealNodeCount} / 成员 {parent.Members.Count}")
+                    .Foreground(Theme.SecondaryText),
+                Button("测速", () => _ = HealthCheckAsync(parent.Name))));
+            if (!parent.IsUserSelectable)
                 items.Add(TextBlock(
-                    $"（该组类型是 {g.Type}：由内核测速/故障转移自己选，和安卓版一样不可手选。" +
-                    "下面列的是它的候选，现值标记只是当前赢家。）")
+                    $"（该组类型由内核测速/故障转移自己选，和安卓版一样不可手选；" +
+                    "下面列的是它的候选，▶ 只是当前赢家。）")
                     .Foreground(Theme.SecondaryText));
 
-            foreach (var m in g.Members)
+            // ── 正文：一列混排，顺序 = 内核给的 all 原序（= 订阅原序） ────
+            //   ★ 不重排、不分块：安卓的 Default 排序就是订阅里的原序，重排会让
+            //     "📺 动画疯 第一个成员是 🔰 选择节点"这种作者有意为之的顺序丢掉。
+            foreach (var m in parent.Members)
             {
-                bool isNow = string.Equals(m.Name, g.Now, StringComparison.Ordinal);
-                string label = $"{(isNow ? "▶ " : "  ")}{m.Name}";
-                string sub = MemberSubtitle(m);
-                if (sub.Length > 0) label += $"　{sub}";
+                bool isNow = string.Equals(m.Name, parent.Now, StringComparison.Ordinal);
+                string mark = isNow ? "▶ " : "　 ";
+                string member = m.Name;                          // 闭包捕获：原样传给内核
 
-                if (!g.IsUserSelectable)
+                if (m.IsGroup)
+                {
+                    // ★【1.0.84 对齐安卓版】组行也是整行可点的卡片，不是"文字 + 小按钮"。
+                    //   安卓的 <c>ProxyView</c> 对嵌套组用加粗标题 + 副标题，整行点 = patchSelector；
+                    //   我们以前拆成 TextBlock + Button("选它")，导致交互不一致（节点点整行、组要点小按钮）。
+                    //   现在改成整行按钮，靠字重与记号（■）拉开层级，与节点行不再是同款。
+                    //   副标题里的"节点 N"来自那个组<b>自己</b>的 RealNodeCount，所以查得到才写。
+                    KernelView.Group? sub = KernelView.Find(s.Groups, member);
+                    // ★ 先算成局部变量再进内插：`{a ? b : "c"}` 这种"三元直接写在插补里"
+                    //   是 C# 语法错（CS8361，内插里的 `:` 与对齐冒号歧义），编译期就挡下了。
+                    string kind = m.Type.Length > 0 ? m.Type : "组";
+                    string nowText = m.Now.Length > 0 ? m.Now : "未选";
+                    string note = sub == null
+                        ? $"[{kind}] 内核没把它列成可切换组"
+                        : $"[{kind} · 现值 {nowText} · 真节点 {sub.RealNodeCount}]";
+                    
+                    string groupLabel = mark + "■ " + member + $"　{note}";
+                    
+                    if (!parent.IsUserSelectable)
+                    {
+                        Element row = TextBlock(groupLabel)
+                            .FontSize(16)
+                            .FontWeight(new Windows.UI.Text.FontWeight(600));
+                        if (!isNow) row = row.Foreground(Theme.SecondaryText);
+                        items.Add(row);
+                        continue;
+                    }
+                    // ★【1.0.84 · 对齐安卓版】嵌套组点的是"进那组的页"，不是把它当父组的值。
+                    //   Clash Verge Rev 的 ProxyView 里，子组行点击会切换当前选中组；
+                    //   CMFA 的 PagerFragment 同理：点子组 = patchSelector + 刷新列表。
+                    //   我们之前写 SelectAsync(parent.Name, member) 是错的 —— 那会把子组名
+                    //   当成父组的当前值去 PUT /proxies/{parent}，语义完全不对。
+                    items.Add(Button(groupLabel, () => _setSelectedGroup(member))
+                        .FontSize(16)
+                        .FontWeight(new Windows.UI.Text.FontWeight(600)));
+                    continue;
+                }
+
+                // 节点行 / 内置策略行：同一形态，只有记号不同（◇ = DIRECT/REJECT 这类策略）。
+                string label = (m.IsBuiltin ? mark + "◇ " + m.Name : mark + m.Name);
+                string sub2 = MemberSubtitle(m);
+                if (sub2.Length > 0) label += $"　{sub2}";
+
+                if (!parent.IsUserSelectable)
                 {
                     Element row = TextBlock(label);
                     if (!isNow) row = row.Foreground(Theme.SecondaryText);
                     items.Add(row);
                     continue;
                 }
-
-                string member = m.Name;
-                items.Add(Button(label, () => _ = SelectAsync(g.Name, member)));
+                items.Add(Button(label, () => _ = SelectAsync(parent.Name, member)));
             }
-            if (items.Count == 0) items.Add(TextBlock("(该组没有成员)"));
+
+            // 判据用"父组到底有没有成员"，不用 items 的行数 —— items 里还有页头那句。
+            if (parent.Members.Count == 0) items.Add(TextBlock("(该组没有成员)"));
             return VStack(items.ToArray());
         }
 
         /// <summary>
-        /// 一行的副标题：分类（嵌套组 / 类型）+ 测过的延迟。
+        /// 订阅源（提供方）状态面板（M7/Q10）：显示每个 <c>proxy-providers</c> 提供方的
+        /// 类型、已加载节点数、最近更新时间、订阅流量/到期（http 订阅才有）。
+        /// 每行一个「刷新」按钮触发 healthcheck（<c>GET /providers/proxies/{name}/healthcheck</c>）。
+        /// 没有提供方时给一句明确提示——大多数顶层 <c>proxies:</c> 的普通订阅本就没有
+        /// provider 段，这是正常的，不是 bug。
+        /// </summary>
+        private Element ProviderPanel(KernelView.Snapshot s)
+        {
+            if (s.Providers.Count == 0)
+                return TextBlock("(无订阅源 —— 本订阅没有 proxy-providers 段，节点是直给的，正常)")
+                    .Foreground(Theme.SecondaryText);
+
+            var items = new List<Element>();
+            foreach (var p in s.Providers)
+            {
+                // ★ vehicleType 是官方给的 Http/File/Inline，转成中国人话。
+                string type = p.VehicleType switch
+                {
+                    "Http" => "远程",
+                    "File" => "本地",
+                    "Inline" => "内联",
+                    _ => p.VehicleType.Length > 0 ? p.VehicleType : "未知"
+                };
+                string line = $"{p.Name}　[{type}]　{p.NodeCount} 节点";
+                if (p.UpdatedAt.Length > 0) line += $"　更新 {p.UpdatedAt}";
+
+                // 订阅流量/到期（仅 http 订阅有 subscriptionInfo）。
+                if (p.SubTotal > 0 || p.SubExpire > 0)
+                {
+                    long used = p.SubDownload + p.SubUpload;
+                    line += $"　流量 {FormatBytes(used)}/{FormatBytes(p.SubTotal)}";
+                    if (p.SubExpire > 0)
+                    {
+                        try { line += $"　到期 {DateTimeOffset.FromUnixTimeMilliseconds(p.SubExpire):yyyy-MM-dd}"; }
+                        catch { /* 时间戳异常也不该崩这一行 */ }
+                    }
+                }
+
+                string name = p.Name;   // 闭包捕获：healthcheck 用原始名（可能含中文/空格）
+                items.Add(HStack(8,
+                    TextBlock(line),
+                    Button("刷新", () => _ = RefreshProviderAsync(name))));
+            }
+            if (items.Count == 0) items.Add(TextBlock("(没有可用的提供方)"));
+            return VStack(items.ToArray());
+        }
+
+        /// <summary>
+        /// 触发某提供方刷新（healthcheck）并立即重载快照。
+        /// ★ 与 <see cref="SelectAsync"/> 同构：结果进 actionHint，随后 reload 快照让
+        ///   节点数/延迟跟上（节点是异步刷新的，稍后轮询也会自动更新）。
+        /// </summary>
+        private async Task RefreshProviderAsync(string name)
+        {
+            try
+            {
+                string result = await MihomoController.TriggerProviderHealthCheckAsync(name);
+                _setActionHint(result);
+                _setSnap(await KernelView.LoadAsync());
+            }
+            catch (Exception ex)
+            {
+                _setActionHint($"提供方刷新失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>字节数转人话（B/KB/MB/GB）。</summary>
+        private static string FormatBytes(long bytes)
+        {
+            if (bytes < 1024) return $"{bytes}B";
+            double v = bytes;
+            string[] units = { "B", "KB", "MB", "GB", "TB" };
+            int i = 0;
+            while (v >= 1024 && i < units.Length - 1) { v /= 1024; i++; }
+            return $"{v:F1}{units[i]}";
+        }
+
+        /// <summary>
+        /// 一行的副标题：分类（类型）+ 测过的延迟。
         /// ★ 与安卓 <c>ProxyItemProvider</c> 同一呈现口径：先"这是什么"，再"多快"。
-        ///   嵌套组写成 <c>Selector(现值)</c>（CMFA 的 <c>subTitle</c> 形态），
         ///   真节点写协议类型（<c>ss</c> / <c>trojan</c> / <c>AnyTLS</c>…），
         ///   内置策略写它的类型（<c>Direct</c> / <c>Reject</c>…）。
+        /// ★【1.0.84】<b>嵌套组不再走这里</b>：<c>MemberList</c> 把子组单独成块，
+        ///   行文本用的是子组自己的现值与节点数（<c>KernelView.Find</c>），
+        ///   因为"一行后缀副标题"恰恰是让 <c>🔰 选择节点</c> 看起来像个节点的那半步。
+        ///   这里保留 <c>IsGroup</c> 分支只为防御 —— 万一以后又有哪块把成员混着渲染。
         /// </summary>
         private static string MemberSubtitle(KernelView.Member m)
         {
@@ -771,10 +1019,16 @@ namespace ClashUWP.Frontend
             else
                 kind = m.Type;
 
+            // ★【1.0.81 · M4/Q8】provider 提供方节点带 provider-name（官方把提供方节点提升为
+            //   顶层条目并附该字段）。补进副标题，让用户分清单子是订阅直给还是某提供方动态拉来。
+            string src = (!m.IsGroup && !m.IsBuiltin && m.ProviderName.Length > 0)
+                ? $" · {m.ProviderName}" : "";
+            string body = kind + src;
+
             // 延迟：没测过就<b>不写</b>（见 KernelView 顶部那条口径）。
             string delay = m.DelayMs >= 0 ? $"{m.DelayMs}ms" : "";
-            if (kind.Length > 0 && delay.Length > 0) return $"{kind}　{delay}";
-            return kind.Length > 0 ? kind : delay;
+            if (body.Length > 0 && delay.Length > 0) return $"{body}　{delay}";
+            return body.Length > 0 ? body : delay;
         }
 
         /// <summary>
@@ -1139,6 +1393,30 @@ namespace ClashUWP.Frontend
             catch (Exception ex)
             {
                 _setActionHint($"切节点失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 组测速（安卓那枚 ⚡）：<c>PUT /proxies/{组}/healthcheck</c> 让内核把这组成员全拨一遍。
+        /// ★ 与 <see cref="SelectAsync"/> / <see cref="RefreshProviderAsync"/> 同构：结果进
+        ///   <c>actionHint</c>，随后立刻刷一次快照。
+        /// ★ 但<b>别期待当场就出数</b>：204 只代表"已触发"，延迟是内核测完异步写回
+        ///   <c>history</c> 的，所以这一次 reload 可能还是旧值，随后的 3 秒轮询才会把
+        ///   新延迟带上来 —— 这句话必须写在返回文案里，否则"点了没变"会被读成"按钮坏了"
+        ///   （1.0.75 那条"界面一言不发所以没人知道后端在报错"的教训，同一个方向的坑）。
+        /// </summary>
+        private async Task HealthCheckAsync(string group)
+        {
+            try
+            {
+                _setActionHint($"测速中：{group}（要拨完这组所有成员，几秒到几十秒）");
+                string result = await MihomoController.TriggerGroupHealthCheckAsync(group);
+                _setActionHint(result);
+                _setSnap(await KernelView.LoadAsync());
+            }
+            catch (Exception ex)
+            {
+                _setActionHint($"测速失败: {ex.GetType().Name}: {ex.Message}");
             }
         }
 

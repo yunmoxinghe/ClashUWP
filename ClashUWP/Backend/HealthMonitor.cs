@@ -23,6 +23,17 @@ namespace ClashUWP.Backend
         private static CancellationTokenSource? _healthCts;
 
         /// <summary>
+        /// ★【1.0.88】当前<b>是否已有一个哨兵在跑</b>（<see cref="Arm"/> 之前读一次）。
+        /// 存在的理由：<see cref="Arm"/> 是"顶掉上一个再武装"，而
+        /// <see cref="VpnSession.ConnectAsync"/> 现在可能<b>根本不发起拨号</b>
+        /// （官方前置条件 / "至多一条活动会话"闸把它拦住了）。那种情况下如果顺手 <c>Cancel</c>，
+        /// 就会把<b>上一次连接留下的保护</b>一起解除 —— 黑洞保护不能因为"多点了一下按钮"而消失。
+        /// 只读一个字段、不加锁：这个判据只用来决定"要不要解除自己刚武装的那个"，
+        /// 读旧了最多是少解除一次（保守方向，安全）。
+        /// </summary>
+        internal static bool IsActive => _healthCts != null;
+
+        /// <summary>
         /// 武装健康哨兵（connect 前调用；重复调用只保留最后一个）。
         /// ★ 调用方是 <see cref="VpnSession.ConnectAsync"/> 与
         ///   <see cref="DebugCommandLoop"/>，两条连接路径都必须先武装再连 ——

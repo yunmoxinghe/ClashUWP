@@ -36,6 +36,25 @@ namespace ClashUWP.Backend.Mihomo
     /// </summary>
     internal static class SubscriptionView
     {
+        // ★【1.0.81 · Q13】从一条列表项里抠出它的 <c>name:</c>：块写法
+        //   <c>- name: A</c> 与行内写法 <c>- { name: a, type: ss }</c> 都要认，
+        //   名字带引号（<c>"A, B"</c>）也要能完整取到（否则重名检测会被逗号截断）。
+        private static readonly System.Text.RegularExpressions.Regex EntryNameRe =
+            new System.Text.RegularExpressions.Regex(
+                @"name:\s*(?:""([^""]*)""|'([^']*)'|([^,""'\}\n]+))",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        /// <summary>从一条列表项（已 trim）里取节点/组名；取不到返回 null。</summary>
+        private static string? EntryName(string trimmedLine)
+        {
+            var m = EntryNameRe.Match(trimmedLine);
+            if (!m.Success) return null;
+            string v = m.Groups[1].Success ? m.Groups[1].Value
+                     : m.Groups[2].Success ? m.Groups[2].Value
+                     : m.Groups[3].Value;
+            v = v.Trim();
+            return v.Length > 0 ? v : null;
+        }
         internal sealed record Info(
             bool Found,
             string Error,
@@ -45,13 +64,30 @@ namespace ClashUWP.Backend.Mihomo
             int NodeCount,
             int RuleCount,
             int GroupCount,
+            int ProviderCount,
+            int InlineProviderNodes,
             IReadOnlyList<KeyValuePair<string, int>> Protocols,
-            IReadOnlyList<string> GroupNames)
+            IReadOnlyList<string> GroupNames,
+            IReadOnlyList<string> DuplicateNames)
         {
             internal static Info Missing() => new(
                 false, "config.yaml 不存在（订阅尚未放置到 LocalState）",
-                0, default, 0, 0, 0, 0,
-                Array.Empty<KeyValuePair<string, int>>(), Array.Empty<string>());
+                0, default, 0, 0, 0, 0, 0, 0,
+                Array.Empty<KeyValuePair<string, int>>(), Array.Empty<string>(),
+                Array.Empty<string>());
+
+            /// <summary>是否含 <c>proxy-providers:</c>（官方动态节点提供方）。</summary>
+            internal bool HasProviders => ProviderCount > 0;
+
+            /// <summary>
+            /// ★【1.0.81 · Q13】全局命名空间里的重名清单：节点名（<c>proxies:</c> 列表 +
+            ///   各 inline 提供方的 <c>payload:</c>）+ 组名，外加与<b>内置策略保留名</b>
+            ///   （DIRECT/REJECT/GLOBAL…）撞名的也算。mihomo 的代理名/组名/内置策略共享
+            ///   同一个扁平命名空间，重名会被内核折叠或报错，且行为<b>未定义</b>——这里在
+            ///   订阅这一层（唯一能观察重名的地方）先抓出来，UI 与 debug 都能提示，
+            ///   而不是等内核真折叠了才对着错乱的节点发呆。
+            /// </summary>
+            internal bool HasDuplicateNames => DuplicateNames.Count > 0;
         }
 
         /// <summary>读订阅原文的元信息。任何失败都降级成 <see cref="Info.Found"/>=false 的 Info。</summary>
@@ -78,8 +114,9 @@ namespace ClashUWP.Backend.Mihomo
             catch (Exception ex)
             {
                 return new Info(false, $"读订阅失败: {ex.GetType().Name}: {ex.Message}",
-                    0, default, 0, 0, 0, 0,
-                    Array.Empty<KeyValuePair<string, int>>(), Array.Empty<string>());
+                    0, default, 0, 0, 0, 0, 0, 0,
+                    Array.Empty<KeyValuePair<string, int>>(), Array.Empty<string>(),
+                    Array.Empty<string>());
             }
         }
 
@@ -100,6 +137,12 @@ namespace ClashUWP.Backend.Mihomo
             // ── proxies 段：节点数 + 协议分布 ──
             int nodeCount = 0;
             var protocols = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            // ★【1.0.81 · Q13】全局命名空间计数：节点名 + 组名 + 内置策略保留名，
+            //   任一名字出现超过一次就记为重名（含"与内置策略撞名"这类内核会折叠的冲突）。
+            var nameCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (string b in MihomoController.BuiltinProxyNames)
+                nameCounts[b] = 1;   // 先埋一份保留名基线，用户节点/组撞上即变 2
             int proxiesStart = FindTopLevel(lines, "proxies");
             int proxiesEnd = proxiesStart < 0 ? lines.Length : FindNextTopLevel(lines, proxiesStart);
             if (proxiesStart >= 0)
@@ -136,6 +179,11 @@ namespace ClashUWP.Backend.Mihomo
                     if (!isEntry) continue;
 
                     nodeCount++;
+
+                    // ★【1.0.81 · Q13】记节点名（用于全局重名检测）。
+                    string? nodeName = EntryName(t);
+                    if (nodeName != null)
+                        nameCounts[nodeName] = nameCounts.TryGetValue(nodeName, out int nc) ? nc + 1 : 1;
 
                     // 协议名：同行取不到就往下看几行（block style 的 type 在下一行）
                     string? type = Regex.Match(t, @"type:\s*([A-Za-z0-9_+-]+)", RegexOptions.IgnoreCase).Groups[1].Value;
@@ -201,7 +249,107 @@ namespace ClashUWP.Backend.Mihomo
                     if (m.Success)
                     {
                         string n = m.Groups[1].Value.Trim();
-                        if (n.Length > 0) groupNames.Add(n);
+                        if (n.Length > 0)
+                        {
+                            groupNames.Add(n);
+                            // ★【1.0.81 · Q13】组名与节点名共享 mihomo 的扁平命名空间，
+                            //   撞名（节点名==组名，或==内置策略保留名）内核会折叠/报错。
+                            nameCounts[n] = nameCounts.TryGetValue(n, out int gc) ? gc + 1 : 1;
+                        }
+                    }
+                }
+            }
+
+            // ── proxy-providers 段：提供方数 + inline 的 payload 节点数 ──
+            // ★【1.0.81 · M2/Q3 修复】旧版完全不认识 <c>proxy-providers:</c>，
+            //   于是纯提供方型订阅（节点只在 <c>proxy-providers</c> 里、顶层无 <c>proxies:</c>）
+            //   会被数成"0 节点"，UI 误导用户以为订阅没拉到节点。
+            //   官方键名是 <c>proxy-providers</c>（不是 <c>proxies-providers</c>）。
+            // ★ 提供方段既有<b>映射</b>写法（<c>p1:</c> 作键）也有<b>列表</b>写法
+            //   （<c>- name: p1</c> 作项），两种都认；只数"本层条目"，嵌套的
+            //   <c>type:/payload:</c> 与 payload 子列表不误数。
+            int providerCount = 0;
+            int inlineProviderNodes = 0;
+            int providersStart = FindTopLevel(lines, "proxy-providers");
+            int providersEnd = providersStart < 0 ? lines.Length : FindNextTopLevel(lines, providersStart);
+            if (providersStart >= 0)
+            {
+                int keyIndent = LeadingSpaces(lines[providersStart]);
+                // 段内第一个子项的缩进 = 提供方条目所在列（映射键或列表项都在这个缩进）。
+                int entryIndent = -1;
+                for (int i = providersStart + 1; i < providersEnd; i++)
+                {
+                    string t0 = lines[i].Trim();
+                    if (t0.Length == 0 || t0.StartsWith("#")) continue;
+                    int sp = LeadingSpaces(lines[i]);
+                    if (sp > keyIndent) { entryIndent = sp; break; }
+                }
+                if (entryIndent < 0) entryIndent = keyIndent + 2;
+
+                for (int i = providersStart + 1; i < providersEnd; i++)
+                {
+                    string raw = lines[i];
+                    string t = raw.TrimStart();
+                    if (t.Length == 0 || t.StartsWith("#")) continue;
+                    if (LeadingSpaces(raw) != entryIndent) continue;   // 只认本层条目
+
+                    // 列表项（- name: x / - { name: x }）或映射键（p1:）。
+                    bool isListItem = t.StartsWith("- ");
+                    var nameMatch = Regex.Match(t, @"^(?:-\s*\{?\s*)?name:\s*[""']?([^,""'\}]+)");
+                    string pname;
+                    if (isListItem && nameMatch.Success)
+                        pname = nameMatch.Groups[1].Value.Trim();
+                    else
+                    {
+                        int colon = t.IndexOf(':');           // 映射键：取冒号前的名字
+                        pname = colon > 0 ? t.Substring(0, colon).Trim() : "";
+                    }
+                    if (pname.Length == 0) continue;
+                    providerCount++;
+
+                    // ★ inline 提供方：type: inline，下面是 payload: 列表，里面每个 - 是一节点。
+                    //   http/file 提供方（type: http / file）的节点是内核运行时拉取的，
+                    //   这里只看得到 URL/路径，数不到节点 ⇒ 只计为"动态提供方"。
+                    string? ptype = Regex.Match(t, @"type:\s*([A-Za-z0-9_+-]+)", RegexOptions.IgnoreCase).Groups[1].Value;
+                    if (ptype.Length == 0)
+                    {
+                        for (int j = i + 1; j < Math.Min(i + 8, providersEnd); j++)
+                        {
+                            string t2 = lines[j].Trim();
+                            if (LeadingSpaces(lines[j]) <= entryIndent) break;
+                            var mt = Regex.Match(t2, @"^type:\s*([A-Za-z0-9_+-]+)", RegexOptions.IgnoreCase);
+                            if (mt.Success) { ptype = mt.Groups[1].Value; break; }
+                        }
+                    }
+                    if (string.Equals(ptype, "inline", StringComparison.OrdinalIgnoreCase))
+                    {
+                        for (int j = i + 1; j < providersEnd; j++)
+                        {
+                            string t2 = lines[j].Trim();
+                            if (LeadingSpaces(lines[j]) <= entryIndent) break;
+                            if (Regex.IsMatch(t2, @"^payload:\s*$", RegexOptions.IgnoreCase))
+                            {
+                                int pEnd = EndOfProviderBlock(lines, j + 1, providersEnd, entryIndent);
+                                int pcol = FirstItemColumn(lines, j + 1, pEnd);
+                                if (pcol >= 0)
+                                {
+                                    for (int k = j + 1; k < pEnd; k++)
+                                    {
+                                        string tk = lines[k].Trim();
+                                        if (tk.StartsWith("- ") && LeadingSpaces(lines[k]) == pcol)
+                                        {
+                                            inlineProviderNodes++;
+                                            // ★【1.0.81 · Q13】inline 提供方的 payload 节点
+                                            //   也是全局命名空间的一员，重名同样要记。
+                                            string? pn = EntryName(tk);
+                                            if (pn != null)
+                                                nameCounts[pn] = nameCounts.TryGetValue(pn, out int c) ? c + 1 : 1;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -209,8 +357,15 @@ namespace ClashUWP.Backend.Mihomo
             var protocolList = new List<KeyValuePair<string, int>>(protocols);
             protocolList.Sort((a, b) => b.Value.CompareTo(a.Value));
 
+            // ★【1.0.81 · Q13】汇总重名清单（出现次数 > 1 的名字，按序排列，便于 UI 原样列出）。
+            var dupList = new List<string>();
+            foreach (var kv in nameCounts)
+                if (kv.Value > 1) dupList.Add(kv.Key);
+            dupList.Sort(StringComparer.Ordinal);
+
             return new Info(true, "", size, mtime, lineCount,
-                nodeCount, ruleCount, groupNames.Count, protocolList, groupNames);
+                nodeCount, ruleCount, groupNames.Count, providerCount, inlineProviderNodes,
+                protocolList, groupNames, dupList);
         }
 
         // ── 行式 YAML 的两个小工具（与 KernelConfig 同款思路：只认顶层键）──
@@ -278,10 +433,37 @@ namespace ClashUWP.Backend.Mihomo
             return n;
         }
 
+        /// <summary>
+        /// 在 <c>proxy-providers</c> 段内，找"单个提供方条目（缩进 = <paramref name="col"/> 的 <c>-</c> 行）
+        /// 或下一个顶层键"的起始位置（不含）。用来界定单个 inline 提供方的 <c>payload:</c> 子列表边界，
+        /// 避免把别的提供方 / 别的段数进来（与 <see cref="FindNextTopLevel"/> 同一思路）。
+        /// </summary>
+        private static int EndOfProviderBlock(string[] lines, int from, int end, int col)
+        {
+            for (int i = from; i < end; i++)
+            {
+                int sp = LeadingSpaces(lines[i]);
+                if (sp <= col)
+                {
+                    string t = lines[i].TrimStart();
+                    if (t.StartsWith("- ") || t == "-" || t.StartsWith("-\t") || sp == 0)
+                        return i;
+                }
+            }
+            return end;
+        }
+
         /// <summary>给人看的一行摘要（UI 与 debug 命令共用）。</summary>
         internal static string OneLine(Info i)
         {
             if (!i.Found) return i.Error;
+
+            // ★【1.0.81 · Q3】inline 提供方的 payload 节点也是真实可用的，并进来一起显示，
+            //   避免纯提供方型订阅被显示成"0 节点"。
+            int shownNodes = i.NodeCount + i.InlineProviderNodes;
+            string providers = i.ProviderCount == 0
+                ? ""
+                : $" · {i.ProviderCount} 提供方";
 
             string protos = i.Protocols.Count == 0
                 ? "(无)"
@@ -290,10 +472,16 @@ namespace ClashUWP.Backend.Mihomo
                 ? "(无)"
                 : string.Join(" / ", i.GroupNames);
 
-            return $"订阅: {i.NodeCount} 节点 · {i.RuleCount} 规则 · {i.GroupCount} 组 · " +
-                   $"{i.LineCount} 行 · {i.SizeBytes / 1024.0:F1} KB\n" +
+            return $"订阅: {shownNodes} 节点 · {i.RuleCount} 规则 · {i.GroupCount} 组 · " +
+                   $"{i.LineCount} 行 · {i.SizeBytes / 1024.0:F1} KB{providers}\n" +
                    $"协议: {protos}\n" +
-                   $"组: {groups}";
+                   $"组: {groups}" +
+                   // ★【1.0.81 · Q13】订阅里若有重名（节点间重名 / 节点名==组名 / 撞内置策略保留名），
+                   //   内核会折叠或报错且行为未定义 —— 在元信息这一层就明确提示，不等内核出错才查。
+                   (i.HasDuplicateNames
+                       ? $"\n⚠ 重名检测: {string.Join("、", i.DuplicateNames)}（同名节点/组或撞内置策略名，" +
+                         "内核可能折叠或报错，建议改订阅里的重名）"
+                       : "");
         }
     }
 }

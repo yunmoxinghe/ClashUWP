@@ -15,7 +15,7 @@ namespace ClashUWP.Vpn
     ///
     /// 【为什么需要这个类 —— 2026-10-16 00:21 把用户网卡炸了】
     ///   旧的拆法是一行挨一行的三连发：
-    ///   <c>Agent.DisconnectProfileAsync(profile)</c> → <c>Agent.DeleteProfileAsync(profile)</c>，
+    ///   <c>ProfileStore.DisconnectProfileAsync(profile)</c> → <c>ProfileStore.DeleteProfileAsync(profile)</c>，
     ///   中间<b>不等</b>。事后取证（Docs/08 §10.10）：删除发生时平台仍记 <c>CONN=1</c>，
     ///   RasClient 里<b>没有</b>本次会话的 20226 终止事件 ⇒ profile 是在会话还被平台
     ///   认为活着的时候被删掉的。OS 于是直接扯掉接口：
@@ -63,8 +63,15 @@ namespace ClashUWP.Vpn
         /// <summary>
         /// ★【1.0.79 · Docs/30 §8-F】这条 profile 的<b>名字</b>是否属于我们的产品族。唯一定义在此，
         ///   <c>VpnProfileSetup.IsOurName</c> 只是转发 —— 两处各写一遍早晚会漂移。
-        ///   我们写的名字只有三类：基础 <c>ClashUWP</c>、订阅 <c>ClashUWP · {显示名}</c>、
-        ///   探测残留 <c>ClashUWP-Probe</c> / <c>ClashUWP-Dataface</c>。
+        ///   我们写的名字：基础 <c>ClashUWP</c>、探测残留 <c>ClashUWP-Probe</c> / <c>ClashUWP-Dataface</c>、
+        ///   以及<b>旧版</b>订阅条目 <c>ClashUWP · {显示名}</c>。
+        ///
+        /// ★【快速面板改造】订阅 profile 从这一批起改叫<b>订阅显示名本身</b>（如 <c>iKuuu_V2</c>），
+        ///   不再带前缀 ⇒ 按名字认不出它们。名字族缺口由
+        ///   <see cref="VpnPluginConfig.IsOurSchema"/>（CustomConfiguration 的 <c>clash</c> root）
+        ///   在 <see cref="IsOurs"/> 里补上；这里保留旧前缀匹配，是为了迁移期能认出
+        ///   还没被对账改名的旧条目。别把订阅名塞进这里 —— 订阅名是用户内容，
+        ///   "恰好叫 ClashUWP 的别家 profile"会误伤。
         ///
         /// 【为什么需要"按名字认"这条退路】包家族后缀是<b>由签名证书算出来的</b>，
         ///   换一张证书 = 换家族哈希 = 老 profile 的 <c>VpnPluginPackageFamilyName</c>
@@ -79,15 +86,26 @@ namespace ClashUWP.Vpn
              || name.StartsWith(ProfileName + " · ", StringComparison.Ordinal)
              || name.StartsWith(ProfileName + "-", StringComparison.Ordinal));
 
-        /// <summary>★【1.0.79 · Docs/30 §8-F】是不是我们建的：<b>当前家族</b> 或 <b>我们的名字族</b> 任一命中。</summary>
+        /// <summary>★【1.0.79 · Docs/30 §8-F】是不是我们建的：<b>当前家族</b> 或 <b>我们的名字族</b> 任一命中。
+        /// ★【快速面板改造】第三条判据：CustomConfiguration 是我们 schema 的 XML
+        ///   （<see cref="VpnPluginConfig.IsOurSchema"/>）—— 订阅 profile 改叫订阅名后
+        ///   名字族认不出它，换证书后全靠这条兜底。与 <c>VpnProfileSetup.IsOurs</c> 同一把尺子。</summary>
         internal static bool IsOurs(VpnPlugInProfile pp, string family) =>
-            (family.Length > 0 && pp.VpnPluginPackageFamilyName == family) || IsOurName(pp.ProfileName);
+            (family.Length > 0 && pp.VpnPluginPackageFamilyName == family)
+            || IsOurName(pp.ProfileName)
+            || VpnPluginConfig.IsOurSchema(pp.CustomConfiguration);
 
         /// <summary>等平台收尾的最长轮询时间（秒）。</summary>
         internal const int WaitSeconds = 20;
 
-        private static readonly VpnManagementAgent Agent = new();
-
+        /// <summary>
+        /// ★【1.0.81】原先这里也有<b>一份自己的</b> <c>static readonly VpnManagementAgent</c>，
+        ///   与 <c>VpnProfileSetup</c> 那份并存 ⇒ 收尾的 <c>Disconnect/Delete</c> 与前台的
+        ///   状态轮询、连接请求<b>可以同时在飞</b>。现在两处都改走 <see cref="ProfileStore"/>
+        ///   （全进程一个实例 + 一次只允许一个调用），依据与死锁纪律见该类的注释。
+        ///   ⚠️ 收尾这条链尤其不能嵌套：FindProfileAsync 的结果必须先拿到、再单独 await
+        ///   Disconnect / Delete，任何"在一次 ProfileStore 调用里再发起下一次"都会自锁。
+        /// </summary>
         private static string FamilyName
         {
             get
@@ -121,7 +139,7 @@ namespace ClashUWP.Vpn
                 return null;
 
             string want = name ?? ProfileName;
-            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
             VpnPlugInProfile? byNameOnly = null;   // ★【1.0.79 · §8-F】旧家族但名字是我们的
             foreach (IVpnProfile p in profiles)
             {
@@ -165,9 +183,28 @@ namespace ClashUWP.Vpn
 
             var sb = new StringBuilder();
             sb.Append($"状态={st0} → 发起平台断开 ");
+
+            // ★【1.0.88 · 同 Docs/38 F1 的观测口径】断开这一次 await 官方同样<b>没承诺时限</b>，
+            //   而原先这一串结论要等 report 交回调用方才落盘 —— 断开卡在平台上时日志一片干净，
+            //   和"没发起过断开"长得一模一样。所以发起前先落一行（收尾是动作、不是热路径，不违反"热路径禁记"）。
+            RollingLog.Info("teardown",
+                $"[{profile.ProfileName}] 发起=已发出断开请求（等平台返回值；官方对这一次 await 没有时限承诺）");
             try
             {
-                await Agent.DisconnectProfileAsync(profile);
+                // ★【1.0.88 · Docs/38 F4】官方口径：<c>DisconnectProfileAsync</c> 返回的是
+                //   <b>error status</b>（元数据 :218064-218069 returns），sample L522-533 按它分支。
+                //   原先整个丢弃 ⇒ "未等到收尾"这一句分不清是「断了没收尾」还是「平台根本没接受断开」，
+                //   而这两种处置完全不同。这里收下并按枚举写进 report：
+                //   · <c>Ok</c>          = 断开请求已受理（仍要等收尾，口径不变）；
+                //   · <c>AlreadyDisconnecting</c> = 平台<b>已经在断</b>这条 ⇒ 不是失败，继续等；
+                //   · 其余（<c>CannotFindProfile</c> 等）= 明写"断开请求被拒"，让下面等待的结论可读。
+                VpnManagementErrorStatus disc = await ProfileStore.DisconnectProfileAsync(profile);
+                if (disc == VpnManagementErrorStatus.Ok)
+                    sb.Append("断开请求=Ok ");
+                else if (disc == VpnManagementErrorStatus.AlreadyDisconnecting)
+                    sb.Append("断开请求=AlreadyDisconnecting（平台已在断这条，继续等收尾） ");
+                else
+                    sb.Append($"★断开请求被拒={disc} ");
             }
             catch (Exception ex)
             {
@@ -198,8 +235,13 @@ namespace ClashUWP.Vpn
                 sb.Append(report + " ");
                 if (!torn)
                 {
+                    // ★【1.0.88 · Docs/38 F7 订正】原先让人跑 <c>rasdial ClashUWP /disconnect</c> 是<b>指错</b>：
+                    //   我们的 profile 只落在<b>包内</b> LocalState\rasphone.pbk（本轮实测：
+                    //   桌面 <c>rasdial</c> 回 No connections、<c>Get-VpnConnection</c> 空），
+                    //   照这句敲只会得到"没这条连接"，等于把用户支进死胡同。
+                    //   官方给人工处置的通道是系统 VPN UI（设置→VPN，或 <c>ncpa.cpl</c> → 状态 → 断开）。
                     return sb.Append("★拒绝删除：会话没确认收干净，删 profile 会留 NRPT/路由残留 " +
-                                     "→ 请手工 rasdial ClashUWP /disconnect 确认断开后再 /delete")
+                                     "→ 请到 系统设置→VPN（或 ncpa.cpl）把这条断开后确认状态是已断开，再回来重试")
                              .ToString();
                 }
 
@@ -209,7 +251,7 @@ namespace ClashUWP.Vpn
                 {
                     try
                     {
-                        await Agent.DeleteProfileAsync(profile);
+                        await ProfileStore.DeleteProfileAsync(profile);
                         sb.Append("删除=ok ");
                     }
                     catch (Exception ex)

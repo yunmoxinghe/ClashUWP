@@ -45,7 +45,7 @@
   <Identity
     Name="8B8CC4F4.ClashUWP"
     Publisher="CN=A19C62A9-1AA6-44AB-9F57-2DE6C380D9C9"
-    Version="1.0.80.0" />
+    Version="1.0.90.0" />
 
   <mp:PhoneIdentity PhoneProductId="e5bd739e-05a5-4a61-a7ab-2b5d1da1de4e" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 

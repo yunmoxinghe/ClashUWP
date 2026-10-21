@@ -49,8 +49,8 @@ namespace ClashUWP.Backend
 
             try
             {
-                var agent = new VpnManagementAgent();
-                var all = await agent.GetProfilesAsync();
+                // ★【1.0.82 · Docs/34 §六】走串行层，不再自建 agent（见 ProfileDump 同处注释）。
+                var all = await ClashUWP.Vpn.ProfileStore.GetProfilesAsync();
 
                 sb.AppendLine($"Step=GetProfilesAsync");
                 sb.AppendLine($"Count={all.Count}");

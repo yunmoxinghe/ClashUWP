@@ -164,6 +164,10 @@ namespace ClashUWP.Backend
                     }
                 case var c when c.StartsWith("subuse") || c.StartsWith("subswitch"):
                     // ★ subuse <id>：切到某份 profile（复制到 config.yaml）。
+                    //   ★【1.0.86 · Docs/36 A 案】这条现在<b>会碰隧道</b>：ActivateAsync 末尾串行
+                    //   把会话切到新订阅的 profile（已连接时先断旧的、等收尾收干净再拨新的）。
+                    //   CLI 侧已把它从 state 提到 tunnel 并要求 --force —— 别在没带 --force 的
+                    //   自动化里发它，更别在网络敏感时刻发。
                     {
                         string id = arg;
                         foreach (string pfx in new[] { "subuse", "subswitch" })
@@ -206,8 +210,14 @@ namespace ClashUWP.Backend
         /// 默认的内核配置文件路径（<c>LocalState\config.kernel.yaml</c>）。
         /// ★ 与 <c>KernelConfig.EffectiveFileName</c> 同一个文件名 —— 那是组件侧的常量，
         ///   前台引得到（组件是 app 的依赖），但写成两处字面量更容易漂，所以显式对照。
+        /// ★【1.0.89 · Docs/38 §十四】改 <c>internal</c>：全仓只有<b>这里</b>算这个路径是对的
+        ///   （走 <c>ApplicationData.Current.LocalFolder</c>），而 <c>MihomoController.DiagnoseKernelAsync</c>
+        ///   在 <c>:1571</c> 把包目录名写死成了 <c>421769c5-…_y0tg80em3rma2</c> —— 那是 1.0.75 改名<b>之前</b>
+        ///   的家族名（现读 <c>git log -S</c> 为证：主清单 Identity Name 在 <c>3b11f69</c> 才换成
+        ///   <c>8B8CC4F4.ClashUWP</c>），所以那条诊断从 1.0.75 起<b>永远</b>打"内核配置文件不存在"。
+        ///   出口只留一个：诊断侧引这个方法，不许再自己拼路径。
         /// </summary>
-        private static string DefaultKernelConfigPath()
+        internal static string DefaultKernelConfigPath()
         {
             try
             {

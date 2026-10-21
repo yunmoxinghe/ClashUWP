@@ -371,6 +371,40 @@ namespace ClashUWP.Vpn
         internal static uint ConnectCalls => s_connectCalls;
 
         /// <summary>
+        /// ★【1.0.89 · Docs/38 §11.7 / §十四】本进程内"上一次 <c>Connect</c> 走完了、且之后平台
+        ///   再没回调过 <c>Disconnect</c>"——满足它就是<b>重连（reconnect）场景</b>。
+        ///
+        /// 【官方条文】<c>VpnChannel.TerminateConnection</c>："Terminates the connection attempt
+        ///   performed inside IVpnPlugIn.Connect. <b>Should not be called on reconnect cases.</b>"
+        ///   <c>VpnChannel.SetErrorMessage</c> 同被官方 sample 门控（原文注释
+        ///   "we do not set the error message for reconnection attempts"）——
+        ///   因为重连时错误消息会<b>反复糊在系统 VPN 面板/快速面板上</b>，而用户根本没在等一次新的建连。
+        ///
+        /// 【依据是现读的官方 sample，不是我的推断】
+        ///   <c>D:\fluentapps\repos\UwpVpnPluginSample\CSharp\TestVpnPluginAppBg\VpnPlugin.cs</c>：
+        ///   <c>:87</c> 声明 <c>IsReconnect</c>（注释 "For demo purposes, only support one instance"），
+        ///   <c>:572</c> 在 <c>Connect</c> 末尾置真，<c>:640</c> 只在 <c>Disconnect</c> 里置假；
+        ///   它门控 <c>SetErrorMessage</c>（<c>:595-597</c>）与前后自定义 UI 提示（<c>:207</c>、<c>:434</c>），
+        ///   而 <b>sample 全文一次都没调 <c>TerminateConnection</c></b>——失败就是 <c>throw</c>（<c>:599</c>）。
+        ///   ⇒ 官方口径是"平台<b>不给</b>"这是重连"的标志（26100 确实没有 <c>DisconnectReason</c>，
+        ///     见 <see cref="VpnChannel"/> 方法表核对），但<b>调用方可以自己推</b>"。
+        ///     本篇旧注释 <c>:1037-1040</c> 里"插件侧读不到 ⇒ 所以只能无条件调"那半句推理不成立，已订正。
+        ///
+        /// 【为什么这里是 <c>static</c> 而 sample 用实例字段】
+        ///   sample 明写"只支持一个实例"，靠的就是实例生命周期；我们不是——1.0.77 单清单入口合并之后
+        ///   app 与插件同进程（<c>Docs/38</c> §12.3 一手：<c>session 用户发起…</c> 与
+        ///   <c>connect 平台发起连接</c> 两行同 pid），且装机日志里每个会话都有多条
+        ///   <c>bgtask 插件进程启动</c> ⇒ 平台会<b>反复新建后台任务实例</b>复用同一个进程。
+        ///   实例字段会把标志位丢在新实例上，判据必须挂在进程级。
+        ///   <c>volatile</c>：写方是平台回调线程，读方可能是 catch 里的同一条线程，
+        ///   但同一个进程里还有泵线程在读别的静态标志——按本文件既有惯例一律 <c>volatile</c>。
+        /// </summary>
+        private static volatile bool s_lastConnectFinishedWithoutDisconnect;
+
+        /// <summary>只读视图：<see cref="s_lastConnectFinishedWithoutDisconnect"/>（判"这次是不是重连"）。</summary>
+        internal static bool IsReconnectAttempt => s_lastConnectFinishedWithoutDisconnect;
+
+        /// <summary>
         /// 会话生命周期日志：追加进 <c>LocalState\dataface-sessions.txt</c>，一行一个事件。
         ///
         /// 【为什么单独一个文件】<c>dataface-plugin.txt</c> 是"最后一次 Disconnect 的快照"，
@@ -431,7 +465,7 @@ namespace ClashUWP.Vpn
                 RollingLog.Error("connect-abort", "AssociateTransport 失败，本次连接已终止", ex);
                 try { channel.LogDiagnosticMessage("ClashUWP: AssociateTransport 失败，终止本次连接: " + ex); }
                 catch { /* 日志出口偶尔不可用 */ }
-                AbortConnectionAttempt(channel, "AssociateTransport failed");
+                AbortOrThrow(channel, "AssociateTransport failed");
                 return;
             }
 
@@ -477,7 +511,7 @@ namespace ClashUWP.Vpn
                 LogSession($"evt=connect-abort stage=read-config err={ex.GetType().Name}: {ex.Message}");
                 try { channel.LogDiagnosticMessage("ClashUWP: 读 profile 配置失败，终止本次连接: " + ex); }
                 catch { /* 日志出口偶尔不可用 */ }
-                AbortConnectionAttempt(channel, "read CustomField failed");
+                AbortOrThrow(channel, "read CustomField failed");
                 return;
             }
 
@@ -585,7 +619,7 @@ namespace ClashUWP.Vpn
                     }
                     catch { /* 日志出口偶尔不可用 */ }
                     LogSession($"evt=connect-abort stage=no-outbound reason={emptyReason}");
-                    AbortConnectionAttempt(channel, "配置无任何可用出站：" + emptyReason);
+                    AbortOrThrow(channel, "配置无任何可用出站：" + emptyReason);
                     return;
                 }
             }
@@ -616,8 +650,30 @@ namespace ClashUWP.Vpn
                 //   不存在也立即成功 —— 数据面在进程内，transport 纯属满足平台契约。
                 // Connect 是同步回调（IVpnPlugIn.Connect 返回 void），只能用同步等待；
                 // 后台任务线程上没有 SynchronizationContext，不会死锁。
-                _transport.ConnectAsync(new HostName(outerTarget), LocalSettings.OuterPort)
-                    .AsTask().GetAwaiter().GetResult();
+                // ★【1.0.88 · Docs/38 §十一 · D9】这个等待从<b>无上限</b>改成上限 3 s。
+                //   理由不是"猜它会卡"，而是官方承认平台在<b>等这次 Connect 返回</b>
+                //   （ActivateForeground 条文原话："While the app is in the foreground,
+                //    the regular <b>Connect timeout</b> is paused."）—— 既然平台在等，
+                //    我们就不能把自己的任何一步挂成无上限。官方从没给过这个超时的数值，
+                //    所以 3 s 是我们自己定的；实测这一步 UDP 立即返回（UDP ConnectAsync
+                //    不握手、不发包，只设默认远端），14 条会话里 Connect→Start 全程 1–2 s。
+                //   超时后照旧"继续"（与下面 catch 同一语义：Start 才是平台契约点），
+                //   但一定留一行，不让它变成又一个无声的悬挂。
+                var connectTask = _transport.ConnectAsync(new HostName(outerTarget), LocalSettings.OuterPort).AsTask();
+                if (!connectTask.Wait(System.TimeSpan.FromSeconds(3)))
+                {
+                    channel.LogDiagnosticMessage(
+                        "ClashUWP: ★ transport ConnectAsync 3 s 未返回（继续走 Start，这一跳不再等）.");
+                    RollingLog.Warn("connect", $"transport ConnectAsync 3s 未返回 outer={outerTarget}:{LocalSettings.OuterPort}（继续）");
+                    // 这一条我们不再等它 ⇒ 它将来抛的话就没人接了。挂个只看失败的续块，
+                    // 让"晚到的失败"也出声（未观察异常在 .NET 里不会崩进程，但会静静消失）。
+                    _ = connectTask.ContinueWith(t => RollingLog.Warn("connect",
+                            $"那条超时的 transport ConnectAsync 后来抛了：{t.Exception?.GetBaseException().GetType().Name}: " +
+                            $"{t.Exception?.GetBaseException().Message}"),
+                        System.Threading.CancellationToken.None,
+                        System.Threading.Tasks.TaskContinuationOptions.OnlyOnFaulted,
+                        System.Threading.Tasks.TaskScheduler.Default);
+                }
                 channel.LogDiagnosticMessage(
                     $"ClashUWP: transport 已连接（outerTarget={outerTarget}:{LocalSettings.OuterPort}，" +
                     $"配置来源={(rawConfigPath == null ? "内置兜底" : "config.yaml")}，" +
@@ -880,6 +936,25 @@ namespace ClashUWP.Vpn
                 //   发不出通知（比如插件进程没有包身份）只影响通知，绝不影响数据面：
                 //   StatusToast 内部全程 try/catch，失败只进 channel=toast 的日志。
                 StatusToast.Start(_config, this);
+
+                // ★【1.0.88 · Docs/38 §十一 · D9】Connect 回调累计阻塞时长 —— 给装机验收用的判据行。
+                //   依据两条官方原文：
+                //   ① <c>IVpnPlugIn.Connect</c> 是平台<b>同步</b>等待的回调（26100 投影里它只有签名、
+                //      没有 Remarks，官方也从未承诺时限）⇒ 这一段是我们占住平台的时间；
+                //   ② <c>VpnChannel.ActivateForeground</c> 的 Remarks 原文
+                //      "While the app is in the foreground, the regular <b>Connect timeout</b> is paused" ——
+                //      官方承认<b>存在</b>一个 Connect 超时，但从没给数值。
+                //   所以这一行是唯一能和那句官方超时放在同一把尺上比的量；数值口径（多少算慢）是我们自己定的。
+                //   本机已有对照：Connect → <c>evt=start</c> 实测 1–2 s，桥启动 157–577 ms（1.0.85 / 1.0.87）。
+                RollingLog.Info("connect-window",
+                    $"Connect 回调内累计阻塞={(DateTime.Now - _connectBeganAt).TotalMilliseconds:F0}ms" +
+                    "（平台同步等这一段；官方承认有 Connect 超时但未给数值）");
+
+                // ★【1.0.89 · Docs/38 §十四】建连成功走完 ⇒ 记下"这条会话活着、且还没被 Disconnect 回调过"。
+                //   位置照官方 sample：<c>VpnPlugin.cs:572</c> 就是放在 Connect 末尾。
+                //   从这一行起，任何再进来的 Connect 都是<b>重连</b>，<see cref="AbortConnectionAttempt"/>
+                //   据此跳过 TerminateConnection 与 SetErrorMessage（条文"Should not be called on reconnect cases."）。
+                s_lastConnectFinishedWithoutDisconnect = true;
             }
             catch (Exception ex)
             {
@@ -906,6 +981,11 @@ namespace ClashUWP.Vpn
                 catch { /* 日志出口不可用，不能因此跳过收尾 */ }
                 LogSession($"evt=start-failed stage={(_started ? "post-start" : "start")} " +
                            $"err={ex.GetType().Name} {ex.Message}");
+                // ★【1.0.88 · Docs/38 §十一 · D9】失败也要量：占住平台多久之后才抛出去，
+                //   和成功路径是同一个判据（上面那条 connect-window 走不到这里）。
+                RollingLog.Info("connect-window",
+                    $"Connect 回调失败前累计阻塞={(DateTime.Now - _connectBeganAt).TotalMilliseconds:F0}ms" +
+                    $" stage={(_started ? "post-start" : "start")}");
                 // ★ 人读的那一行把阶段说清楚：_started=false 是平台 Start 本身失败，
                 //   true 则是桥 FailFast / 看门狗 —— 两者修法完全不同（Docs/09 C4）。
                 RollingLog.Error("start-failed",
@@ -948,6 +1028,13 @@ namespace ClashUWP.Vpn
                 //   为什么不只 rethrow：只抛出去时"平台到底怎么理解这次失败"是<b>推断</b>，
                 //   而 00:21 那类"半装状态没人收尾"（孤儿 NRPT + 幽灵路由 = 整机断网）
                 //   正是靠推断过活的路径长出来的。显式终止 = 把意图说给平台听。
+                //   ★【1.0.89 · Docs/38 §十四】<b>但重连场景除外</b>：条文原话 "Should not be called on
+                //     reconnect cases."，所以 <see cref="AbortConnectionAttempt"/> 在重连时两个 channel
+                //     调用都不发（<c>evt=skip-terminate-reconnect</c> 留痕）。这一支的出口本来就是紧跟在
+                //     后面的 <c>throw;</c>（<b>原异常</b>，与官方 sample 的 catch 完全同形：
+                //     <c>VpnPlugin.cs:595-599</c> 先按 <c>IsReconnect</c> 决定要不要 SetErrorMessage，
+                //     然后一律 <c>throw;</c>），所以这一处<b>不需要</b>像那三处早期失败点一样改用
+                //     <see cref="AbortOrThrow"/> —— 出口已经有了，只是从"显式终止 + 抛出"变成"只抛出"。
                 // ★ <c>_started==true</c>（桥 FailFast / 步 8 之后任何一处抛）这一支<b>不调</b>
                 //   TerminateConnection，改为<b>显式</b>发起平台级收尾：1.0.26 之前这里只 rethrow，
                 //   注释写着"由平台拆通道后回调 Disconnect 收尾"，而那个假设没有证据（同一个
@@ -983,27 +1070,68 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
-        /// Connect 内、<b>Start 成功之前</b>的官方失败出口。
+        /// Connect 内、<b>Start 成功之前</b>的失败出口。返回值 = <b>"官方那条显式出口（TerminateConnection）
+        /// 这次到底用没用"</b>：<c>true</c> 表示已按非重连路径终止，调用方可以 <c>return</c>；
+        /// <c>false</c> 表示这是<b>重连场景</b>、按官方条文两次都没调 ⇒ 调用方<b>必须改成抛出</b>
+        /// （见下方【重连这一支为什么要有出口】），否则这次 Connect 既没建连也没给平台任何答复。
         ///
-        /// 【官方】TerminateConnection(String)：
+        /// 【官方原文一】<c>VpnChannel.TerminateConnection(String)</c>：
         ///   "Terminates the connection attempt performed inside IVpnPlugIn.Connect.
         ///    <b>Should not be called on reconnect cases.</b>"
-        ///   —— 也就是说它是给"插件自己判定这次建连做不下去"准备的显式出口，
+        ///   —— 它是给"插件自己判定这次<b>新建连</b>做不下去"准备的显式出口，
         ///   不是用来拆已经跑起来的会话（那种形态走平台级断开 +
         ///   <see cref="GracefulTeardown"/> 那道闸，见 <see cref="SessionWatchdog"/>）。
+        /// 【官方原文二】<c>SetErrorMessage</c>：
+        ///   "These error messages will be displayed to the user in both the VPN flyout and
+        ///    settings page when we fail to connect."
         ///
-        /// ★ 本方法<b>绝不抛出</b>：它在失败路径上被调用，从这里再抛一次异常
+        /// ★★【1.0.89 · Docs/38 §十四 · 订正】旧注释在这里写过一句错的推论：
+        ///   "重连场景在 26100 的插件侧读不到 ⇒ 所以这里的调用条件只能是 <c>_started==false</c>
+        ///    且我们仍在自己的 Connect 里"。前半句事实成立（平台确实不给标志），
+        ///   但<b>由它推出的结论不成立</b>：官方 sample 就是<b>自己推</b>这个标志来门控的。现读为证
+        ///   （<c>D:\fluentapps\repos\UwpVpnPluginSample\CSharp\TestVpnPluginAppBg\VpnPlugin.cs</c>）：
+        ///   <c>:87</c> <c>bool IsReconnect</c>（注释 "Set this bool to true so that next time
+        ///   we are called to connect we will know it is really a reconnection"），
+        ///   <c>:572</c> 在 <c>channel.Start(...)</c> 之后立刻置真，<c>:640</c> 只在 <c>Disconnect</c> 置假；
+        ///   catch 里 <c>:595-597</c> 原文 <c>if (IsReconnect == false) { channel.SetErrorMessage(ex.Message); }</c>
+        ///   配注释 "Note that we do not set the error message for reconnection attempts"，紧跟 <c>throw;</c>；
+        ///   而 <b>sample 全文一次都没有调 <c>TerminateConnection</c></b>。
+        ///   ⇒ 官方的失败出口是<b>把异常抛回平台</b>，连重连测试异常（<c>exConnect_3</c>，<c>:577</c>）
+        ///     都是"从 Connect 里抛出去"这一种形状，条文里那句 "Should not" 于是有了落点。
+        ///
+        /// 【重连这一支为什么要有出口】跳过两个 channel 调用之后如果直接 <c>return</c>，
+        ///   这次 Connect 就<b>什么信号都不给</b>：既不建连、不终止、也不抛 ⇒ 平台只能等它自己那个
+        ///   "存在但从不给数值"的 Connect 超时（<c>ActivateForeground</c> 条文），
+        ///   正是本篇在修的那一族"把系统吊在那儿"的形态。所以按 sample 换成抛出。
+        ///   ★ 这三处抛出点（步 0 AssociateTransport / 步 3 读 CustomField / 步 4 无可用出站）
+        ///     全都在<b>路由与 DNS 下发（步 5）之前</b>，此时我们<b>还没</b>往平台交过任何东西，
+        ///     所以"异常漏出 Connect 会不会没人收尾"在这里不成立 —— 没有东西要收。
+        ///
+        /// ★ 本方法自身<b>绝不抛出</b>：它在失败路径上被调用，从这里再抛一次异常
         ///   就等于把"漏异常出平台回调"这个病自己犯一遍（run 34 的实证后果）。
-        /// ★ 重连（reconnect）场景在 26100 的插件侧<b>读不到</b>（没有 DisconnectReason、
-        ///   也没有公开的"这是重连"标志，见 <see cref="VpnChannel"/> 的方法表核对结果），
-        ///   所以这里的调用条件只能是"<c>_started==false</c> 且我们仍在自己的 Connect 里"——
-        ///   这正是条文描述的场景；平台自动重拨时新起的 Connect 同样是这个形状。
+        ///   （返回值给调用方决定抛不抛，抛的是调用方那一句，不是这里。）
         /// </summary>
-        private void AbortConnectionAttempt(VpnChannel channel, string reason)
+        private bool AbortConnectionAttempt(VpnChannel channel, string reason)
         {
+            // ★【1.0.89】重连场景：TerminateConnection 有条文禁令、SetErrorMessage 被官方 sample 门控，
+            //   两个都不调。只留一行证据，并把"这次没走官方出口"回给调用方。
+            if (IsReconnectAttempt)
+            {
+                LogSession($"evt=skip-terminate-reconnect reason={reason} " +
+                           "判据=上次 Connect 走完且平台未回调 Disconnect ⇒ 本次是重连（官方 sample 同口径）");
+                try
+                {
+                    channel.LogDiagnosticMessage(
+                        "ClashUWP: 重连场景不使用 TerminateConnection/SetErrorMessage（官方条文），" +
+                        "本次失败以异常上报: " + reason);
+                }
+                catch { /* 日志出口偶尔不可用 */ }
+                return false;
+            }
+
             try
             {
-                // ★【1.0.74 · P0】先设错误消息，再终止连接。
+                // 先设错误消息，再终止连接。
                 //   【官方】SetErrorMessage："These error messages will be displayed to the user
                 //     in both the VPN flyout and settings page when we fail to connect."
                 //   不调它 = 用户在系统 VPN 面板看不到任何失败原因，只看到"连接失败"。
@@ -1027,6 +1155,22 @@ namespace ClashUWP.Vpn
                 LogSession($"evt=terminate-connection-failed reason={reason} " +
                            $"err={ex.GetType().Name}: {ex.Message}");
             }
+            return true;
+        }
+
+        /// <summary>
+        /// ★【1.0.89 · Docs/38 §十四】<see cref="AbortConnectionAttempt"/> 的统一写法，给
+        ///   Connect 里那三处"<b>步 5 路由/DNS 下发之前</b>"的失败点用（AssociateTransport、
+        ///   读 CustomField、无可用出站）：非重连 ⇒ 官方显式出口 + 调用方 <c>return</c>；
+        ///   重连 ⇒ 条文禁令生效后<b>必须有别的出口</b>，按官方 sample 换成抛出
+        ///   （<c>VpnPlugin.cs:599</c> 就是 <c>throw;</c>，且它连"重连时抛"都不例外）。
+        /// 这三处抛出去时我们还没往平台交过任何路由/DNS/NRPT ⇒ 不存在"没人收尾"的敞口。
+        /// </summary>
+        private void AbortOrThrow(VpnChannel channel, string reason)
+        {
+            if (!AbortConnectionAttempt(channel, reason))
+                throw new InvalidOperationException(
+                    "重连场景按官方条文不使用 TerminateConnection/SetErrorMessage，本次失败以异常上报: " + reason);
         }
 
         /// <summary>
@@ -1789,6 +1933,14 @@ namespace ClashUWP.Vpn
             // ★ <c>_started</c> 抢在第一行置假：泵的三个门闩里它就是"别再往这条通道注包"的信号，
             //   放在收尾中间意味着异常一抛、泵还在对一条正在拆的通道注入。
             _started = false;
+
+            // ★【1.0.89 · Docs/38 §十四】平台既然回调了 Disconnect，这条会话就"死过一次"了：
+            //   下一次 Connect 是<b>全新建连</b>、不再算重连 ⇒ <see cref="AbortConnectionAttempt"/>
+            //   重新允许 TerminateConnection / SetErrorMessage。
+            //   位置照官方 sample（<c>VpnPlugin.cs:640</c> 只在这一处把 IsReconnect 置假），
+            //   并跟着 <c>_started</c> 一起<b>抢在第一行</b>改：收尾主体一抛就进 catch，
+            //   标志位不能留到 finally 才动（留在 finally 也一样能走到，但这里要的是"绝不落空"）。
+            s_lastConnectFinishedWithoutDisconnect = false;
 
             try
             {

@@ -75,7 +75,19 @@ namespace ClashUWP.Backend
             DateTime FetchedAt,
             long SizeBytes,
             int NodeCount,
-            int RuleCount);
+            int RuleCount,
+            int ProviderCount,
+            int InlineProviderNodes);
+
+        /// <summary>订阅形态校验结果（<see cref="ProbeShape"/> 返回）。</summary>
+        internal sealed record ShapeProbe(bool Ok, string? Error);
+
+        /// <summary>
+        /// ★【1.0.81 · 修复 Q1/Q2】串行化"落盘 + 激活 + 热重载"，避免重复点「更新」时
+        /// 两次 <see cref="FetchAsync"/> 交叉写 <c>config.yaml</c>（旧响应覆盖新响应）。
+        /// 下载在锁外并行无妨；仅序列化写段。
+        /// </summary>
+        private static readonly System.Threading.SemaphoreSlim _fetchGate = new(1, 1);
 
         // ── 拉取 ──────────────────────────────────────────────────────────
 
@@ -124,21 +136,28 @@ namespace ClashUWP.Backend
             }
             catch (Exception ex)
             {
-                return new Result(false, $"拉取异常: {ex.GetType().Name}: {ex.Message}");
+                // ★【1.0.81 · M6/Q9】异常消息可能夹带完整 URL（含订阅 token 的 query），
+                //   只回异常类型，不把 URL 写进用户可见文案 / 日志。
+                return new Result(false, $"拉取异常: {ex.GetType().Name}");
             }
 
             if (string.IsNullOrWhiteSpace(text))
                 return new Result(false, "订阅内容为空");
 
-            // ★ 最基本的形态校验：至少得有 proxies 或 proxies-providers 之一。
-            //   不做完整 YAML 校验（那会把"机场换了格式"误判成"拉取失败"），
-            //   只挡掉"拉到的是登录页/错误页"这种最常见的坑。
-            if (!text.Contains("proxies") && !text.Contains("proxies-providers"))
-                return new Result(false, "内容不像 Clash 订阅（找不到 proxies/proxies-providers）");
+            // ★【1.0.81 · 修复 Q1/Q2】形态校验：官方 yaml 顶层结构判定（见 <see cref="ProbeShape"/>）。
+            //   取代旧的 <c>text.Contains("proxies")</c> 弱判据：旧判据①用错键
+            //   <c>proxies-providers</c>（官方是 <c>proxy-providers</c>），②纯 provider 型订阅
+            //   （无顶层 <c>proxies:</c>）会被整体拒收，③HTML 错误页含 "proxies" 会被误判并覆盖旧配置。
+            //   校验在落盘之前，失败不覆盖缓存。
+            var shape = ProbeShape(text);
+            if (!shape.Ok)
+                return new Result(false, shape.Error ?? "订阅形态校验未通过");
 
-            string id = MakeId(url);
+            // ★【1.0.81 · M5/Q5】串行化"落盘 + 激活 + 热重载"，避免并发刷新交叉写 config.yaml。
+            await _fetchGate.WaitAsync();
             try
             {
+                string id = MakeId(url);
                 await EnsureDirAsync();
                 string path = PathFor(id);
                 await WriteAllTextAsync(path, text);
@@ -154,7 +173,8 @@ namespace ClashUWP.Backend
                 var self = list.FirstOrDefault(x => x.Id == id)
                            ?? new Profile(id,
                                   displayName.Length > 0 ? displayName : FallbackName(id, url),
-                                  url, DateTime.Now, text.Length, info.NodeCount, info.RuleCount);
+                                  url, DateTime.Now, text.Length, info.NodeCount, info.RuleCount,
+                                  info.ProviderCount, info.InlineProviderNodes);
 
                 // ★【1.0.62】为该订阅注册一个独立的系统 VPN profile（快速设置面板原生列出、
                 //   点哪个连哪个）。无论是否立即启用都注册 —— 拉过的订阅都应在快速设置里可切。
@@ -179,8 +199,10 @@ namespace ClashUWP.Backend
                     await WriteAllTextAsync(ActiveName, text);
                     await SetActiveAsync(id);
                     // ★ UX 对齐 Verge：拉取并启用后原地热重载，不必断重连。
+                    // ★【1.0.81 · M8/Q12】reload 失败（核心拒绝/崩溃）则整体标失败：
+                    //   不要再报"已拉取"假成功，让用户知道新订阅没真正生效。
                     var reload = await ReloadActiveConfigAsync();
-                    return new Result(true,
+                    return new Result(reload.Ok,
                         $"已拉取 {info.NodeCount} 节点 / {info.RuleCount} 规则（{info.SizeBytes / 1024.0:F1} KB）　{reload.Message}　{reg.Message}",
                         id);
                 }
@@ -192,6 +214,22 @@ namespace ClashUWP.Backend
             {
                 return new Result(false, $"落盘失败: {ex.GetType().Name}: {ex.Message}");
             }
+            finally
+            {
+                // ★【1.0.81 · M5/Q5】无论哪条返回路径都释放闸门，避免死锁（重复点「更新」时串行化）。
+                _fetchGate.Release();
+            }
+        }
+
+        /// <summary>
+        /// ★【1.0.81 · 修复 Q1/Q2 · 可单测】订阅正文形态校验。
+        /// 逻辑抽到无依赖的 <see cref="SubscriptionShape.ProbeShape"/>（同一份、可被离线夹具直测），
+        /// 这里只做结果类型的桥接。校验在落盘之前，失败不覆盖缓存。
+        /// </summary>
+        internal static ShapeProbe ProbeShape(string text)
+        {
+            var p = SubscriptionShape.ProbeShape(text);
+            return new ShapeProbe(p.Ok, p.Error);
         }
 
         // ── 切换 / 更新 ───────────────────────────────────────────────────
@@ -222,8 +260,21 @@ namespace ClashUWP.Backend
                 string shown = self != null ? DisplayName(self, list) : FallbackName(id, url);
                 string profName = self != null ? SystemProfileName(self, list) : FallbackName(id, url);
                 var reg = await VpnProfileSetup.EnsureSubscriptionProfileAsync(id, profName);
-                return new Result(true,
-                    $"已切到「{shown}」：{info.NodeCount} 节点 / {info.RuleCount} 规则　{reload.Message}　{reg}", id);
+
+                // ★★【1.0.86 · Docs/36 A 案】热重载不等于换了隧道：账本改了、
+                //   会话仍属旧订阅的 profile 时，插件每次（重）拨号都会按旧 subId 覆写
+                //   config.kernel.yaml，把上面那次热重载吃掉（本机实测见 Docs/36 E6/E8）。
+                //   ⇒ 必须把隧道会话本身切过来。放在 reg 之后：profile 先就位才谈得上连它。
+                //   无会话/已在该条上时它自己返回 Ok，属正常路径，不是"做了什么"。
+                (bool switched, string switchMsg) = await VpnSession.SwitchSubscriptionAsync(id);
+
+                // ★【1.0.81 · M8/Q12】reload 失败则整体标失败，不报"已切"假成功。
+                // ★【1.0.86】同理，隧道没落到 Connected 也不能说"已切到"——
+                //   这条正是 Docs/36 那个"前台显示新订阅、隧道还在旧订阅"的谎报源头。
+                bool ok = reload.Ok && switched;
+                string head = ok ? $"已切到「{shown}」" : $"切到「{shown}」未完成";
+                return new Result(ok,
+                    $"{head}：{info.NodeCount} 节点 / {info.RuleCount} 规则　{reload.Message}　{reg}　隧道={switchMsg}", id);
             }
             catch (Exception ex)
             {
@@ -392,7 +443,20 @@ namespace ClashUWP.Backend
                     return new Result(true, "新订阅已落盘（内核未连接，下次连接自动加载）");
 
                 string reload = await MihomoController.RunReloadAsync(path);
-                return new Result(true, "已热重载内核: " + reload);
+                // ★【1.0.81 · M8/Q12】不再把"落盘即成功"伪装成成功：RunReloadAsync 已把
+                //   内核对非法配置的拒收（非 2xx + 原因）拼进文本，这里据前缀判真值；内核拒绝
+                //   ⇒ 整体失败，用户立刻知道"新订阅没真正生效"，而不是看到"已拉取/已切"假成功。
+                if (!MihomoController.IsReloadSuccess(reload))
+                    return new Result(false, "热重载被核心拒绝（新配置可能非法）: " + reload);
+
+                // ★【M8 · 核心接受度判据】HTTP 2xx 只代表"收到并解析"，核心随后仍存活才代表
+                //   "真接受了这份配置"。重载成功后再次探活：无应答 ⇒ 很可能非法配置把核心搞崩。
+                if (!await IsKernelUpAsync())
+                    return new Result(false,
+                        "已发重载但核心随后无应答：很可能新配置非法导致核心崩溃，" +
+                        "请查 logs/app.log（config 频道）确认原因");
+
+                return new Result(true, "已热重载内核: " + reload + "　（核心已接受并在线）");
             }
             catch (Exception ex)
             {
@@ -490,7 +554,7 @@ namespace ClashUWP.Backend
 
                 long size = 0;
                 DateTime mtime = DateTime.MinValue;
-                int nodes = 0, rules = 0;
+                int nodes = 0, rules = 0, providers = 0, inline = 0;
                 try
                 {
                     var props = await f.GetBasicPropertiesAsync();
@@ -502,13 +566,15 @@ namespace ClashUWP.Backend
                     var info = SubscriptionView.Parse(text, size, mtime);
                     nodes = info.NodeCount;
                     rules = info.RuleCount;
+                    providers = info.ProviderCount;
+                    inline = info.InlineProviderNodes;
                 }
                 catch
                 {
                     // 读不了一份也不能让整份列表失败，那份就显示成 0 节点。
                 }
 
-                result.Add(new Profile(id, name, url, mtime, size, nodes, rules));
+                result.Add(new Profile(id, name, url, mtime, size, nodes, rules, providers, inline));
             }
 
             result.Sort((a, b) => b.FetchedAt.CompareTo(a.FetchedAt));
@@ -698,14 +764,21 @@ namespace ClashUWP.Backend
                 return "（还没有订阅：用 fetch <URL> 拉一个）";
 
             var sb = new StringBuilder();
-            sb.Append($"共 {profiles.Count} 份，生效={active.Id}({(active.Url.Length == 0 ? "无URL" : active.Url)})");
+            // ★【1.0.81 · M6/Q9】生效 URL 只显示 host，不把可能带订阅 token 的 query/path 露出去
+            //   （订阅链接的凭证几乎都挂在 ? 后面）。要排查用 CLI 的调试通道，那里按需显式打印。
+            string activeUrlShown = active.Url.Length == 0 ? "无URL" : HostOf(active.Url);
+            sb.Append($"共 {profiles.Count} 份，生效={active.Id}({activeUrlShown})");
             foreach (var p in profiles)
             {
                 bool isActive = string.Equals(p.Id, active.Id, StringComparison.OrdinalIgnoreCase);
                 string shown = DisplayName(p, profiles);
                 if (!string.Equals(shown, p.Id, StringComparison.Ordinal))
                     shown += $" [{p.Id}]";   // CLI 的 switch/delete 还要用 id
-                sb.Append($"\n{(isActive ? "▶" : " ")} {shown}  {p.NodeCount}节点/{p.RuleCount}规则  " +
+                // ★【1.0.81 · Q3】inline 提供方的 payload 节点也是真实可用的，并进来一起显示；
+                //   纯提供方型订阅不再被显示成"0 节点"。
+                int shownNodes = p.NodeCount + p.InlineProviderNodes;
+                string prov = p.ProviderCount == 0 ? "" : $"/{p.ProviderCount}提供方";
+                sb.Append($"\n{(isActive ? "▶" : " ")} {shown}  {shownNodes}节点{prov}/{p.RuleCount}规则  " +
                           $"{p.SizeBytes / 1024.0:F1}KB  {p.FetchedAt:MM-dd HH:mm}");
             }
             return sb.ToString();

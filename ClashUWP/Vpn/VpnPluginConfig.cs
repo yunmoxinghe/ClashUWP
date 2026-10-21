@@ -100,6 +100,41 @@ namespace ClashUWP.Vpn
         public string SubId { get; set; } = "";
 
         /// <summary>
+        /// ★【1.0.81 · 通知优化】订阅显示名（从机场响应头解析出来的友好名称）。
+        ///
+        /// 用于在状态通知中显示"星链机场"而不是 "RyjBM4AAk7gx" 这种 ID。
+        /// 空串时回退到 <see cref="SubId"/>。
+        /// </summary>
+        public string SubDisplayName { get; set; } = "";
+
+        /// <summary>
+        /// ★【快速面板改造】这段 CustomConfiguration 是不是<b>我们 schema</b> 的 XML（root 元素是 <c>clash</c>）。
+        ///
+        /// 【为什么要它】订阅 profile 的名字从这一版起<b>不再带 <c>ClashUWP · </c> 前缀</b>
+        ///   （快速设置里直接显示订阅名），于是"按名字族认领"对它失效 —— 换签名证书
+        ///   （＝换包家族哈希）之后，旧家族建的订阅 profile 既不同家族、也不同名字，
+        ///   再没有第三条判据它们就是永久幽灵。CustomConfiguration 的 root <c>clash</c>
+        ///   是我们自己造的元素名（见 <see cref="ToXml"/>），别人家的 VPN 插件不会写它。
+        /// 【为什么不能拿 <see cref="Parse"/> 凑合】Parse 对<b>任何</b>合法 XML 都返回
+        ///   默认值不抛（那是给插件侧兜底的契约），判不出"是不是我们的 schema"。
+        /// 【纪律】只用于"认领/看见"（IsOurs、prune），不用于"取对象来连"——
+        ///   连接永远先同家族，这条判据与 <c>GracefulTeardown.IsOurName</c> 同级兜底。
+        /// </summary>
+        internal static bool IsOurSchema(string? customConfiguration)
+        {
+            if (string.IsNullOrWhiteSpace(customConfiguration))
+                return false;
+            try
+            {
+                return XElement.Parse(customConfiguration).Name.LocalName == "clash";
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         /// 解析前台下发的 CustomConfiguration。解析不出来就退回默认值，不抛 ——
         /// 插件侧抛异常会让 <c>Connect</c> 直接失败，用户只看到"连不上"。
         /// </summary>
@@ -175,6 +210,12 @@ var dns = Elements(root, "dns");
                 config.SubId = sb2.ToString();
             }
 
+            // ★【1.0.81】<subDisplayName>：订阅显示名。用于通知等 UI 展示，
+            //   允许中文/emoji 等 Unicode 字符，不做字符过滤。
+            string? rawName = Element(root, "subDisplayName");
+            if (!string.IsNullOrWhiteSpace(rawName))
+                config.SubDisplayName = rawName;
+
             // 兜底夹紧：mtu < maxFrame 是官方明文约束，配置写反了也不能让它违规。
             if (config.Mtu >= config.MaxFrame)
                 config.Mtu = config.MaxFrame - 1;
@@ -197,6 +238,9 @@ var dns = Elements(root, "dns");
             foreach (string route in ExcludeRoutes) sb.Append($"<excludeRoute>{route}</excludeRoute>");
             if (SubId.Length > 0)
                 sb.Append($"<subId>{SubId}</subId>");
+            // ★【1.0.81】订阅显示名：用于通知等 UI 展示
+            if (SubDisplayName.Length > 0)
+                sb.Append($"<subDisplayName>{SubDisplayName}</subDisplayName>");
             sb.Append("</clash>");
             return sb.ToString();
         }

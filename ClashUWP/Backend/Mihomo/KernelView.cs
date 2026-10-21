@@ -37,15 +37,17 @@ namespace ClashUWP.Backend.Mihomo
                                     IReadOnlyList<Member> Members)
         {
             /// <summary>
-            /// 能不能手选：<b>只有 Selector 可以</b> —— 与安卓版一致
-            /// （CMFA 的 <c>PagerFragment</c> 里只有 <c>group.type == "Selector"</c> 才把
-            /// 点行动作接到 <c>patchSelector</c>，url-test / fallback / load-balance
-            /// 是只读页）。自动组的选择由内核测速/故障转移维护，手选会在下一轮被改回去，
+            /// 能不能手选：<b>只有 Selector 与 Relay 可以</b>（二者都是手动组，选择由用户决定且持久）
+            /// —— 与安卓版一致（CMFA 的 <c>PagerFragment</c> 里只有可手选的组才把
+            /// 点行动作接到 <c>patchSelector</c>）。url-test / fallback / load-balance
+            /// 是只读页：自动组的选择由内核测速/故障转移维护，手选会在下一轮被改回去，
             /// 给一个"点了会自己变回去"的按钮不如说明白它是谁在选。
-            /// ★ 类型名认内核给的驼峰形态，两套写法都收（同 <c>IsSelectableGroupType</c>）。
+            /// ★【1.0.81 · M3/Q7】补 <c>Relay</c>/<c>relay</c>：relay 与 Selector 同为手动组，
+            ///   官方 Mihomo 同样支持手选切换；<c>LoadBalance</c> 维持不可手选。
+            /// ★【1.0.84 · 判据抽函数】"类型名 → 能不能手选"抽到 <see cref="IsUserSelectableType"/>，
+            ///   与"某个成员是不是一个可手选的子组"共用同一份 —— Q7 那条"两处口径分叉"不能再犯一遍。
             /// </summary>
-            internal bool IsUserSelectable =>
-                Type is "Selector" or "select";
+            internal bool IsUserSelectable => IsUserSelectableType(Type);
 
             /// <summary>成员里<b>真节点</b>的个数（嵌套组与内置策略不算，安卓口径）。</summary>
             internal int RealNodeCount
@@ -61,6 +63,26 @@ namespace ClashUWP.Backend.Mihomo
         }
 
         /// <summary>
+        /// "这个类型名能不能手选"的<b>唯一</b>判据（组的类型、成员里嵌套组的类型都走这里）。
+        /// 认内核给的驼峰形态，配置里的短写法也一并收（同 <c>MihomoController.IsSelectableGroupType</c>）。
+        /// </summary>
+        internal static bool IsUserSelectableType(string type) =>
+            type is "Selector" or "select" or "Relay" or "relay";
+
+        /// <summary>
+        /// 按名字找组。<b>Ordinal</b> 原样比 —— 组名带 emoji、带空格、带前导空格都是订阅里的常态，
+        /// 任何规范化都会让"点一个组"跳错或干脆找不到。
+        /// 两处用得上：<c>MainComponent.MemberList</c> 的页头与组行（组行副标题里那个
+        /// "真节点 N" 是这个组<b>自己</b>的 <see cref="Group.RealNodeCount"/>，不是父组的）。
+        /// </summary>
+        internal static Group? Find(IReadOnlyList<Group> groups, string name)
+        {
+            foreach (var g in groups)
+                if (string.Equals(g.Name, name, StringComparison.Ordinal)) return g;
+            return null;
+        }
+
+        /// <summary>
         /// 组里的一个成员。<see cref="DelayMs"/> 为 -1 表示<b>从没测过</b>。
         ///
         /// 【★ 为什么成员要带分类】安卓的分类是内核在 Go 里做好的
@@ -72,7 +94,8 @@ namespace ClashUWP.Backend.Mihomo
         ///   节点显示协议类型），并且只对真节点显示延迟。
         /// </summary>
         internal sealed record Member(string Name, long DelayMs, string Type,
-                                     bool IsGroup, bool IsBuiltin, string Now);
+                                     bool IsGroup, bool IsBuiltin, string Now,
+                                     string ProviderName);
 
         /// <summary>一条活动连接。</summary>
         internal sealed record Conn(string Target, string Chain, long Upload, long Download);
@@ -85,11 +108,13 @@ namespace ClashUWP.Backend.Mihomo
             string LogLevel,
             string InterfaceName,
             IReadOnlyList<Group> Groups,
-            IReadOnlyList<Conn> Connections)
+            IReadOnlyList<Conn> Connections,
+            IReadOnlyList<MihomoController.ProviderInfo> Providers)
         {
             internal static Snapshot Failed(string error) => new(
                 false, error, "", "", "",
-                System.Array.Empty<Group>(), System.Array.Empty<Conn>());
+                System.Array.Empty<Group>(), System.Array.Empty<Conn>(),
+                System.Array.Empty<MihomoController.ProviderInfo>());
         }
 
         /// <summary>
@@ -127,25 +152,8 @@ namespace ClashUWP.Backend.Mihomo
                     using var http = MihomoController.NewLoopbackClient(10);
                     string json = await http.GetStringAsync("http://127.0.0.1:9090/proxies");
                     using var doc = System.Text.Json.JsonDocument.Parse(json);
-                    var (gs, delay, byName) = MihomoController.ReadProxiesTable(doc.RootElement);
-                    foreach (var g in gs)
-                    {
-                        var members = new List<Member>(g.Members.Count);
-                        foreach (string name in g.Members)
-                        {
-                            // ★ 每个成员都去 ByName 查自己的分类；查不到就按"未知节点"处理
-                            //   （Type 空串、不是组、不是策略）—— 宁可少一条副标题，
-                            //   也不要把未知东西当成组藏起来。
-                            byName.TryGetValue(name, out MihomoController.ProxyInfo? info);
-                            members.Add(new Member(name,
-                                delay.TryGetValue(name, out long d) ? d : -1L,
-                                info?.Type ?? "",
-                                info?.IsGroup ?? false,
-                                info?.IsBuiltin ?? false,
-                                info?.Now ?? ""));
-                        }
-                        groups.Add(new Group(g.Name, g.Type, g.Now, members));
-                    }
+                    var (gs, delay, byName, _) = MihomoController.ReadProxiesTable(doc.RootElement);
+                    groups = BuildGroups(gs, byName, delay);
                 }
                 catch (Exception ex)
                 {
@@ -180,7 +188,56 @@ namespace ClashUWP.Backend.Mihomo
                 }
             }
 
-            return new Snapshot(error.Length == 0, error, mode, level, iface, groups, conns);
+            // ④ 提供方状态：GET /providers/proxies（M7/Q10，补充信息）
+            //   ★ 独立 try：拉不到<b>不写全局 error</b> —— 它是补充信息，
+            //   不该让"代理页"整体显示"未连接"；内核没起时本就为空列表。
+            var providers = new List<MihomoController.ProviderInfo>();
+            try
+            {
+                providers = await MihomoController.GetProvidersAsync();
+            }
+            catch (Exception ex)
+            {
+                ClashUWP.Vpn.RollingLog.Info("kernelview-providers",
+                    $"读 /providers/proxies 失败（补充信息，忽略）: {ex.GetType().Name}");
+            }
+
+            return new Snapshot(error.Length == 0, error, mode, level, iface, groups, conns, providers);
+        }
+
+        /// <summary>
+        /// 把 <c>ReadProxiesTable</c> 的三张表（组 / 分类 / 延迟）折成 UI 用的 <see cref="Group"/> 列表。
+        ///
+        /// 【★ 为什么单独抽出来（1.0.84）】这段原来内联在 <see cref="LoadAsync"/> 里。
+        ///   抽出来不是为了好看：<c>LoadAsync</c> 要联网打回环，离线夹具（<c>Tools/YamlShapeTest</c>）
+        ///   进不去，于是那边只能照抄一遍成员映射 —— "测试自己抄一份"就是测试会先绿后坏的原因。
+        ///   现在生产路径与夹具走<b>同一个函数</b>，成员分类不再有两份。
+        /// 【查不到条目的成员】按"未知节点"处理（Type 空串、不是组、不是策略）——
+        ///   宁可少一条副标题，也不要把未知东西当成组藏起来（这条纪律自 1.0.75 起没变）。
+        /// </summary>
+        internal static List<Group> BuildGroups(
+            List<MihomoController.ProxyGroup> gs,
+            Dictionary<string, MihomoController.ProxyInfo> byName,
+            Dictionary<string, long> delay)
+        {
+            var groups = new List<Group>(gs.Count);
+            foreach (var g in gs)
+            {
+                var members = new List<Member>(g.Members.Count);
+                foreach (string name in g.Members)
+                {
+                    byName.TryGetValue(name, out MihomoController.ProxyInfo? info);
+                    members.Add(new Member(name,
+                        delay.TryGetValue(name, out long d) ? d : -1L,
+                        info?.Type ?? "",
+                        info?.IsGroup ?? false,
+                        info?.IsBuiltin ?? false,
+                        info?.Now ?? "",
+                        info?.ProviderName ?? ""));
+                }
+                groups.Add(new Group(g.Name, g.Type, g.Now, members));
+            }
+            return groups;
         }
 
         /// <summary>把 <c>chains</c> 数组拼成"规则 &gt; 代理组 &gt; 节点"的一行文本。</summary>

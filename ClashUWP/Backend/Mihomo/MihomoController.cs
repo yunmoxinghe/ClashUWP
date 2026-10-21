@@ -278,6 +278,22 @@ namespace ClashUWP.Backend.Mihomo
         }
 
         /// <summary>
+        /// ★【1.0.81 · M8/Q12 · 可单测】把 <see cref="RunReloadAsync"/> 返回的文本判成
+        /// "内核是否真的接受了这份配置"。
+        ///
+        /// 内核对非法配置返回非 2xx（4xx/5xx，body 里写着原因），<see cref="RunReloadAsync"/>
+        /// 据此拼出三种文本：
+        ///   · <c>重载成功（HTTP 2xx）：&lt;path&gt;</c>  —— 解析并应用成功；
+        ///   · <c>重载失败（HTTP 4xx）：&lt;原因&gt;</c>   —— 内核明确拒绝（配置非法/路径不安全）；
+        ///   · <c>reload 失败: &lt;异常&gt;</c> / <c>reload 需要参数：…</c> —— 连请求都没发出去。
+        /// 这里只认"重载成功"前缀，其余一律算失败 —— 不让"落盘即成功"把核心拒绝伪装成成功。
+        /// 纯函数（不碰网络），可被离线夹具直测（M1 同款思路）。
+        /// </summary>
+        internal static bool IsReloadSuccess(string reloadResult)
+            => reloadResult != null &&
+               reloadResult.StartsWith("重载成功", System.StringComparison.Ordinal);
+
+        /// <summary>
         /// GET /configs 取内核运行态三要素：mode / log-level / interface-name（debug status 命令）。
         ///
         /// 【为什么要】G8 "模式切换与生效值回读进 UI"的最小可用通道。
@@ -597,19 +613,27 @@ namespace ClashUWP.Backend.Mihomo
         ///   名单是便宜的冗余；② 列出来之后，<c>groups</c> 的输出和
         ///   <c>select</c> 的报错都能说清"这个名字是内置策略，不是组"。
         /// </summary>
-        private static readonly string[] BuiltinProxyNames =
+        // ★【1.0.81 · Q11/Q13】internal（原为 private）：<see cref="SubscriptionView"/>
+        //   也要用同一份保留名名单去查"用户节点/组名是否撞了内置策略名"（那也是一类
+        //   命名冲突，mihomo 会折叠或报错，订阅侧就能先发现）。保留名是固定集合，
+        //   两份口径必须同源，所以这里放开可见性而不是在订阅解析里重抄一份。
+        internal static readonly string[] BuiltinProxyNames =
             { "GLOBAL", "DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE" };
 
         /// <summary>
         /// 是不是"可以选进去的组"：<c>Selector</c> / <c>URLTest</c> / <c>Fallback</c> /
-        /// <c>LoadBalance</c> 四种之一。
+        /// <c>LoadBalance</c> / <c>Relay</c> 五种之一（官方内核给的组类型）。
         /// ★ 类型名是内核给的<b>驼峰</b>形态（实测 <c>type=Selector</c>，而不是配置里的
         ///   <c>select</c>）—— 拿 yaml 的写法来比会永远比不中。两种形态都收，
         ///   免得以后内核改了序列化口径又变成"没有组"。
+        /// ★【1.0.81 · M3/Q6】补 <c>Relay</c>/<c>relay</c>：relay 与 Selector 一样是<b>手动组</b>，
+        ///   选择由用户决定且持久（不会像 url-test/fallback/load-balance 那样被内核改回）；
+        ///   官方 Mihomo 同样支持 <c>PUT /proxies/{name}</c> 切换 relay 的选中项。
+        ///   <c>LoadBalance</c> 维持"不可手选"（自动按策略分流，手选无意义）。
         /// </summary>
         private static bool IsSelectableGroupType(string type)
-            => type is "Selector" or "URLTest" or "Fallback" or "LoadBalance"
-               or "select" or "url-test" or "fallback" or "load-balance";
+            => type is "Selector" or "URLTest" or "Fallback" or "LoadBalance" or "Relay"
+               or "select" or "url-test" or "fallback" or "load-balance" or "relay";
 
         /// <summary>一个可切换组：<c>Members</c> 是 <c>all</c> 里的成员名原样列表。</summary>
         internal sealed record ProxyGroup(string Name, string Type, string Now,
@@ -633,7 +657,7 @@ namespace ClashUWP.Backend.Mihomo
         ///   而不是像我们以前那样把它们整个从延迟表里藏掉。
         /// </summary>
         internal sealed record ProxyInfo(string Name, string Type, bool IsGroup,
-                                          string Now, bool IsBuiltin);
+                                          string Now, bool IsBuiltin, string ProviderName);
 
         /// <summary>
         /// 从 <c>GET /proxies</c> 的原文里一次拿全：可切换的组 + 每个节点最近一次测速 +
@@ -650,9 +674,18 @@ namespace ClashUWP.Backend.Mihomo
         ///   产出 UI 用的结构化视图 —— 解析规则（组类型判定、延迟取顶层 history、内置策略过滤）
         ///   只能有一份，两边各写一遍必然分叉。
         /// </summary>
+        // ★【1.0.81 · Q11】返回值多了 <c>Duplicates</c>：<see cref="ByName"/> 是按名字
+        //   扁平建表的 —— 一旦内核返回两个同名条目（mihomo 正常不会，但畸形的
+        //   /proxies 响应、或订阅里重名节点被内核折叠后仍可能露出马脚），后写的会
+        //   悄悄盖掉先写的，元数据（类型/延迟/是否策略）就会错位。这里把"盖掉"这个
+        //   动作<b>记下来</b>而不是默默发生：<c>Duplicates</c> 计数，让上层诊断能
+        //   明确说出来"内核里有 N 处同名条目，已按名字折叠"，而不是让用户对着错位的
+        //   延迟/类型干瞪眼。切换本身以组作用域进行（PUT /proxies/{组} 在组内解析），
+        //   所以同名不影响切得对，只影响"展示层"——这正是 Q11 残留的那一条。
         internal static (System.Collections.Generic.List<ProxyGroup> Groups,
                         System.Collections.Generic.Dictionary<string, long> LastDelay,
-                        System.Collections.Generic.Dictionary<string, ProxyInfo> ByName)
+                        System.Collections.Generic.Dictionary<string, ProxyInfo> ByName,
+                        int Duplicates)
             ReadProxiesTable(System.Text.Json.JsonElement root)
         {
             var groups = new System.Collections.Generic.List<ProxyGroup>();
@@ -660,9 +693,10 @@ namespace ClashUWP.Backend.Mihomo
                 System.StringComparer.Ordinal);
             var byName = new System.Collections.Generic.Dictionary<string, ProxyInfo>(
                 System.StringComparer.Ordinal);
+            int duplicates = 0;
             if (!root.TryGetProperty("proxies", out var proxies) ||
                 proxies.ValueKind != System.Text.Json.JsonValueKind.Object)
-                return (groups, delay, byName);
+                return (groups, delay, byName, duplicates);
 
             foreach (var kv in proxies.EnumerateObject())
             {
@@ -672,6 +706,11 @@ namespace ClashUWP.Backend.Mihomo
 
                 string type = GetString(kv.Value, "type");
                 string now = GetString(kv.Value, "now");
+                // ★【1.0.81 · M4/Q8】官方 GET /proxies 会把 <c>proxy-providers</c> 里的节点
+                //   <b>提升为顶层条目</b>并附 <c>provider-name</c> 字段（见 Mihomo 源码
+                //   proxyProviders 的 merge）。订阅直给的节点该字段为空，提供方动态拉来的
+                //   节点带提供方名 —— 这是区分"节点来自哪"的唯一官方信号。
+                string providerName = GetString(kv.Value, "provider-name");
                 bool hasAll = kv.Value.TryGetProperty("all", out var allEl) &&
                               allEl.ValueKind == System.Text.Json.JsonValueKind.Array;
 
@@ -681,8 +720,11 @@ namespace ClashUWP.Backend.Mihomo
 
                 // ★ 分类表对<b>每一个</b>条目都要记（下面两个 continue 只挡"能不能当组来切"，
                 //   挡不住"UI 得知道这个成员是什么"）。
+                // ★【1.0.81 · Q11】同名条目不再默默覆盖：若这个名字已经建过表，记一次碰撞
+                //   （后写的会盖掉先写的，元数据可能错位——计数让上层能说出来）。
+                if (byName.ContainsKey(kv.Name)) duplicates++;
                 byName[kv.Name] = new ProxyInfo(kv.Name, type,
-                    IsGroup: hasAll && !builtin, now, builtin);
+                    IsGroup: hasAll && !builtin, now, builtin, providerName);
 
                 if (builtin) continue;
                 if (!IsSelectableGroupType(type)) continue;
@@ -708,7 +750,184 @@ namespace ClashUWP.Backend.Mihomo
 
                 groups.Add(new ProxyGroup(kv.Name, type, now, members));
             }
-            return (groups, delay, byName);
+            return (groups, delay, byName, duplicates);
+        }
+
+        // ===================== 代理提供方状态（M7 / Q10，官方 GET /providers/proxies） =====================
+
+        /// <summary>
+        /// 一个代理提供方的状态（<c>GET /providers/proxies</c> 解析结果）。
+        ///
+        /// 【★ 官方依据】Mihomo 暴露 <c>GET /providers/proxies</c>，返回每个
+        ///   <c>proxy-providers:</c> 段提供方的：<c>vehicleType</c>（Http/File/Inline）、
+        ///   <c>proxies</c>（已加载的节点数组）、<c>updatedAt</c>（最近一次拉取/更新时间）、
+        ///   <c>subscriptionInfo</c>（upload/download/total/expire，仅 http 订阅有）。
+        ///   这是 Q10 缺的那块能力：provider 级「刷没刷到、拉了多少节点、流量剩多少」在客户端
+        ///   一直不可见，只能看到被提升到 <c>/proxies</c> 的节点（且那层不报节点总数）。
+        /// 【与 <see cref="ReadProxiesTable"/> 同一风格】纯解析、internal，供 <see cref="KernelView"/>
+        ///   与离线夹具共用同一份口径。
+        /// </summary>
+        internal sealed record ProviderInfo(
+            string Name,
+            string VehicleType,   // Http / File / Inline（官方 vehicleType 首字母大写）
+            int NodeCount,        // proxies 数组长度
+            string UpdatedAt,     // 原始时间戳字符串（RFC3339，缺则空）
+            long SubUpload,
+            long SubDownload,
+            long SubTotal,
+            long SubExpire);      // Unix 毫秒，0 表示无
+
+        /// <summary>
+        /// 解析 <c>GET /providers/proxies</c> 的 <c>providers</c> 对象。
+        /// ★ 纯函数：离线夹具直接喂 JSON 字符串验证，不碰网络。
+        /// 任一提供方缺字段都不抛，按"缺省值"处理 —— 内核返回的字段偶有不齐。
+        /// </summary>
+        internal static System.Collections.Generic.List<ProviderInfo> ReadProvidersTable(
+            System.Text.Json.JsonElement root)
+        {
+            var list = new System.Collections.Generic.List<ProviderInfo>();
+            if (!root.TryGetProperty("providers", out var providers) ||
+                providers.ValueKind != System.Text.Json.JsonValueKind.Object)
+                return list;
+
+            foreach (var kv in providers.EnumerateObject())
+            {
+                var p = kv.Value;
+                string name = GetString(p, "name");
+                if (name.Length == 0) name = kv.Name;   // 兜底用对象 key
+                string vehicle = GetString(p, "vehicleType");
+
+                int nodeCount = 0;
+                if (p.TryGetProperty("proxies", out var px) &&
+                    px.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    nodeCount = px.GetArrayLength();
+
+                string updatedAt = GetString(p, "updatedAt");
+
+                long up = 0, down = 0, total = 0, expire = 0;
+                if (p.TryGetProperty("subscriptionInfo", out var sub) &&
+                    sub.ValueKind == System.Text.Json.JsonValueKind.Object)
+                {
+                    up = ReadNumber(sub, "upload");
+                    down = ReadNumber(sub, "download");
+                    total = ReadNumber(sub, "total");
+                    expire = ReadNumber(sub, "expire");
+                }
+
+                list.Add(new ProviderInfo(name, vehicle, nodeCount, updatedAt,
+                    up, down, total, expire));
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 取全部提供方状态（<c>GET /providers/proxies</c>）。
+        /// ★ 失败返回<b>空列表</b>（不是抛）—— 提供方状态是<b>补充信息</b>，
+        ///   拉不到不该让"代理页"整体报错；内核没起时本就空。
+        /// </summary>
+        internal static async System.Threading.Tasks.Task<
+            System.Collections.Generic.List<ProviderInfo>> GetProvidersAsync()
+        {
+            var empty = new System.Collections.Generic.List<ProviderInfo>();
+            try
+            {
+                using var http = NewLoopbackClient(10);
+                string json = await http.GetStringAsync("http://127.0.0.1:9090/providers/proxies");
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                return ReadProvidersTable(doc.RootElement);
+            }
+            catch (Exception ex)
+            {
+                ClashUWP.Vpn.RollingLog.Info("providers",
+                    $"GET /providers/proxies 失败（补充信息，忽略）: {ex.GetType().Name}");
+                return empty;
+            }
+        }
+
+        /// <summary>
+        /// 触发某提供方的健康/节点刷新（<c>GET /providers/proxies/{name}/healthcheck</c>）。
+        /// ★ 返回给人看的文本；204 表示已触发刷新（节点会在稍后陆续更新）。
+        /// 失败的本体（如 404 提供方不存在）也返回文本，不抛。
+        /// </summary>
+        internal static async System.Threading.Tasks.Task<string> TriggerProviderHealthCheckAsync(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return "healthcheck 需要参数：提供一个方名称";
+            try
+            {
+                using var http = NewLoopbackClient(30);
+                using var resp = await http.GetAsync(
+                    "http://127.0.0.1:9090/providers/proxies/" +
+                    System.Uri.EscapeDataString(name) + "/healthcheck");
+                int code = (int)resp.StatusCode;
+                // 官方：成功 204 No Content；节点会异步刷新，稍后 GET /proxies 可见新延迟。
+                return code is 200 or 204
+                    ? $"已触发「{name}」节点刷新（{code}），稍后自动重载延迟"
+                    : $"「{name}」刷新失败（HTTP {code}）";
+            }
+            catch (Exception ex)
+            {
+                ClashUWP.Vpn.RollingLog.Error("providers-hc", ex);
+                return $"「{name}」刷新失败: {ex.GetType().Name}";
+            }
+        }
+
+        /// <summary>
+        /// 组测速接口的 URL。<b>纯函数</b>，离线夹具直测。
+        ///
+        /// ★ 组名进路径<b>一律 percent-encode</b>：订阅里的组名普遍带 emoji、带空格，
+        ///   甚至可能带 <c>/</c>（<c>🚀 加速/代理</c> 这类写法真有机场在用）。不编码的话
+        ///   一个 <c>/</c> 就把路由切断了 —— 那不是"测速失败"，是打到别的接口上去了。
+        ///   同 <see cref="SelectCoreAsync"/> 那条"组名进 URL 一律编码"的实测口径。
+        /// </summary>
+        internal static string GroupHealthCheckUrl(string group) =>
+            "http://127.0.0.1:9090/proxies/" + Uri.EscapeDataString(group) + "/healthcheck";
+
+        /// <summary>
+        /// 让这个组立刻把成员全测一遍（安卓版那枚 ⚡ 的等价物：CMFA 是
+        /// <c>healthCheck(groupName)</c> 之后重载这一组的数据，<c>ProxyActivity.kt 93-101</c>）。
+        ///
+        /// ★ 测速用的是<b>组自己在订阅里配的</b> <c>url:</c> / <c>timeout:</c> / <c>interval:</c>
+        ///   （内核侧 <c>group.Healthcheck</c> 读的就是这几个字段），本函数不传测试地址、
+        ///   不覆盖机场的设定 —— 与安卓一致。
+        /// ★ 自动组（url-test / fallback）同样能测，而且这才是它的正事：手动组测完
+        ///   只是把延迟刷新一下，自动组测完可能直接换赢家。所以这个按钮<b>不给
+        ///   "能不能手选"门控</b>，每组都有。
+        /// ★ 证据级别：<c>PUT /proxies/{name}/healthcheck</c> + 成功 204 这条按
+        ///   <b>推断</b>记账（mihomo/clash REST 路由与 yacd 面板的用法一致如此；
+        ///   官方 API 手册原文这一版没抓到 —— 沙箱无外网）。因此这里把内核回的
+        ///   <b>状态码与响应体原样带回</b>：204=方法对了，405=方法不对（该换 GET），
+        ///   404=路由不对。一次上机就定死，不搞"两种都试"的和稀泥。
+        /// ★ 响应 204 是"已触发"，不是"测完了"：延迟是异步写回 <c>history</c> 的，
+        ///   界面上的数会由 3 秒轮询带出来（与安卓"测完重载该组数据"同一效果）。
+        /// </summary>
+        internal static async Task<string> TriggerGroupHealthCheckAsync(string group)
+        {
+            if (string.IsNullOrEmpty(group))
+                return "测速需要参数：给一个组名称";
+            try
+            {
+                // 一次要拨完整组成员，最慢的那员就是这里的上限；30 秒够机场常见
+                // （timeout 5000ms + 并发）的量级，也比"卡住不动"更容易看出来。
+                using var http = NewLoopbackClient(30);
+                string url = GroupHealthCheckUrl(group);
+                using var req = new HttpRequestMessage(HttpMethod.Put, url);
+                using var resp = await http.SendAsync(req);
+                int code = (int)resp.StatusCode;
+                string body = await resp.Content.ReadAsStringAsync();
+                if (body.Length > 200) body = body[..200] + "…";
+
+                if (code is 200 or 204)
+                    return $"已触发「{group}」测速（{code}），延迟随下一次刷新出来";
+                return $"「{group}」测速失败 HTTP {code}" +
+                       (body.Length > 0 ? $" {body}" : "") +
+                       "　※ 若这里是 405，说明本内核这版走的是 GET 而不是 PUT（见注释的证据级别）";
+            }
+            catch (Exception ex)
+            {
+                ClashUWP.Vpn.RollingLog.Error("group-hc", ex);
+                return $"「{group}」测速失败: {ex.GetType().Name}";
+            }
         }
 
         /// <summary>读一个字符串字段；缺失/类型不对给空串（组名与节点名都必须原样，不做任何加工）。</summary>
@@ -757,7 +976,7 @@ namespace ClashUWP.Backend.Mihomo
                 var sb = new StringBuilder();
 
                 using var doc = System.Text.Json.JsonDocument.Parse(json);
-                var (groups, delay, byName) = ReadProxiesTable(doc.RootElement);
+                var (groups, delay, byName, duplicates) = ReadProxiesTable(doc.RootElement);
 
                 if (groups.Count == 0)
                     return "(内核里没有可切换的代理组：要么规则里没有组，要么订阅没加载。" +
@@ -798,6 +1017,13 @@ namespace ClashUWP.Backend.Mihomo
                         sb.Append(delay.TryGetValue(name, out long d) ? $" delay={d}ms" : " delay=-");
                     }
                 }
+
+                // ★【1.0.81 · Q11】同名条目不再吞掉：若内核响应里出现了同名条目
+                //   （异常情形，正常 mihomo 不会），明确说出来，免得延迟/类型错位还查不出因。
+                if (duplicates > 0)
+                    sb.Append($"\n⚠ 内核返回了 {duplicates} 处同名代理条目，已按名字折叠：" +
+                              "切换以组作用域仍正确，但同名节点的延迟/类型展示可能错位——" +
+                              "多半是订阅里存在重名节点（见订阅元信息里的「重名」提示）。");
 
                 string s = sb.ToString();
                 return s.Length > 2600 ? s[..2600] + "…" : s;
@@ -1008,20 +1234,108 @@ namespace ClashUWP.Backend.Mihomo
             // 自动组（url-test / fallback / load-balance）的"选中"由内核自己维护：
             // PUT 一个成员名会被接受，但下一轮测速/故障转移就把名字改回赢家。
             // 必须当场说出来，否则"我明明选了它，怎么又回去了"会被读成 select 失败。
-            string groupNote = target.Type is "Selector" or "select"
+            // ★【1.0.81 · M3】relay 与 Selector 同属手动组，选择持久，不给"自动组"提示；
+            //   url-test / fallback / load-balance 是自动组，选了会被内核改回赢家。
+            string groupNote = target.Type is "Selector" or "select" or "Relay" or "relay"
                 ? "" : $"\n※ 该组类型是 {target.Type}（自动组）：选择会立刻生效，" +
                        "但测速/故障转移可能把它改回赢家 —— 不是 select 没成功。";
 
             if (!resp.IsSuccessStatusCode)
                 return $"PUT /proxies/{group} -> {(int)resp.StatusCode} {respBody}；现值 now={now}" + groupNote;
 
+            // ★【1.0.81 · Q4】手动组（Selector / relay）选择成功 → 客户端记下，
+            //   供内核重启后由 ReplaySelectionsAsync 回放（home 只读，内核自己的
+            //   cache.db 跨重启不保留，见本方法旧注释；客户端代记是本轮的非侵入修复）。
+            //   自动组（url-test / fallback / load-balance）内核自管，不记。
+            if (target.Type is "Selector" or "select" or "Relay" or "relay")
+                SelectionStore.Record(group, node);
+
             string verdict = string.Equals(now, node, System.StringComparison.Ordinal)
                 ? "★ 已选中" : "⚠ 现值与请求不一致，别当成功";
             return $"PUT /proxies/{group} -> {(int)resp.StatusCode}；now={now}（{verdict}）" +
-                   $"\n※ 选择由内核写进 <home>/cache.db 持久化，但当前 home 是只读的 " +
-                   $"InstalledLocation ⇒ 重启/重装后不保留（G10 修 home 之后才有持久化）。" +
+                   $"\n※ 选择已记入客户端持久化（LocalState/selection.txt），内核重启后会自动回放；" +
+                   $"若内核 home 日后迁到可写 LocalState（G10），这份客户端记录即作废、以内核为准。" +
                    groupNote;
         }
+
+        /// <summary>
+        /// ★【1.0.81 · Q4】内核每次（重新）起来后，回放客户端记下的组选择。
+        ///
+        /// 由 UI 轮询在 <c>KernelView.LoadAsync()</c> 成功（即内核当前可达）后调用；
+        /// 用 <see cref="_kernelWasReachable"/> 做<b>边沿触发</b>：内核从不可达 → 可达时
+        /// 只回放一次，避免每 3 秒轮询都打一遍 <c>PUT</c>。内核掉线后由
+        /// <see cref="MarkKernelUnreachable"/> 复位，下次起来再回放。
+        ///
+        /// 回放规则：只针对<b>手动组</b>（Selector / relay）；自动组（url-test /
+        /// fallback / load-balance）由内核自管，跳过；组或节点已不存在（订阅变了）
+        /// 也跳过。回放失败不抛（不连累轮询），下个可达周期会重试（本次未清边沿标志）。
+        /// </summary>
+        private static bool _kernelWasReachable = false;
+
+        internal static async Task<string> ReplaySelectionsAsync()
+        {
+            if (_kernelWasReachable)
+                return "";                 // 本轮内核已回放过，跳过
+            _kernelWasReachable = true;    // 先置位：即便后面失败也不重复刷
+
+            var saved = SelectionStore.LoadAll();
+            if (saved.Count == 0)
+                return "";
+
+            try
+            {
+                using var http = NewLoopbackClient(10);
+                var groups = await FetchGroupsAsync(http);
+
+                int applied = 0, skipped = 0;
+                foreach (var kv in saved)
+                {
+                    ProxyGroup? g = null;
+                    foreach (var x in groups)
+                        if (string.Equals(x.Name, kv.Key, StringComparison.Ordinal)) { g = x; break; }
+                    if (g == null)
+                    {
+                        skipped++;
+                        continue;
+                    }
+                    // 自动组内核自管，回放无意义（且下一轮就被改回），跳过。
+                    if (g.Type is "URLTest" or "url-test" or "Fallback" or "fallback" or
+                        "LoadBalance" or "load-balance")
+                    {
+                        skipped++;
+                        continue;
+                    }
+                    bool member = false;
+                    foreach (var m in g.Members)
+                        if (string.Equals(m, kv.Value, StringComparison.Ordinal)) { member = true; break; }
+                    if (!member)
+                    {
+                        skipped++;          // 节点已不在该组（订阅变化）→ 跳过，不删除记录
+                        continue;
+                    }
+                    if (string.Equals(g.Now, kv.Value, StringComparison.Ordinal))
+                    {
+                        applied++;         // 内核当前就选着它，无需再打 PUT
+                        continue;
+                    }
+                    await SelectCoreAsync(http, groups, kv.Key, kv.Value, fromDebugText: false);
+                    applied++;
+                }
+
+                return saved.Count == 0 ? "" :
+                    $"已回放上次节点选择 {applied} 项，跳过 {skipped} 项（组/节点已不存在或非手动组）";
+            }
+            catch (Exception ex)
+            {
+                return $"回放节点选择失败: {ex.GetType().Name}（将在下次内核可达时重试）";
+            }
+        }
+
+        /// <summary>
+        /// 内核掉线时复位回放边沿（UI 轮询的 catch 分支调用）。
+        /// 下次内核可达时 ReplaySelectionsAsync 会再回放一次。
+        /// </summary>
+        internal static void MarkKernelUnreachable() => _kernelWasReachable = false;
 
         /// <summary>组名列表（报错时把候选原样回出来，供照抄）。</summary>
         private static System.Collections.Generic.IEnumerable<string> GroupNames(
@@ -1252,26 +1566,59 @@ namespace ClashUWP.Backend.Mihomo
             // 3. 检查 LocalState 里的内核配置
             try
             {
-                var configPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "Packages", "421769c5-17f4-4287-b6c1-193222d21e14_y0tg80em3rma2",
-                    "LocalState", "config.kernel.yaml");
-                
+                // ★【1.0.89 · Docs/38 §十四 · 修 bug】这里原先把包目录名<b>写死</b>成
+                //   <c>%LocalAppData%\Packages\421769c5-17f4-4287-b6c1-193222d21e14_y0tg80em3rma2\LocalState\…</c>，
+                //   而那个家族名属于 1.0.75 <b>改名之前</b>的包（现读 <c>git log -S 421769c5 -- ClashUWP/Package.appxmanifest</c>：
+                //   <c>3b11f69</c> 那笔把主清单 Identity Name 从 GUID 换成 <c>8B8CC4F4.ClashUWP</c>，
+                //   换名同时换了发布者 hash）。⇒ 这一段从 1.0.75 起<b>每次</b>都走 <c>else</c>，
+                //   诊断里那句"✗ 内核配置文件不存在"<b>从来不是事实</b>，而是一条读不到的假判据。
+                //   现在统一走 <see cref="DebugCommandLoop.DefaultKernelConfigPath"/>（唯一算对的出口），
+                //   并把路径本身打出来 —— 以后再漂，日志一行就能看出来是路径错还是文件真不在。
+                var configPath = DebugCommandLoop.DefaultKernelConfigPath();
+
                 if (File.Exists(configPath))
                 {
                     var config = File.ReadAllText(configPath);
                     var lines = config.Split('\n');
-                    sb.AppendLine($"\n✓ 内核配置文件存在 ({lines.Length} 行)");
+                    sb.AppendLine($"\n✓ 内核配置文件存在 ({lines.Length} 行) path={configPath}");
                     
-                    // 检查关键配置项
-                    if (config.Contains("external-controller: 127.0.0.1:9090"))
-                        sb.AppendLine("  ✓ external-controller 配置正确");
+                    // ★【1.0.89 · Docs/38 §十四 · 同一批的第二条假判据】这里原先用
+                    //   <c>config.Contains("external-controller: 127.0.0.1:9090")</c> 整串字面量判"配置正确"。
+                    //   装机实测（本轮 C5，1.0.89 诊断出口原文）读到的真行是
+                    //   <c>external-controller: '127.0.0.1:9090'</c> —— <b>带单引号</b>。这一行是订阅 yaml
+                    //   原样带进来的（全仓现读：<c>grep -rn external-controller ClashUWP --include=*.cs</c> 里
+                    //   除了本函数没有任何一处生成或改写它），所以引号风格、空格、端口<b>都由机场决定</b>，
+                    //   字面量整串匹配在这种输入上必然漂。
+                    //   ⇒ 上一行路径修好之后，旧判据仍然<b>假阴性</b>：文件里明明有这一行、REST 也明明可达
+                    //     （同一次诊断的上面几行就是「✓ REST API 可达 {"meta":true,…}」），它照样报
+                    //     「✗ external-controller 配置缺失或错误」。这种"读起来像故障、其实是判据写错"的行
+                    //     比缺判据更坏，所以改成按行解析、把值<b>原样打出来</b>，只判两件事：有没有、
+                    //     和前台 REST 客户端用的基址是不是同一个。
+                    //   ★ 前台基址（<c>http://127.0.0.1:9090/…</c>，本文件与 KernelView 里 20+ 处字面量）
+                    //     是另一笔债，本批不动，这里只负责把"两者不一致"如实报出来。
+                    const string ControllerKey = "external-controller:";
+                    string? controller = null;
+                    foreach (var line in lines)
+                    {
+                        string t = line.Trim();
+                        if (t.StartsWith(ControllerKey, StringComparison.OrdinalIgnoreCase))
+                        {
+                            controller = t.Substring(ControllerKey.Length).Trim().Trim('\'', '"');
+                            break;
+                        }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(controller))
+                        sb.AppendLine("  ✗ 配置里没有 external-controller（内核不会开 REST 控制器）");
+                    else if (string.Equals(controller, "127.0.0.1:9090", StringComparison.OrdinalIgnoreCase))
+                        sb.AppendLine($"  ✓ external-controller={controller}（与前台 REST 基址一致）");
                     else
-                        sb.AppendLine("  ✗ external-controller 配置缺失或错误");
+                        sb.AppendLine($"  ⚠ external-controller={controller}（前台 REST 客户端写的是 127.0.0.1:9090，" +
+                                      "两者不一致 ⇒ 前台读不到内核）");
                 }
                 else
                 {
-                    sb.AppendLine("\n✗ 内核配置文件不存在");
+                    sb.AppendLine($"\n✗ 内核配置文件不存在 path={configPath}");
                 }
             }
             catch (Exception ex)

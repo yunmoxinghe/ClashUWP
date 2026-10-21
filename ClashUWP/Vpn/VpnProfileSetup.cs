@@ -41,8 +41,14 @@ namespace ClashUWP.Vpn
         /// </summary>
         internal const string ProfileName = ClashUWP.Vpn.GracefulTeardown.ProfileName;
 
-        private static readonly VpnManagementAgent Agent = new();
-
+        /// <summary>
+        /// ★【1.0.81】这里原来有一份<b>自己的</b> <c>static readonly VpnManagementAgent</c> 缓存。
+        ///   现在全进程只有 <see cref="ProfileStore"/> 那一份，且它把每次调用<b>串行化</b> ——
+        ///   依据与死锁纪律写在 <see cref="ProfileStore"/> 的类注释里（一句话：
+        ///   "句柄无效 0x80070006"只在连接 RPC 在飞的同时枚举 profile 存储时出现，
+        ///   与本类用的是哪个 agent 实例无关）。本类所有 <c>GetProfilesAsync</c>/
+        ///   <c>ConnectProfileAsync</c>/… 一律走 <c>ProfileStore.*</c>。
+        /// </summary>
         private static string PackageFamilyName => Windows.ApplicationModel.Package.Current.Id.FamilyName;
 
         /// <summary>
@@ -71,9 +77,15 @@ namespace ClashUWP.Vpn
         /// 不是为了拿它去连接 —— 旧家族的 <c>VpnPluginPackageFamilyName</c> 指向可能已注销的包，
         /// 平台能否拉起插件没有实测背书。所以所有"取一条来用"的地方走
         /// <see cref="PickOurs"/>：先同家族，取不到才退到名字族，并把这次"退路"记进日志。
+        ///
+        /// ★【快速面板改造】第三条判据：<see cref="VpnPluginConfig.IsOurSchema"/> ——
+        ///   订阅 profile 改叫订阅名后（不再带 <c>ClashUWP · </c> 前缀），名字族对它失效，
+        ///   换证书后只剩 CustomConfiguration 的 <c>&lt;clash&gt;</c> root 能认出它们。
+        ///   与前两条同属"认领/看见"，"取对象来连"仍走 <see cref="PickOurs"/> 的家族优先序。
         /// </summary>
         private static bool IsOurs(VpnPlugInProfile pp) =>
-            IsCurrentFamily(pp) || IsOurName(pp.ProfileName);
+            IsCurrentFamily(pp) || IsOurName(pp.ProfileName)
+            || VpnPluginConfig.IsOurSchema(pp.CustomConfiguration);
 
         /// <summary>
         /// 从一堆 profile 里按"先同家族、后名字族"取第一条命中 <paramref name="match"/> 的。
@@ -112,7 +124,7 @@ namespace ClashUWP.Vpn
         /// </summary>
         private static async Task<VpnPlugInProfile?> FindOurProfileAsync()
         {
-            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
             VpnPlugInProfile? ours = PickOurs(profiles, pp => pp.ProfileName == ProfileName, out bool foreign);
 
             // sample 原文：var pluginProfile = profile as VpnPlugInProfile;
@@ -161,7 +173,7 @@ namespace ClashUWP.Vpn
                 return $"删旧=拒绝（{report}）";
             }
 
-            VpnManagementErrorStatus del = await Agent.DeleteProfileAsync(profile);
+            VpnManagementErrorStatus del = await ProfileStore.DeleteProfileAsync(profile);
             if (del != VpnManagementErrorStatus.Ok)
             {
                 RollingLog.Warn("profile", $"主 profile 删除失败={del}");
@@ -187,8 +199,11 @@ namespace ClashUWP.Vpn
 
                 // 【官方】RequireVpnClientAppUI："determines whether this VPN profile appears in
                 //   the system's VPN connection UI."
-                //   true = 出现在系统 VPN 设置里，用户可以从系统那边连/断。
-                RequireVpnClientAppUI = true,
+                //   ★【快速面板改造】基础 profile（无 subId、读 config.yaml）从这一批起
+                //   <b>不再进系统 UI</b>：快速面板只列订阅条目（连哪条订阅、哪条亮），
+                //   裸 ClashUWP 条目对用户是噪音，还造成"app 里连接、面板亮的是基础条目"
+                //   的错位。只影响系统 UI 可见性，不影响程序侧 ConnectProfileAsync。
+                RequireVpnClientAppUI = false,
 
                 // 【官方】CustomConfiguration："an XML string to configure the VPN plug-in. Refer
                 //   to the documentation from the VPN plug-in for format and support."
@@ -211,7 +226,7 @@ namespace ClashUWP.Vpn
 
             // 【官方】AddProfileFromObjectAsync(IVpnProfile)："Creates a new VPN Profile based on
             //   the VpnProfile input object."
-            return await Agent.AddProfileFromObjectAsync(pluginProfile);
+            return await ProfileStore.AddProfileFromObjectAsync(pluginProfile);
         }
 
         /// <summary>
@@ -331,6 +346,13 @@ namespace ClashUWP.Vpn
         ///   最后 <c>断开=NoConnection</c>，日志看着像「隧道健康但海外不通」，
         ///   实际上压根没有隧道。这种假绿灯会把整轮排障带到错误的方向上，
         ///   所以这里必须轮询到 profile 的真实状态再返回。
+        ///
+        /// ★★【1.0.88 · Docs/38 官方方案 F1/F2/F3】本方法从此<b>不再裸拨</b>：
+        ///   ① 前置条件（sample L496 只在 <c>Disconnected</c> 时连）＋ ② 返回值分支（sample L499-506）
+        ///   ＋ ④ 至多一条活动会话（sample L80/L101-113）全部收进
+        ///   <see cref="ConnectOnceAsync"/> 与 <see cref="SerializeBehindActiveSessionAsync"/>，
+        ///   与 1.0.86 A 案（<see cref="SwitchToSubscriptionAsync"/>）<b>共用同一份实现</b> ——
+        ///   两处各写一遍早晚分叉，这是本仓已经认过的账（口径同 1.0.84 对 KernelView.Find 的订正）。
         /// </summary>
         public static async Task<string> ConnectAsync(string? subId = null)
         {
@@ -344,28 +366,264 @@ namespace ClashUWP.Vpn
                     ? "找不到我们的 profile，请先点「建/重建 profile」"
                     : $"找不到订阅 profile（subId={subId}），请先拉取并启用该订阅";
 
-            var sb = new StringBuilder();
-            sb.Append($"[{target.ProfileName}] 发起前状态={target.ConnectionStatus}, ");
-            sb.Append($"连接请求={await Agent.ConnectProfileAsync(target)}");
+            // ★【F3】官方按「至多一条活动会话」建模：本条之外还有 Connected ⇒ 先把它收尾，
+            //   收不干净就<b>拒绝发起</b>（同一道安全闸，绝不带着未收尾会话去拨第二条）。
+            (string note, bool canDial) = await SerializeBehindActiveSessionAsync(target);
+            if (!canDial) return note;
 
-            // 轮询真实状态，最多 20 秒。★ 这里用字符串而不是枚举成员名：
-            //   CsWinRT 投影里的 VpnManagementConnectionStatus 并没有文档简名里的
-            //   NotConfigured / Waiting 这些成员（实测编译报 CS0117），
-            //   而调用方只关心「到底 Connected 没有」，字符串口径最稳。
-            string now = target.ConnectionStatus.ToString();
+            (bool ok, string msg) = await ConnectOnceAsync(target, finder, "profile-connect", "连接请求");
+            _ = ok; // 回话文本本身已带终态，调用方（按钮/CLI）只展示文本
+            return note.Length == 0 ? msg : note + "；" + msg;
+        }
+
+        /// <summary>
+        /// ★【1.0.88 · Docs/38 F1+F2】按官方 sample 的契约拨<b>一次</b>，顺序写死在这里：
+        ///   ① <b>前置条件</b>：只有 <c>Disconnected</c> 才发起（sample L496）。
+        ///     <c>Connected</c> ⇒ 无事可做（Ok=true，交回话说明）；
+        ///     <c>Connecting/Disconnecting</c> ⇒ 平台正在这条上处理，<b>不硬拨</b>、回"稍后再试"。
+        ///   ② <b>发起之前</b>先落一行 —— 这条是本症状唯一的观测出口：
+        ///     <c>ConnectProfileAsync</c> 的 await 官方<b>没有任何时限承诺</b>（Docs/38 D8），
+        ///     先例里它挂过 &gt;3.5 min（研究档案 docs/60 §3.1）。"拿到返回值再拼一行"的旧写法
+        ///     在悬挂时那一行永远不落，日志看着就像"用户没点过"。
+        ///     ★【1.0.89】这一行落在①<b>之后</b>（1.0.88 装机时误写在①之前，"已连接再点一次"会出现
+        ///       相邻两行自相矛盾；订正见 Docs/38 §13.5 与 §十四）。它仍在唯一一个无界 await 之前，②的性质不丢。
+        ///   ③ 拿到返回值<b>单独</b>落第二行并按 <see cref="VpnManagementErrorStatus"/> 分支：
+        ///     非 <c>Ok</c> 一律按失败回话，枚举名原样带出去（历史实例：<c>Docs/30:378</c> 那次
+        ///     <c>连接请求=ServerConnection</c> 就是这样被插值进一行文本里冲掉的）。
+        ///   ④ 受理（<c>Ok</c>）之后仍要轮询真实状态 —— <c>Ok</c> 只代表平台接受了请求，
+        ///     不代表隧道起来（:343-348 那段口径不变，假绿灯会把整轮排障带偏）。
+        /// 返回 <c>Ok</c> 的判据写死为「轮询末态 == <c>Connected</c>」，不让调用方去猜字符串。
+        /// ★ 轮询条件从"排除 Waiting"改成"只在 <c>Connecting/Disconnecting</c> 上继续等"：
+        ///   <c>VpnManagementConnectionStatus</c> 投影里只有 4 个成员
+        ///   （Disconnected/Disconnecting/Connected/Connecting，元数据 :218074-218084），
+        ///   旧代码那个 <c>!= "Waiting"</c> 是永不成立的死条件（Docs/38 D7）。
+        /// </summary>
+        /// <param name="dialLabel">回话里那次请求的名字：「连接 VPN」用 <c>连接请求</c>，
+        ///   切换路径用 <c>新连接请求</c> —— 装机验收靠这两个词分辨是哪条路发起的。</param>
+        private static async Task<(bool Ok, string Message)> ConnectOnceAsync(
+            VpnPlugInProfile target, Func<Task<VpnPlugInProfile?>> refinder,
+            string category, string dialLabel)
+        {
+            string st0;
+            try
+            {
+                st0 = (target = await RefreshForDialAsync(target, refinder)).ConnectionStatus.ToString();
+            }
+            catch (ProfileStore.ProfileStoreBusyException exPre)
+            {
+                // 连"发起前状态"都读不到 ⇒ 不能凭猜测拨号（官方前置条件要求先判状态）。
+                string pre = "未发起=" + exPre.Message;
+                RollingLog.Warn(category, pre);
+                return (false, pre);
+            }
+            string head = $"[{target.ProfileName}] 发起前状态={st0}";
+
+            // ② 前置条件按官方 sample：只有 <c>Disconnected</c> 才允许硬拨。
+            switch (st0)
+            {
+                case "Connected":
+                    string already = head + " 未发起=平台报告这条已经 Connected（会话已在，不再拨第二次）";
+                    RollingLog.Info(category, already);
+                    return (true, already);
+                case "Connecting":
+                case "Disconnecting":
+                    string busy = head + $" 未发起=平台正在这条 profile 上处理（{st0}），稍后再试";
+                    RollingLog.Warn(category, busy);
+                    return (false, busy);
+            }
+
+            // ③ 发起前留痕 —— 必须落在这一次 await <b>之前</b>。
+            //   ★【1.0.89 · Docs/38 §13.5 措辞债订正】这一行原来写在上面那个 switch <b>之前</b>，
+            //     于是"已连接时再点一次"会在日志里留下相邻两行自相矛盾：
+            //     「发起=即将发出连接请求」紧跟「未发起=平台报告这条已经 Connected」（1.0.88 装机实测 B2/B5/B6 各一次）。
+            //     挪到 switch 之后不丢 F1 的性质：它仍然在<b>本方法唯一一个无界 await</b>
+            //     （<see cref="ProfileStore.ConnectProfileAsync"/>，下面那一句）之前，
+            //     悬挂时照样看得见这条发起行；而"根本没拨"的那些分支从此只有一行、不再谎报"即将发出"。
+            RollingLog.Info(category, head + " 发起=即将发出连接请求（下一行才是平台返回值；官方对该 await 没承诺时限）");
+
+            VpnManagementErrorStatus conn;
+            try
+            {
+                conn = await ProfileStore.ConnectProfileAsync(target);
+            }
+            catch (ProfileStore.ProfileStoreBusyException ex)
+            {
+                // ★【1.0.88 · Docs/38 §十一】串行层拒绝发这一条（上一条 profile 存储调用至今未返回）。
+                //   走"未发起="那个前缀，是为了让 <see cref="VpnSession"/> 认出"这一句根本没拨"，
+                //   从而按有无既有哨兵分别处置（见 IsNoDialResult 的注释）。
+                string blocked = head + " 未发起=" + ex.Message;
+                RollingLog.Warn(category, blocked);
+                return (false, blocked);
+            }
+            if (conn != VpnManagementErrorStatus.Ok)
+            {
+                string bad = head + $" {dialLabel}={conn}（★平台拒绝：{ExplainDialError(conn)}）";
+                RollingLog.Warn(category, bad);
+                return (false, bad);
+            }
+            RollingLog.Info(category, head + $" {dialLabel}=Ok（平台已受理，继续轮询真实状态）");
+
+            string now = st0;
             for (int i = 0; i < 20; i++)
             {
                 await Task.Delay(1000);
-                VpnPlugInProfile? fresh = await finder();
+                VpnPlugInProfile? fresh;
+                try
+                {
+                    fresh = await refinder();
+                }
+                catch (ProfileStore.ProfileStoreBusyException exRead)
+                {
+                    // 读不到不等于没连上 —— 明写"状态不可读"，绝不猜成 Disconnected。
+                    now = $"状态不可读（{exRead.Message.Split('，')[0]}）";
+                    break;
+                }
                 if (fresh == null) { now = "Profile缺失"; break; }
                 now = fresh.ConnectionStatus.ToString();
-                if (now != "Connecting" && now != "Waiting") break;
+                if (now != "Connecting" && now != "Disconnecting") break;
             }
-            sb.Append($", 实际状态={now}");
-
-            RollingLog.Info("profile-connect", sb.ToString());
-            return sb.ToString();
+            string tail = head + $" {dialLabel}=Ok, 实际状态={now}";
+            bool ok = now == "Connected";
+            if (ok) RollingLog.Info(category, tail);
+            else RollingLog.Warn(category, tail + "（未落到 Connected，不能对用户说已连接）");
+            return (ok, tail);
         }
+
+        /// <summary>
+        /// ★【1.0.88 · Docs/38 F3】官方建模：<b>至多一条活动会话</b>
+        ///   （sample L80 "There should be zero or one of these at all times" +
+        ///   可连清单只收 <c>Disconnected</c> L101-113）。
+        ///   拨<b>另一条</b>之前先把这一条收尾；收尾收不干净就<b>拒绝发起</b> ——
+        ///   判据与安全闸同 1.0.86 A 案，共用 <see cref="GracefulTeardown.EnsureTornDownAsync"/>。
+        /// 返回 (前缀回话, 能否发起)。能否发起为 <c>false</c> 时前缀就是完整回话。
+        /// </summary>
+        private static async Task<(string Note, bool CanDial)> SerializeBehindActiveSessionAsync(
+            VpnPlugInProfile target)
+        {
+            VpnPlugInProfile? active;
+            try
+            {
+                active = await FindActiveSessionAsync();
+            }
+            catch (ProfileStore.ProfileStoreBusyException ex)
+            {
+                // 读不到"当前会话在哪"⇒ 更不能裸拨（官方要求先确认至多一条）。
+                string refused = "新连接=跳过（" + ex.Message + "）";
+                RollingLog.Warn("profile-connect", "★拒绝发起 —— " + refused);
+                return (refused, false);
+            }
+            if (active == null || SameProfile(active, target)) return ("", true);
+
+            string oldName = active.ProfileName;
+            RollingLog.Info("profile-connect",
+                $"[{oldName}] 状态=Connected 而目标是 [{target.ProfileName}] ⇒ " +
+                "按官方「至多一条活动会话」先收尾（不裸拨第二条）");
+
+            bool torn;
+            string report;
+            try
+            {
+                (torn, report) = await GracefulTeardown.EnsureTornDownAsync(active);
+            }
+            catch (ProfileStore.ProfileStoreBusyException ex)
+            {
+                string refused = $"旧会话 [{oldName}] 收尾这一步发不出去（{ex.Message}），新连接=跳过（避免与未收尾会话并发）";
+                RollingLog.Warn("profile-connect", "★拒绝发起 —— " + refused);
+                return (refused, false);
+            }
+            if (!torn)
+            {
+                string refused = $"旧会话 [{oldName}] 未收干净（{report}），新连接=跳过（避免与未收尾会话并发）";
+                RollingLog.Warn("profile-connect", "★拒绝发起 —— " + refused);
+                return (refused, false);
+            }
+            return ($"已先收尾旧会话 [{oldName}]（{report}）", true);
+        }
+
+        /// <summary>
+        /// ★【1.0.88】当前<b>确实处于 Connected</b> 的那条我们的 profile（排除 Probe/Dataface），
+        ///   没有则 null。<b>「当前会话在哪」这一判据全仓只此一份</b>：
+        ///   <see cref="FindConnectedProfileAsync"/> 没连着时会兜底回基础 profile，
+        ///   而"根本没连接"绝不该被读成"有条会话要收尾"（空壳不拨号是已验收口径），
+        ///   所以这里显式再要一次 <c>Connected</c>。1.0.86 A 案原先就地写这段，现收进来共用。
+        /// ★ <c>internal</c>（不是 private）的理由：诊断路径的拨号点
+        ///   （<see cref="ProbeConnectAsync"/>、<c>Backend.StartupProbes</c> 的 dataface probe）
+        ///   也必须守官方第④条"至多一条活动会话"，它们读的是<b>同一把尺子</b>。
+        /// </summary>
+        internal static async Task<VpnPlugInProfile?> FindActiveSessionAsync()
+        {
+            VpnPlugInProfile? candidate = await FindConnectedProfileAsync();
+            return candidate != null && candidate.ConnectionStatus.ToString() == "Connected"
+                ? candidate
+                : null;
+        }
+
+        /// <summary>两条对象是否指同一条 profile（名字 + CustomConfiguration 里的 subId 一起比）。</summary>
+        private static bool SameProfile(VpnPlugInProfile a, VpnPlugInProfile b) =>
+            a.ProfileName == b.ProfileName &&
+            VpnPluginConfig.Parse(a.CustomConfiguration).SubId ==
+            VpnPluginConfig.Parse(b.CustomConfiguration).SubId;
+
+        /// <summary>
+        /// ★【1.0.88 · F1】拨号<b>前</b>再回读一次目标：调用方手里那份对象可能是
+        ///   <see cref="SerializeBehindActiveSessionAsync"/> 收尾<b>之前</b>的快照，
+        ///   拿旧快照判前置条件会把"刚刚被我们断开的那条"读成还连着。
+        ///   回读不到就原样交回旧对象，让下一句 <c>CannotFindProfile</c> 之类的真实返回值说话，
+        ///   不在这里假装成功（口径同 :104 那条硬约束：拨号必须用新鲜回读的对象）。
+        /// </summary>
+        private static async Task<VpnPlugInProfile> RefreshForDialAsync(
+            VpnPlugInProfile target, Func<Task<VpnPlugInProfile?>> refinder)
+        {
+            VpnPlugInProfile? fresh = await refinder();
+            return fresh ?? target;
+        }
+
+        /// <summary>
+        /// ★【1.0.88 · Docs/38 F2】把 <see cref="VpnManagementErrorStatus"/> 翻成一句人能照着做的话。
+        ///   成员与官方语义按 26100 元数据现读逐条对照（:218088-218140，共 19 项：
+        ///   <c>Ok=0 … InvalidIP=18</c>；其中 13 项是 1607 / SDK 14393 引入，
+        ///   我们最低支持 17763 ⇒ 全部可用，没有兼容性退路）。
+        ///   <c>AlreadyConnected</c> / <c>AlreadyDisconnecting</c> 这两项**明令不得重试**：
+        ///   先例里悬挂之后重试一律回 <c>AlreadyConnected</c>，等于把僵尸会话坐实
+        ///   （研究档案 docs/60:140、docs/62:65）。
+        /// </summary>
+        private static string ExplainDialError(VpnManagementErrorStatus s) => s switch
+        {
+            VpnManagementErrorStatus.Ok => "无错误",
+            VpnManagementErrorStatus.Other => "平台只给了 Other，无进一步细节（不重试，先看这条 profile 的对账结果）",
+            VpnManagementErrorStatus.InvalidXmlSyntax => "CustomConfiguration 的 XML 语法非法（改 profile 内容，别重试）",
+            VpnManagementErrorStatus.ProfileNameTooLong => "profile 名过长（订阅显示名要截短）",
+            VpnManagementErrorStatus.ProfileInvalidAppId => "profile 绑定的 app id 非法（多半是 ManagementApp/包家族对不上，需重建 profile）",
+            VpnManagementErrorStatus.AccessDenied => "拒绝访问（权限或包身份不匹配）",
+            VpnManagementErrorStatus.CannotFindProfile => "找不到指定的 profile（★ 已知硬约束：必须用 GetProfilesAsync 新鲜回读的对象去拨，自建对象必吃这个码）",
+            VpnManagementErrorStatus.AlreadyDisconnecting => "这条正在断开中 ⇒ 等收尾，不要重拨",
+            VpnManagementErrorStatus.AlreadyConnected => "会话已存在 ⇒ 不要重拨（先例：悬挂后重拨只会一直吃这个码）",
+            VpnManagementErrorStatus.GeneralAuthenticationFailure => "认证失败（平台没给细节）",
+            VpnManagementErrorStatus.EapFailure => "EAP 认证失败",
+            VpnManagementErrorStatus.SmartCardFailure => "智能卡认证失败",
+            VpnManagementErrorStatus.CertificateFailure => "证书认证失败",
+            VpnManagementErrorStatus.ServerConfiguration => "服务器配置非法（查 ServerUris）",
+            VpnManagementErrorStatus.NoConnection => "没有可用网络连接（外层物理链路不通）",
+            VpnManagementErrorStatus.ServerConnection => "连不上外层服务器（Docs/30:378 那次就是这个码）",
+            VpnManagementErrorStatus.UserNamePassword => "用户名/密码认证失败",
+            VpnManagementErrorStatus.DnsNotResolvable => "ServerUris 的域名解析不了",
+            VpnManagementErrorStatus.InvalidIP => "给定的 IP 非法",
+            _ => $"未识别的返回值={(int)s}（按失败处理，原样上报）",
+        };
+
+        /// <summary>
+        /// ★【1.0.88 · Docs/38 F1】这一句回话代表<b>我们根本没有发起拨号</b>
+        ///   （被官方前置条件拦住，或被"至多一条活动会话"的安全闸拒绝）。
+        ///   存在的理由只有一条：<see cref="Backend.VpnSession.ConnectAsync"/> 是<b>先武装哨兵再连接</b>的，
+        ///   而这次没拨 ⇒ 哨兵没有要保护的拨号，留着它到点会把<b>平台自己正在处理</b>的那条连接
+        ///   当成"隧道没起来"断掉（HealthMonitor 的非终态出口就是这么写的）。
+        ///   口径靠固定前缀而不是枚举传递，是为了不把 <c>ConnectAsync</c> 的返回形状改成
+        ///   结构体后连带 CLI/调试回路的文本出口一起动 —— 这两个前缀就是上面两处拒绝文案，改文案要同步改这里。
+        /// </summary>
+        internal static bool IsNoDialResult(string message) =>
+            message.Contains("未发起=", StringComparison.Ordinal) ||
+            message.Contains("新连接=跳过", StringComparison.Ordinal);
+
 
         /// <summary>一次「把订阅 profile 对齐到应有形态」的结果分类（给启动对账计数用）。</summary>
         internal enum SubProfileAction { Unchanged, Added, Updated, Skipped, Failed }
@@ -376,7 +634,13 @@ namespace ClashUWP.Vpn
         /// ★【1.0.62】为一条订阅注册/更新一个独立的系统 VPN profile，
         /// 让 Windows 快速设置 VPN 面板里<b>原生列出该订阅</b>、点哪个连哪个。
         ///
-        /// profile 名 = <c>"ClashUWP · {displayName}"</c>，<c>CustomConfiguration</c> 带
+        /// ★【快速面板改造】profile 名 = <b>订阅显示名本身</b>（如 <c>iKuuu_V2</c>），
+        /// 不再带 <c>ClashUWP · </c> 前缀 —— 用户在快速面板里只想看到订阅叫什么，
+        /// 产品名前缀属于噪音。"按名字族认领"由此出现的缺口，由
+        /// <see cref="VpnPluginConfig.IsOurSchema"/> 的 CustomConfiguration 兜底补上；
+        /// 旧前缀条目（仍被 <c>GracefulTeardown.IsOurName</c> 认得）在下次对账走到这里时
+        /// 因 <c>ProfileName != name</c> 被判"待更新"，断开状态下自动改名迁移。
+        /// <c>CustomConfiguration</c> 带
         /// &lt;subId&gt;（插件 Connect 据此读 <c>subscriptions/{subId}.yaml</c>）。
         /// <see cref="RequireVpnClientAppUI"/>=true ⇒ 出现在系统 VPN UI（含快速设置）；
         /// <see cref="AlwaysOn"/>=false ⇒ 不自动连，避免调试时甩不掉。
@@ -402,8 +666,10 @@ namespace ClashUWP.Vpn
                 return new SubProfileResult(SubProfileAction.Skipped,
                     "EnsureSubscriptionProfile: subId 为空，跳过");
 
-            string name = "ClashUWP · " + (string.IsNullOrWhiteSpace(displayName) ? subId : displayName);
-            string custom = new VpnPluginConfig { SubId = subId }.ToXml();
+            // ★【快速面板改造】不再拼 "ClashUWP · " 前缀（见方法头注释）。
+            string name = string.IsNullOrWhiteSpace(displayName) ? subId : displayName;
+            // ★【1.0.81】把显示名也写进 CustomConfiguration，插件侧用它来在通知里展示友好名称
+            string custom = new VpnPluginConfig { SubId = subId, SubDisplayName = displayName ?? "" }.ToXml();
 
             try
             {
@@ -423,7 +689,7 @@ namespace ClashUWP.Vpn
                     };
                     fresh.ServerUris.Add(serverUri);
 
-                    VpnManagementErrorStatus add = await Agent.AddProfileFromObjectAsync(fresh);
+                    VpnManagementErrorStatus add = await ProfileStore.AddProfileFromObjectAsync(fresh);
                     string addedMsg = $"订阅profile[{name}] subId={subId} 新建={add}";
                     RollingLog.Info("profile-sub", addedMsg);
                     return new SubProfileResult(
@@ -457,7 +723,7 @@ namespace ClashUWP.Vpn
                 existing.ServerUris.Clear();
                 existing.ServerUris.Add(serverUri);
 
-                VpnManagementErrorStatus upd = await Agent.UpdateProfileFromObjectAsync(existing);
+                VpnManagementErrorStatus upd = await ProfileStore.UpdateProfileFromObjectAsync(existing);
                 string updMsg = $"订阅profile[{name}] subId={subId} 更新={upd}";
                 RollingLog.Info("profile-sub", updMsg);
                 return new SubProfileResult(
@@ -510,8 +776,10 @@ namespace ClashUWP.Vpn
                                   existing.ServerUris[0].ToString() == serverUri.ToString();
                 // 基础 profile 的定义就是"不带 subId"（插件据此走 config.yaml）。
                 // ★ 用<b>解析后</b>的 SubId 比，不比 XML 原文：平台回读会重排空白与属性。
+                // ★【快速面板改造】UI 期望值翻转为 false：老机器上已存在的基础 profile
+                //   还是可见的，这里必须把它判成"待更新"才能在断开后被改成隐藏。
                 bool same = existing.ProfileName == ProfileName
-                            && existing.RequireVpnClientAppUI
+                            && !existing.RequireVpnClientAppUI
                             && VpnPluginConfig.Parse(existing.CustomConfiguration).SubId.Length == 0
                             && sameServer;
                 if (same)
@@ -530,12 +798,13 @@ namespace ClashUWP.Vpn
                     ? $"ServerUri={existing.ServerUris.Count}个→1个({serverUri})"
                     : "名字/CustomConfiguration/UI可见性 对齐";
                 existing.ProfileName = ProfileName;
-                existing.RequireVpnClientAppUI = true;
+                // ★【快速面板改造】改为 false：把老机器上可见的基础条目藏出系统 UI。
+                existing.RequireVpnClientAppUI = false;
                 existing.CustomConfiguration = new VpnPluginConfig().ToXml();
                 existing.ServerUris.Clear();
                 existing.ServerUris.Add(serverUri);
 
-                VpnManagementErrorStatus upd = await Agent.UpdateProfileFromObjectAsync(existing);
+                VpnManagementErrorStatus upd = await ProfileStore.UpdateProfileFromObjectAsync(existing);
                 string updMsg = $"基础profile[{ProfileName}] 更新={upd}（{why}）";
                 RollingLog.Info("profile-base", updMsg);
                 return new SubProfileResult(
@@ -580,7 +849,7 @@ namespace ClashUWP.Vpn
 
             try
             {
-                IReadOnlyList<IVpnProfile> all = await Agent.GetProfilesAsync();
+                IReadOnlyList<IVpnProfile> all = await ProfileStore.GetProfilesAsync();
                 foreach (IVpnProfile p in all)
                 {
                     if (p is not VpnPlugInProfile pp) continue;
@@ -589,8 +858,11 @@ namespace ClashUWP.Vpn
                     //   <b>完全隐形</b>：面板里挂着幽灵条目，当前代又新建一份同名的。
                     //   现在"名字族命中"也纳入清理（迁移式）。旧家族的条目到底删得掉删不掉
                     //   <b>未实测</b>，所以每条都在结果串里标 [旧家族]，删除返回值如实进日志。
+                    // ★【快速面板改造】这里曾有一句 `!IsOurName → continue` 的复核（1.0.79 加的
+                    //   双保险），在订阅 profile 改叫订阅名后它会<b>误杀新判据</b>：改名条目
+                    //   名字不再命中 IsOurName，但 IsOurs 已靠 CustomConfiguration 认出它。
+                    //   复核与 IsOurs 本就是同一把尺子的两个刻度，撤掉复核，尺子归一。
                     if (!IsOurs(pp)) continue;
-                    if (!IsCurrentFamily(pp) && !IsOurName(pp.ProfileName)) continue;
                     bool foreign = !IsCurrentFamily(pp);
 
                     string subId = VpnPluginConfig.Parse(pp.CustomConfiguration).SubId;
@@ -615,7 +887,7 @@ namespace ClashUWP.Vpn
                         continue;
                     }
 
-                    VpnManagementErrorStatus del = await Agent.DeleteProfileAsync(pp);
+                    VpnManagementErrorStatus del = await ProfileStore.DeleteProfileAsync(pp);
                     if (del == VpnManagementErrorStatus.Ok)
                     {
                         removed++;
@@ -648,7 +920,7 @@ namespace ClashUWP.Vpn
         /// </summary>
         private static async Task<VpnPlugInProfile?> FindProfileBySubIdAsync(string subId)
         {
-            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
             VpnPlugInProfile? pp = PickOurs(profiles,
                 p => VpnPluginConfig.Parse(p.CustomConfiguration).SubId == subId,
                 out bool foreign);
@@ -656,6 +928,98 @@ namespace ClashUWP.Vpn
                 RollingLog.Warn("profile-find",
                     $"订阅 subId={subId} 命中的是旧签名家族的条目 family={pp.VpnPluginPackageFamilyName}");
             return pp;
+        }
+
+        /// <summary>
+        /// ★【1.0.86 · Docs/36 A 案】把会话从当前 profile <b>串行切</b>到目标订阅的 profile。
+        ///
+        /// 【为什么必须存在】App 内切订阅（<c>SubscriptionManager.ActivateAsync</c>）从 1.0.62 起
+        ///   只做「写 config.yaml + 记生效 + 热重载 + 确保 profile 注册」，<b>从不 Disconnect/Connect</b>
+        ///   ⇒ 会话仍属旧订阅的 profile，而插件 <c>Connect</c> 把 <c>subId</c> 钉在 profile 的
+        ///   CustomConfiguration 上，<b>每次（重）拨号都按旧 subId 覆写 <c>config.kernel.yaml</c></b>，
+        ///   把那次热重载的成果吃掉。本机实测（Docs/36 E6/E8）：连续 8 次会话读的全是旧订阅，
+        ///   <c>config.kernel.yaml</c> 9920 行/18 name ≡ 旧订阅，而账本写着新订阅 ⇒
+        ///   前台「生效中」是新订阅、面板与隧道是旧订阅。<b>这条就是把「切」这个动作补完整。</b>
+        ///
+        /// 【为什么是"先断干净、再连新的"，不能并行】官方 <c>VpnChannel.Start</c> 条文
+        ///   "There can only be one VPN profile per process"，插件侧 <c>s_activeChannel</c> 也只有一份；
+        ///   <see cref="ParallelConnectedReportAsync"/> 对并发的既有口径是<b>只观测不处置</b>。
+        ///
+        /// 【★ 安全闸】旧会话收不干净时<b>拒绝发起新连接</b>并原样回话，绝不带着未收尾的会话去连第二条 ——
+        ///   拆不干净就动下一步正是 2026-10-16 孤儿 NRPT + 幽灵路由 = 整机断网的重演路径
+        ///   （见 <see cref="GracefulTeardown"/> 类注释）。宁可让用户先手工断开，也不拿网卡赌一次。
+        /// 【与删除的区别】这里<b>不删</b> profile：只断会话、留着条目，面板上那条订阅仍然可点。
+        ///
+        /// 【返回形状】<c>Ok</c> 的口径写死在这里，不让调用方去猜字符串：
+        ///   · 本来就没有活动会话 / 会话已经在这条上 ⇒ <b>Ok=true</b>（无事可做不是失败）；
+        ///   · 找不到目标 profile、安全闸拒绝、或轮询没落到 Connected ⇒ <b>Ok=false</b>。
+        ///   上层（<c>ActivateAsync</c>）拿它决定"已切到"这句话能不能说。
+        /// </summary>
+        internal static async Task<(bool Ok, string Message)> SwitchToSubscriptionAsync(string targetSubId)
+        {
+            if (string.IsNullOrWhiteSpace(targetSubId))
+                return (false, "切换跳过：targetSubId 为空");
+
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
+
+            VpnPlugInProfile? target = PickOurs(profiles,
+                p => VpnPluginConfig.Parse(p.CustomConfiguration).SubId == targetSubId, out bool foreign);
+            if (target == null)
+                return (false, $"切换失败：找不到订阅 profile（subId={targetSubId}），先拉取并启用该订阅");
+
+            // ★【1.0.86】"当前连着的是哪条"沿用 <see cref="FindConnectedProfileAsync"/> 这<b>同一份</b>判据
+            //   （家族优先 → 名字族兜底、排除 Probe/Dataface），不在这里再写一个 foreach ——
+            //   两处各判一次早晚分叉，口径同 1.0.84 对 KernelView.Find 的订正。
+            //   但<b>不能</b>直接拿它的返回值当"有会话"用：它没连着时会兜底回基础 profile，
+            //   而"用户根本没连接"时切订阅绝不该擅自拨一条隧道出来
+            //   （空壳不拨号是已验收口径）⇒ 显式再要一次 Connected 才认。
+            // ★【1.0.88】这段判据从就地写法改成共用 <see cref="FindActiveSessionAsync"/>：
+            //   「连接 VPN」按钮路径（Docs/38 F3）从此和这里读<b>同一个</b>"当前会话在哪"，
+            //   两处各写一遍早晚分叉 —— 本仓为这个已经认过一次账（1.0.84 对 KernelView.Find 的订正）。
+            VpnPlugInProfile? current = await FindActiveSessionAsync();
+
+            if (current == null)
+                return (true, "当前无活动会话，无需切换（下次连接自然走新订阅的 profile）");
+            if (VpnPluginConfig.Parse(current.CustomConfiguration).SubId == targetSubId)
+                return (true, $"会话已经在 [{current.ProfileName}] 上，无需切换");
+
+            string oldName = current.ProfileName;
+            var sb = new StringBuilder();
+
+            // ★★【1.0.86 实现复核订正】这里<b>不</b>先自己 DisconnectProfileAsync ——
+            //   断开这一步交给 EnsureTornDownAsync 统一发起。理由不是"少写一行"：
+            //   它进来先读一次状态，不是 Connected 就返回「无需断开」<b>直接跳过等待</b>。
+            //   我们若先断一次，它几乎必然读到 Disconnected ⇒ 那条"等会话真收干净
+            //   （连续两轮，最多 WaitSeconds 秒）"的闸形同虚设，旧会话还在平台手里
+            //   半起半落时我们就去连第二条 —— 正是本方法注释里承诺要避免的并发。
+            //   让它自己断，st0 读到的必是 Connected，等待才真的发生。
+            (bool torn, string report) = await GracefulTeardown.EnsureTornDownAsync(current);
+            sb.Append($"[{oldName}]→[{target.ProfileName}] 收尾={(torn ? "干净" : "未收干净")}（{report}）");
+            if (!torn)
+            {
+                // ★ 必须出声，且是 Warn：这条意味着「切换被安全闸挡下」，
+                //   只看返回值容易读成「点了没反应」。
+                string refused = sb.Append("；新连接=跳过（避免与未收尾会话并发）").ToString();
+                RollingLog.Warn("profile-switch",
+                    $"拒绝切换（旧会话未收干净，保持现状不发起新连接）—— {refused}");
+                return (false, refused);
+            }
+
+            // ★【1.0.88 · Docs/38 F1/F2】拨号这一步从此和「连接 VPN」按钮<b>共用同一份实现</b>
+            //   （<see cref="ConnectOnceAsync"/>）：发起前先落一行、返回值单独一行并按枚举判、
+            //   轮询只判投影里真有的那 4 个状态。原先这里自己写一遍，和本方法上面的安全闸
+            //   一样是"两处各写一遍"的第二例 —— 收进来，观测缺口只补一次。
+            (bool dialed, string dialMsg) = await ConnectOnceAsync(
+                target, () => FindProfileBySubIdAsync(targetSubId), "profile-switch", "新连接请求");
+            sb.Append("；").Append(dialMsg);
+            bool ok = dialed;
+
+            // 成功/失败都要留这一行：Docs/36 §5 第 1 条正是"会话期切订阅"缺装机实测背书，
+            // 这行日志就是补齐它的第一手证据。
+            string msg = sb.ToString();
+            if (foreign)
+                msg += $"（注意：命中的是旧签名家族的条目 family={target.VpnPluginPackageFamilyName}）";
+            return (ok, msg);
         }
 
         /// <summary>
@@ -680,7 +1044,7 @@ namespace ClashUWP.Vpn
             VpnManagementErrorStatus del;
             try
             {
-                del = await Agent.DeleteProfileAsync(p);
+                del = await ProfileStore.DeleteProfileAsync(p);
             }
             catch (Exception ex)
             {
@@ -695,6 +1059,32 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
+        /// ★【快速面板改造】同时处于 Connected 的我们的 profile（排除探测残留）清单。
+        /// 空串 = 正常（0 或 1 条）；≥2 条返回名字列表。
+        ///
+        /// 【为什么只观测、不处置】"A 连着时在快速面板直接点 B"是切换订阅的常规操作，
+        ///   但平台对同一插件的两条 profile 能否并行没有实测背书（官方 VpnChannel.Start 条文
+        ///   "There can only be one VPN profile per process"，插件侧 <c>s_activeChannel</c>
+        ///   也只有一份）。真出现并发时，这一行日志是定位的第一手证据；
+        ///   <b>绝不</b>在这里自动断开谁 —— 拆会话的时机错了就是整机断网事故重演
+        ///   （见 <see cref="GracefulTeardown"/> 类注释的 2026-10-16 案例），
+        ///   处置方案等实测形状出来再定。
+        /// </summary>
+        internal static async Task<string> ParallelConnectedReportAsync()
+        {
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
+            var names = new List<string>();
+            foreach (IVpnProfile p in profiles)
+            {
+                if (p is not VpnPlugInProfile pp || !IsOurs(pp)) continue;
+                if (pp.ProfileName is "ClashUWP-Probe" or "ClashUWP-Dataface") continue;
+                if (pp.ConnectionStatus.ToString() == "Connected")
+                    names.Add(pp.ProfileName);
+            }
+            return names.Count >= 2 ? string.Join(" / ", names) : "";
+        }
+
+        /// <summary>
         /// ★【1.0.62】找"当前已连接"的那条我们的 profile（基础或某条订阅），
         /// 供断开/状态兜底用。排除探测 profile（ClashUWP-Probe / ClashUWP-Dataface）。
         /// 没连着的就回基础 profile。
@@ -706,7 +1096,7 @@ namespace ClashUWP.Vpn
         /// </summary>
         private static async Task<VpnPlugInProfile?> FindConnectedProfileAsync()
         {
-            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
             bool NotProbe(VpnPlugInProfile pp) =>
                 pp.ProfileName is not ("ClashUWP-Probe" or "ClashUWP-Dataface");
 
@@ -751,7 +1141,7 @@ namespace ClashUWP.Vpn
         /// </summary>
         public static async Task<string> ListOurProfilesAsync()
         {
-            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
             var sb = new StringBuilder();
             int n = 0;
             foreach (IVpnProfile p in profiles)
@@ -780,8 +1170,29 @@ namespace ClashUWP.Vpn
 
             // ★ 断开是"恢复网络的兜底手段"，它到底成没成必须留下可查的一行。
             //   注意 Ok 只代表请求被受理，会话收干净与否由 GracefulTeardown 那道闸判定。
-            string r = $"断开={await Agent.DisconnectProfileAsync(profile)}";
-            RollingLog.Info("profile-disconnect", r);
+            // ★【1.0.88 · Docs/38 F2/F4】返回值不再插值冲掉，按 <c>VpnManagementErrorStatus</c> 分支：
+            //   这三项在断开语境里的处置和连接语境<b>不同</b>，所以单独写而不套连接的解释 ——
+            //   <c>NoConnection</c> 官方条文是"没有可用网络连接"，但在断开这里的历史实测形状
+            //   是"平台上本就没有活动会话"（<c>Docs/30</c> 那次 <c>断开=NoConnection</c>）；
+            //   两种读法动作一致（都不需要再断），所以按"已是断开态"回话，同时把条文原义留在括号里不藏。
+            VpnManagementErrorStatus disc = await ProfileStore.DisconnectProfileAsync(profile);
+            string r = disc switch
+            {
+                VpnManagementErrorStatus.Ok =>
+                    "断开=Ok（请求已受理；会话收干净与否由收尾闸判定，这一句不代表已断开）",
+                VpnManagementErrorStatus.NoConnection =>
+                    "断开=NoConnection（平台侧本就没有活动会话 ⇒ 按已断开处理；官方对该成员的条文写的是\u201c没有可用网络连接\u201d）",
+                VpnManagementErrorStatus.AlreadyDisconnecting =>
+                    "断开=AlreadyDisconnecting（平台已经在断这条 ⇒ 等收尾，不再重发断开请求）",
+                VpnManagementErrorStatus.CannotFindProfile =>
+                    "断开=CannotFindProfile（★profile 在存储里找不到，条目多半已消失 ⇒ 走启动对账重建）",
+                _ => $"断开={disc}（★平台未受理断开：{ExplainDialError(disc)}）",
+            };
+            bool discAccepted = disc is VpnManagementErrorStatus.Ok
+                or VpnManagementErrorStatus.NoConnection
+                or VpnManagementErrorStatus.AlreadyDisconnecting;
+            if (discAccepted) RollingLog.Info("profile-disconnect", r);
+            else RollingLog.Warn("profile-disconnect", r);
             return r;
         }
 
@@ -830,6 +1241,20 @@ namespace ClashUWP.Vpn
 
             foreach ((string label, string server, bool requireUi) in cases)
             {
+                // ★【1.0.88 · Docs/38 官方第④条】探测<b>也是拨号</b>：官方按"至多一条活动会话"建模
+                //   （sample L80 "zero or one of these at all times"），插件侧 <c>s_activeChannel</c>
+                //   同样只有一份。已有活动会话时再连一条 probe，就是在制造本篇要避免的那个形态 ——
+                //   而这条路径的"只观测不处置"口径（<see cref="ParallelConnectedReportAsync"/>）
+                //   从此不再由探测自己破坏。探测是诊断，跳过它不影响任何用户功能。
+                VpnPlugInProfile? live = await FindActiveSessionAsync();
+                if (live != null)
+                {
+                    string skip = $"跳过=已有活动会话 [{live.ProfileName}]（官方建模至多一条，探测不得并行拨号）";
+                    RollingLog.Warn("probe-connect", skip);
+                    sb.AppendLine($"[{label}] {skip}");
+                    continue;
+                }
+
                 // 先删干净，保证每次都是新建（新建 vs 复用正是之前踩过的坑）。
                 await DeleteByNameAsync(probeName);
 
@@ -843,7 +1268,7 @@ namespace ClashUWP.Vpn
                 };
                 profile.ServerUris.Add(new Uri(server));
 
-                VpnManagementErrorStatus add = await Agent.AddProfileFromObjectAsync(profile);
+                VpnManagementErrorStatus add = await ProfileStore.AddProfileFromObjectAsync(profile);
 
                 // ★ 关键：把「回读失败」和「平台连不上」分成两个不同的字符串。
                 //   上一版两者都输出 CannotFindProfile，等于把自己赋的值和平台返回的值
@@ -863,7 +1288,7 @@ namespace ClashUWP.Vpn
                     }
                     else
                     {
-                        VpnManagementErrorStatus c = await Agent.ConnectProfileAsync(fresh);
+                        VpnManagementErrorStatus c = await ProfileStore.ConnectProfileAsync(fresh);
                         VpnPlugInProfile? after = await FindByNameAsync(probeName);
                         conn = $"平台返回={c}, 连后回读={(after == null ? "NULL" : after.ConnectionStatus.ToString())}";
                     }
@@ -888,7 +1313,7 @@ namespace ClashUWP.Vpn
                     sb.AppendLine($"  收尾[{label}]={(torn ? "可删" : "拒绝删")} {teardownReport}");
                     if (torn)
                     {
-                        VpnManagementErrorStatus del = await Agent.DeleteProfileAsync(toClean);
+                        VpnManagementErrorStatus del = await ProfileStore.DeleteProfileAsync(toClean);
                         if (del != VpnManagementErrorStatus.Ok)
                             sb.AppendLine($"  删除[{label}]={del}");
                     }
@@ -900,7 +1325,7 @@ namespace ClashUWP.Vpn
 
         private static async Task<VpnPlugInProfile?> FindByNameAsync(string name)
         {
-            IReadOnlyList<IVpnProfile> profiles = await Agent.GetProfilesAsync();
+            IReadOnlyList<IVpnProfile> profiles = await ProfileStore.GetProfilesAsync();
             foreach (IVpnProfile p in profiles)
             {
                 if (p is VpnPlugInProfile pp && pp.ProfileName == name)
@@ -922,7 +1347,7 @@ namespace ClashUWP.Vpn
                 RollingLog.Warn("profile-delete-refused", $"{name} 会话未收干净，拒绝删除");
                 return;
             }
-            VpnManagementErrorStatus del = await Agent.DeleteProfileAsync(existing);
+            VpnManagementErrorStatus del = await ProfileStore.DeleteProfileAsync(existing);
             if (del != VpnManagementErrorStatus.Ok)
                 RollingLog.Warn("profile", $"探测 profile {name} 删除失败={del}（保留，用户可手工清）");
         }

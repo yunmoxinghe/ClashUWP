@@ -41,8 +41,9 @@ namespace ClashUWP.Backend
             try
             {
                 sb.AppendLine("Step=GetProfilesAsync");
-                var agent = new Windows.Networking.Vpn.VpnManagementAgent();
-                var all = await agent.GetProfilesAsync();
+                // ★【1.0.82 · Docs/34 §六】诊断路径也不能绕过串行层：dump 恰恰是在"出事了"的时候跑的，
+                //   那时连接 RPC 很可能还在飞 —— 这正是 0x80070006 的形状（叶子调用，不嵌套）。
+                var all = await ClashUWP.Vpn.ProfileStore.GetProfilesAsync();
                 sb.AppendLine($"Count={all.Count}");
 
                 foreach (var p in all)
@@ -86,8 +87,7 @@ namespace ClashUWP.Backend
         /// </summary>
         internal static async Task<string> StatusTextAsync()
         {
-            var agent = new Windows.Networking.Vpn.VpnManagementAgent();
-            var profiles = await agent.GetProfilesAsync();
+            var profiles = await ClashUWP.Vpn.ProfileStore.GetProfilesAsync();
             if (profiles.Count == 0) return "profile 数=0";
             var sb = new StringBuilder();
             sb.AppendLine($"profile 数={profiles.Count}");

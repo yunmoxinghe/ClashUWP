@@ -188,7 +188,10 @@ namespace ClashUWP.Vpn
                 return;
             }
 
-            string profile = config.SubId.Length == 0 ? "默认配置" : config.SubId;
+            // ★【1.0.81】优先用显示名（如"星链机场"），没有则回退到 subId
+            string profile = config.SubDisplayName.Length > 0 ? config.SubDisplayName
+                          : config.SubId.Length > 0 ? config.SubId
+                          : "默认配置";
 
             var cts = new CancellationTokenSource();
             _cts = cts;
@@ -411,6 +414,12 @@ namespace ClashUWP.Vpn
         ///   清 <c>_shown</c> 并走 <see cref="ReRaiseThrottleSeconds"/> 限流补发；
         ///   <c>TimedOut</c> 按上一段只记账。
         ///
+        /// ★【1.0.81 · 新增】点击"断开连接"按钮后的行为：
+        ///   按钮使用 <c>hintAfterActivationBehavior='pendingUpdate'</c>，点击后通知进入"待更新"状态
+        ///   （不会消失，但会显示一个加载指示器）。此时 App.OnActivated 会收到激活参数，
+        ///   调用 VpnSession.DisconnectAsync 发起断开。断开成功后，Stop() 会 Hide 掉这条通知。
+        ///   如果用户在 pendingUpdate 状态下手动划掉通知，那会被计为 UserCanceled。
+        ///
         /// ★ 关于"想常驻就设 <c>ExpirationTime</c>"这条：已按官方文档<b>证伪</b> ——
         ///   <see cref="ToastNotification.ExpirationTime"/> 的 Remarks 写的是
         ///   "<i>Windows attempts to raise toast notifications immediately after you call Show,
@@ -619,9 +628,17 @@ namespace ClashUWP.Vpn
         ///   二是上下行速率不是"完成度"，硬造一个参考速率只会误导；
         ///   三行文字才是与安卓 <c>contentTitle / contentText / subText</c> 一一对应的形态。
         ///   <c>&lt;audio silent='true'/&gt;</c> 是第二重保险：万一横幅因为别的原因出现，也不响。
+        ///
+        /// ★【1.0.81 · 新增】点击通知打开主窗口且通知不消失：
+        ///   · <c>launch="action=viewMainWindow"</c> —— 点击通知主体时触发前台激活，
+        ///     App.OnActivated 会收到这个参数并打开/激活主窗口；
+        ///   · 按钮使用 <c>activationType="foreground"</c> 而非 <c>protocol</c>，
+        ///     这样点击后通知不会自动消失（官方：<c>PendingUpdate</c> 行为需要前台激活）；
+        ///   · "断开连接"按钮带 <c>hintAfterActivationBehavior="pendingUpdate"</c>，
+        ///     点击后保持通知可见，直到我们主动 Hide 或用户手动关闭。
         /// </summary>
         private static string StatusXml() =>
-            "<toast>" +
+            "<toast launch='action=viewMainWindow'>" +
               "<visual>" +
                 "<binding template='ToastGeneric'>" +
                   $"<text>{{{KeyTitle}}}</text>" +
@@ -629,6 +646,9 @@ namespace ClashUWP.Vpn
                   $"<text>{{{KeyTotal}}}</text>" +
                 "</binding>" +
               "</visual>" +
+              "<actions>" +
+                "<action content='断开连接' activationType='foreground' arguments='action=disconnect' hintAfterActivationBehavior='pendingUpdate'/>" +
+              "</actions>" +
               "<audio silent='true'/>" +
             "</toast>";
 

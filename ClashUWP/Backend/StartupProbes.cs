@@ -73,7 +73,23 @@ namespace ClashUWP.Backend
                 var sb = new StringBuilder();
                 sb.AppendLine($"Time={DateTime.Now:yyyy-MM-dd HH:mm:ss}");
 
-                var agent = new Windows.Networking.Vpn.VpnManagementAgent();
+                // ★【1.0.88 · Docs/38 官方第④条】探测也是拨号，官方按<b>至多一条活动会话</b>建模
+                //   （sample L80 "There should be zero or one of these at all times"）⇒
+                //   已经有隧道在飞时不再连这条 probe（它会占用插件唯一那份 activeChannel）。
+                //   判据共用前台那一份 <see cref="ClashUWP.Vpn.VpnProfileSetup.FindActiveSessionAsync"/>，
+                //   不在这里另写一遍"什么叫有会话"。结果照旧落盘，跳过这件事本身要看得见。
+                var live = await ClashUWP.Vpn.VpnProfileSetup.FindActiveSessionAsync();
+                if (live != null)
+                {
+                    sb.AppendLine($"跳过=已有活动会话 [{live.ProfileName}]（官方建模至多一条，探测不得并行拨号）");
+                    await LocalState.WriteTextAsync("dataface-v4.txt", sb.ToString());
+                    return;
+                }
+
+                // ★【1.0.82 · Docs/34 §六】这条 probe 自己就是"建 + 连 + 断 + 删 + 中途枚举"的
+                //   一整串 profile 存储 RPC，且它是在应用启动阶段跑的 —— 那时前台 UI 的 3 秒轮询、
+                //   甚至健康哨兵都可能正在读同一个存储。全部改走串行层；下面每一步都是
+                //   "await 完拿结果再走下一步"的叶子调用，没有嵌套，不会自锁。
 
                 // 建 probe profile。route 由插件 Connect 从 CustomConfiguration 解析成
                 // VpnRouteAssignment 下发 —— 与 selftest 的 safeConfig 同一机制。
@@ -90,7 +106,7 @@ namespace ClashUWP.Backend
                 };
                 profile.ServerUris.Add(new Uri("http://127.0.0.1"));
 
-                var add = await agent.AddProfileFromObjectAsync(profile);
+                var add = await ClashUWP.Vpn.ProfileStore.AddProfileFromObjectAsync(profile);
                 sb.AppendLine($"Add={add}");
                 if (add != Windows.Networking.Vpn.VpnManagementErrorStatus.Ok)
                 {
@@ -100,7 +116,7 @@ namespace ClashUWP.Backend
 
                 // ★ 硬约束：连接必须用 GetProfilesAsync 新鲜回读的对象，自建对象会 CannotFindProfile。
                 Windows.Networking.Vpn.VpnPlugInProfile? fresh = null;
-                var all = await agent.GetProfilesAsync();
+                var all = await ClashUWP.Vpn.ProfileStore.GetProfilesAsync();
                 foreach (var p in all)
                     if (p is Windows.Networking.Vpn.VpnPlugInProfile pp && pp.ProfileName == probeName)
                         { fresh = pp; break; }
@@ -112,7 +128,7 @@ namespace ClashUWP.Backend
                     return;
                 }
 
-                var conn = await agent.ConnectProfileAsync(fresh);
+                var conn = await ClashUWP.Vpn.ProfileStore.ConnectProfileAsync(fresh);
                 sb.AppendLine($"Connect={conn}");
 
                 // 插件 Connect 是同步回调（含 bridge 启动），ConnectAsync 返回时桥已就位；
@@ -202,7 +218,7 @@ namespace ClashUWP.Backend
 
                 await Task.Delay(1500);
 
-                var disc = await agent.DisconnectProfileAsync(fresh);
+                var disc = await ClashUWP.Vpn.ProfileStore.DisconnectProfileAsync(fresh);
                 sb.AppendLine($"Disconnect={disc}");
 
                 // ★★ 「断开」与「删 profile」之间必须有一道<b>确认</b>闸，不能靠固定延时。
@@ -242,7 +258,7 @@ namespace ClashUWP.Backend
                 // 也不能在会话还挂着的时候删 —— 那才是"拆 VPN 拆出整机断网"的入口。
                 if (tornDown)
                 {
-                    await agent.DeleteProfileAsync(fresh);
+                    await ClashUWP.Vpn.ProfileStore.DeleteProfileAsync(fresh);
                     sb.AppendLine("删probe=完成");
                 }
                 else

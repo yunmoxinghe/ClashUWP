@@ -313,9 +313,39 @@ namespace ClashUWP
         ///   自动拉 = 用户没确认就把订阅地址发出去，这超出"一键导入"的授权范围。
         ///   ⇒ 这里只做三件安全的事：解析 → 记日志 → 把 URL 填进 UI 的输入框。
         ///     <b>必须用户亲手点「拉取并启用」才真正发请求</b>。
+        ///
+        /// ★【1.0.81 · 新增】Toast 通知激活 —— 点击状态通知时打开/激活主窗口。
+        ///   通知 XML 里 <c>launch="action=viewMainWindow"</c>，这里识别后调
+        ///   <see cref="ActivateMainWindow"/> 把窗口带到前台。
         /// </summary>
         protected override void OnActivated(IActivatedEventArgs args)
         {
+            // ★【1.0.81】先检查是不是 Toast 激活（要在 HandleActivation 之前判断）
+            if (args is Windows.ApplicationModel.Activation.ToastNotificationActivatedEventArgs toastArgs)
+            {
+                string arguments = toastArgs.Argument ?? "";
+                RollingLog.Info("toast", $"Toast 激活 argument={arguments}");
+
+                if (arguments.Contains("action=viewMainWindow"))
+                {
+                    // 点击通知主体：打开/激活主窗口
+                    ActivateMainWindow();
+                    return;
+                }
+
+                if (arguments.Contains("action=disconnect"))
+                {
+                    // 点击"断开连接"按钮：触发断开逻辑
+                    RollingLog.Info("toast", "用户通过通知点击断开连接");
+                    TriggerDisconnectFromToast();
+                    return;
+                }
+
+                // 其它 toast 参数原样忽略
+                RollingLog.Info("toast", "未知 toast 激活参数，忽略");
+                return;
+            }
+
             HandleActivation(args);
         }
 
@@ -425,5 +455,63 @@ namespace ClashUWP
         /// 由 <see cref="HandleActivation"/> 写、由 MainComponent 的挂载 effect 读并清空。
         /// </summary>
         internal static string PendingSubscriptionUrl = "";
+
+        /// <summary>
+        /// ★【1.0.81】把主窗口带到前台：Toast 点击时调用。
+        /// 如果窗口已存在且有内容就 Activate；如果窗口为空则重建 Reactor 外壳。
+        /// </summary>
+        private static void ActivateMainWindow()
+        {
+            try
+            {
+                var window = Windows.UI.Xaml.Window.Current;
+                
+                // 窗口不存在或内容为空：需要重建 Reactor 外壳（冷启动路径）
+                if (window?.Content == null)
+                {
+                    RollingLog.Info("toast", "窗口内容为空，补建 Reactor 外壳");
+                    // ★ 协议冷启动也是这么做的（见 HandleActivation 386-387 行）：
+                    //   反编译确认 ReactorApplication.OnLaunched 完全不读 args，传 null! 安全
+                    //   它会做 BootstrapWinUi2 + 建 ReactorHost + Window.Current.Activate
+                    var app = Windows.UI.Xaml.Application.Current as App;
+                    if (app != null)
+                    {
+                        app.OnLaunched(null!);
+                        RollingLog.Info("toast", "已重建 Reactor 外壳并激活窗口");
+                    }
+                    else
+                    {
+                        RollingLog.Warn("toast", "Application.Current 为空，无法重建外壳");
+                    }
+                    return;
+                }
+                
+                // 窗口已经活着且有内容：把它激活到前台
+                window.Activate();
+                RollingLog.Info("toast", "已将主窗口激活到前台");
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Warn("toast", $"激活主窗口失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// ★【1.0.81】从 Toast 按钮触发断开连接。
+        /// 通过 VpnSession.DisconnectAsync 发起断开。
+        /// </summary>
+        private static async void TriggerDisconnectFromToast()
+        {
+            try
+            {
+                // 调用 VpnSession.DisconnectAsync（后台线程，fire-and-forget）
+                var result = await ClashUWP.Backend.VpnSession.DisconnectAsync();
+                RollingLog.Info("toast", $"Toast 断开连接结果: {result}");
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Error("toast", "Toast 断开连接失败", ex);
+            }
+        }
     }
 }
