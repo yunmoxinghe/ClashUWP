@@ -167,6 +167,18 @@ winapp package bin/publish `
 
 部署走 Visual Studio，这是项目规矩（AGENTS 第 2 条：不绕开 VS、不自制 ps1）；`Add-AppxPackage` 在这台机器上也不可用。CLI 包由使用者自己双击安装（自签证书需已信任）。
 
+★ **【2026-10-22 01:15 订正 · 两处已过期】**
+· "`Add-AppxPackage` 在这台机器上也不可用"**是错的**：127 那次是**在 pwsh 7 里跑的**（7 没带 Appx 模块），
+  Windows PowerShell **5.1 一直可用**（Docs/30 §5 已订正过一次）。本批 CLI 1.0.3.0 / 1.0.4.0 两次装机走的都是
+  `powershell -NoProfile -Command "Add-AppxPackage -Path '…\ClashUWP.Cli_1.0.x.0_x64.msix'"`，**无输出即成功**；
+  ★ 参数名是 **`-Path`**（`-Package`/`-FilePath` 都报 `NamedParameterNotFound`）。
+· 下面那条"`--list` 应打印 `421769c5-…_<hash>`"也已经过期：主清单 Identity Name 在 `3b11f69`（1.0.74→1.0.75）
+  改成了 `8B8CC4F4.ClashUWP`，而 CLI 里的 `TargetPackageName` 没跟着改 ⇒ **从 1.0.75 起 `--list` 一律"找不到目标包"**。
+  修法与装机凭据（现打印 `8B8CC4F4.ClashUWP_4tjvwvefxrz66`）在 **Docs/38 §十四 · F5**。
+· ★ 顺带记下本批量到的一个包身份事实：**主包与本 CLI 包现在不是同一个发布者** —— 主清单 `Publisher="CN=A19C62A9-…"`
+  （家族后缀 `4tjvwvefxrz66`），本工程 `Publisher="CN=gold"`（后缀 `y0tg80em3rma2`）。
+  ⇒ **别拿本包的后缀去猜主包**（当年那份过期 GUID 恰好带着同样的 `_y0tg80em3rma2`，看上去"没漂"，就是把两个家族混了）。
+
 2026-10-18 补：agent 侧可行的等价做法是**只拉起官方"应用安装程序"，点它自己的按钮** —— `Start-Process <msix>` 让系统用桌面上的 `AppInstaller.exe` 弹框，再用项目已有的 `winapp ui list-windows / inspect / invoke` 先读页面上写的是哪个版本、确认无误后 `invoke primaryButton`。全程没有自制部署脚本，MSIX 仍走系统唯一的正式安装通道。
 
 ⚠ 但这次真正拦住安装的不是包，是**部署队列被一次中断的 Remove 占死了**（见 §6.1）。先诊断再点安装，否则只是往队列里再塞一条永远不会执行的请求。

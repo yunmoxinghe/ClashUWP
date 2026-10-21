@@ -161,6 +161,9 @@ http://www.google.com/generate_204   code=204        t=0.25s    ← 走节点，
 ## 五、收工判据
 
 - `Get-DnsClientNrptRule` = 0；`Get-NetRoute -InterfaceAlias 'ClashUWP*'` = 0；断开后复查无自动重拨。
+  ★【1.0.81 复查订正】`= 0` 是本轮的真实读数，但**此后不能再当验收判据**：机器上现在常驻 1 条
+  Windows 自己的 `DNS_RESILIENCY_slscr.update.microsoft.com`（命名空间只锁那一个域名，不是根命名空间、
+  不是我们建的）。判据口径改成"**我们的 = 0 且没有根命名空间的那条**"，证据与理由见 Docs/33 §八、Docs/34 §五。
 - **没写过 `debug-cmd.txt`**（收工再查：文件不存在）。
 - `settings.txt` 已回滚：`selfSplitTunnel` 已删，与本轮开始前逐字一致（改前做过备份比对）。
 - Clash Verge 已还原：`clash-verge` 6604 + `verge-mihomo` 17672 在跑，`Meta` Connected 且抢回 `0.0.0.0/0`，
