@@ -208,28 +208,20 @@ namespace ClashUWP.Backend
 
         /// <summary>
         /// 默认的内核配置文件路径（<c>LocalState\config.kernel.yaml</c>）。
-        /// ★ 与 <c>KernelConfig.EffectiveFileName</c> 同一个文件名 —— 那是组件侧的常量，
-        ///   前台引得到（组件是 app 的依赖），但写成两处字面量更容易漂，所以显式对照。
         /// ★【1.0.89 · Docs/38 §十四】改 <c>internal</c>：全仓只有<b>这里</b>算这个路径是对的
         ///   （走 <c>ApplicationData.Current.LocalFolder</c>），而 <c>MihomoController.DiagnoseKernelAsync</c>
         ///   在 <c>:1571</c> 把包目录名写死成了 <c>421769c5-…_y0tg80em3rma2</c> —— 那是 1.0.75 改名<b>之前</b>
         ///   的家族名（现读 <c>git log -S</c> 为证：主清单 Identity Name 在 <c>3b11f69</c> 才换成
         ///   <c>8B8CC4F4.ClashUWP</c>），所以那条诊断从 1.0.75 起<b>永远</b>打"内核配置文件不存在"。
         ///   出口只留一个：诊断侧引这个方法，不许再自己拼路径。
+        /// ★【1.0.91】算法搬进 <see cref="LocalStatePaths"/>，这里只留一层转发。原因是上一批搬完之后
+        ///   <c>MihomoController.cs</c> 出现对 <c>DebugCommandLoop</c> 的引用，而离线夹具
+        ///   （<c>Tools/YamlShapeTest</c>，靠 link 源文件编译）link 了 <c>MihomoController.cs</c>
+        ///   却没 link 也 link 不动这个类 —— 它依赖命令分发、RollingLog、VPN 会话一整条链
+        ///   ⇒ 夹具当场 <c>CS0103 不存在名称"DebugCommandLoop"</c>（当时只验了主工程 Debug 编译，没跑夹具，
+        ///   属于自查漏掉）。转发的意义：命令侧的既有调用点与文档口径都不用改。
         /// </summary>
-        internal static string DefaultKernelConfigPath()
-        {
-            try
-            {
-                return System.IO.Path.Combine(
-                    Windows.Storage.ApplicationData.Current.LocalFolder.Path,
-                    "config.kernel.yaml");
-            }
-            catch
-            {
-                return "config.kernel.yaml";
-            }
-        }
+        internal static string DefaultKernelConfigPath() => LocalStatePaths.DefaultKernelConfigPath();
 
         /// <summary>
         /// LocalState 文件调试入口 —— 免重装操作 VPN。

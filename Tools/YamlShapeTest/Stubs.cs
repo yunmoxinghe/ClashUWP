@@ -24,6 +24,10 @@ namespace Windows.Storage
 
     public sealed class StorageFolder
     {
+        // ★【1.0.91】给 <c>LocalStatePaths.DefaultKernelConfigPath()</c> 用（它读 LocalFolder.Path 拼路径）。
+        //   返回空串而不是抛：那条调用在产品的诊断里被 try/catch 包住且只做字符串拼接，
+        //   夹具要的是"编译得过、判据不走 IO"，不是把它钉死。
+        public string Path => "";
         public FakeOp<StorageFile> GetFileAsync(string name) => new();
         public FakeOp<StorageFile> CreateFileAsync(string name, CreationCollisionOption o) => new();
     }

@@ -1572,9 +1572,12 @@ namespace ClashUWP.Backend.Mihomo
                 //   <c>3b11f69</c> 那笔把主清单 Identity Name 从 GUID 换成 <c>8B8CC4F4.ClashUWP</c>，
                 //   换名同时换了发布者 hash）。⇒ 这一段从 1.0.75 起<b>每次</b>都走 <c>else</c>，
                 //   诊断里那句"✗ 内核配置文件不存在"<b>从来不是事实</b>，而是一条读不到的假判据。
-                //   现在统一走 <see cref="DebugCommandLoop.DefaultKernelConfigPath"/>（唯一算对的出口），
+                //   现在统一走 <see cref="LocalStatePaths.DefaultKernelConfigPath"/>（唯一算对的出口），
                 //   并把路径本身打出来 —— 以后再漂，日志一行就能看出来是路径错还是文件真不在。
-                var configPath = DebugCommandLoop.DefaultKernelConfigPath();
+                //   ★【1.0.91】出口从 <c>DebugCommandLoop</c> 挪到 <c>LocalStatePaths</c>：本文件被离线夹具
+                //   <c>Tools/YamlShapeTest</c> 按 <c>&lt;Compile Link&gt;</c> 拉进编译单元，而命令分发那一条链
+                //   link 不动 ⇒ 上一批这一行引用把夹具编译弄断了（<c>CS0103</c>）。算法与行为一字未改。
+                var configPath = LocalStatePaths.DefaultKernelConfigPath();
 
                 if (File.Exists(configPath))
                 {

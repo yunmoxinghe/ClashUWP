@@ -19,14 +19,21 @@
     <AssemblyName>YamlShapeTest</AssemblyName>
     <NoWarn>$(NoWarn);CS8632;CS1591</NoWarn>
   </PropertyGroup>
-  <ItemGroup>
-    <Compile Include="..\..\ClashUWP\Vpn\KernelConfig.cs" Link="KernelConfig.cs" />
-    <Compile Include="..\..\ClashUWP\Vpn\AppSplit.cs" Link="AppSplit.cs" />
-    <Compile Include="..\..\ClashUWP\Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
-    <Compile Include="..\..\ClashUWP\Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
-    <Compile Include="..\..\ClashUWP\Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
-    <Compile Include="..\..\ClashUWP\Backend\Mihomo\MihomoController.cs" Link="MihomoController.cs" />
-    <Compile Include="..\..\ClashUWP\Backend\Mihomo\KernelView.cs" Link="KernelView.cs" />
-    <Compile Include="..\..\ClashUWP\Backend\Mihomo\SubscriptionView.cs" Link="SubscriptionView.cs" />
-  </ItemGroup>
+    <ItemGroup>
+        <Compile Include="..\..\ClashUWP\Vpn\KernelConfig.cs" Link="KernelConfig.cs" />
+        <Compile Include="..\..\ClashUWP\Vpn\AppSplit.cs" Link="AppSplit.cs" />
+        <Compile Include="..\..\ClashUWP\Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
+        <Compile Include="..\..\ClashUWP\Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
+        <Compile Include="..\..\ClashUWP\Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
+        <Compile Include="..\..\ClashUWP\Backend\SubscriptionShape.cs" Link="SubscriptionShape.cs" />
+        <Compile Include="..\..\ClashUWP\Backend\SelectionStore.cs" Link="SelectionStore.cs" />
+        <!-- ★【1.0.91】MihomoController.DiagnoseKernelAsync 读内核配置路径要用 LocalStatePaths，
+             这个类只依赖 Windows.Storage.ApplicationData，link 得动；
+             DebugCommandLoop 依赖命令分发/RollingLog/VPN 会话整条链，link 不动，所以路径算法
+             从那边搬进了这里（详见 LocalStatePaths.cs 的类注释）。 -->
+        <Compile Include="..\..\ClashUWP\Backend\LocalStatePaths.cs" Link="LocalStatePaths.cs" />
+        <Compile Include="..\..\ClashUWP\Backend\Mihomo\MihomoController.cs" Link="MihomoController.cs" />
+        <Compile Include="..\..\ClashUWP\Backend\Mihomo\KernelView.cs" Link="KernelView.cs" />
+        <Compile Include="..\..\ClashUWP\Backend\Mihomo\SubscriptionView.cs" Link="SubscriptionView.cs" />
+    </ItemGroup>
 </Project>
