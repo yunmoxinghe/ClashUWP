@@ -24,6 +24,9 @@
         <Compile Include="..\..\ClashUWP\Vpn\AppSplit.cs" Link="AppSplit.cs" />
         <Compile Include="..\..\ClashUWP\Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
         <Compile Include="..\..\ClashUWP\Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
+        <!-- ★【1.0.93 · Docs/48 §四】设置解析收成一份实现后，LocalSettings.cs 直接引用 SettingsParse，
+             这个 link 必须跟着补上 —— 否则夹具编译不过（补它的这一刻正是它咬过一次的样子）。 -->
+        <Compile Include="..\..\ClashUWP\Vpn\SettingsParse.cs" Link="SettingsParse.cs" />
         <Compile Include="..\..\ClashUWP\Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
         <Compile Include="..\..\ClashUWP\Backend\SubscriptionShape.cs" Link="SubscriptionShape.cs" />
         <Compile Include="..\..\ClashUWP\Backend\SelectionStore.cs" Link="SelectionStore.cs" />

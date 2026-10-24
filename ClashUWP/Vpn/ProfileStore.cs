@@ -9,7 +9,7 @@ namespace ClashUWP.Vpn
 {
     /// <summary>
     /// ★【1.0.81 · Docs/33 §三 的后续】<b>profile 存储 RPC 的串行层</b> ——
-    ///   <see cref="VpnProfileSetup"/> 与 <see cref="GracefulTeardown"/> 从此共用<b>一个</b>
+    ///   <see cref="ClashUWP.Backend.VpnProfileSetup"/> 与 <see cref="GracefulTeardown"/> 从此共用<b>一个</b>
     ///   <see cref="VpnManagementAgent"/> 实例，并且<b>任何时刻只允许一次调用在飞</b>。
     ///
     /// ══ 这条是从实机数据里长出来的，不是先猜再验 ══

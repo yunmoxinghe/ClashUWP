@@ -45,7 +45,7 @@
   <Identity
     Name="8B8CC4F4.ClashUWP"
     Publisher="CN=A19C62A9-1AA6-44AB-9F57-2DE6C380D9C9"
-    Version="1.0.91.0" />
+    Version="1.0.117.0" />
 
   <mp:PhoneIdentity PhoneProductId="e5bd739e-05a5-4a61-a7ab-2b5d1da1de4e" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -56,6 +56,11 @@
   </Properties>
 
   <Dependencies>
+    <!-- ★【1.0.102 · Docs/53】这里曾经跟着多实例实验把 MinVersion 提到 10.0.14393.0、
+         MaxVersionTested 提到 10.0.26100.0（uap10 属性是 1607 引入的，MinVersion 停在
+         10.0.0.0 会让"属性被拒还是被 ignorable 吃掉"多出一个说不清的变量）。
+         多实例那条杠杆已被部署期两条 0x80080204 判死（见上方【进程隔离的实测依据】末尾），
+         ⇒ 这两行原样撤回，保持与已提交认证的商店包逐字同一形态。 -->
     <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.0.0" MaxVersionTested="10.0.0.0" />
   </Dependencies>
 
@@ -66,6 +71,13 @@
   <Applications>
     <!--
       前台 UI（Reactor.Uwp）。
+
+      ★【Docs/47 建档】清单声明、本包进程/实例模型、SupportsMultipleInstances 三个同名
+        属性的分工、无头应用豁免、以及"要不要开多实例"这五件事的<b>唯一数据源是 Docs/47</b>，
+        口径以它为准；本文件往下的注释只留一手实测原文，不再承担定义职责。
+        其中那条决定先记在这儿备查：主应用<b>不开</b> SupportsMultipleInstances，
+        因为 appService 与 vpnClient 任务都是 in-proc 形态，而官方口径是
+        "进程内后台任务不支持多实例"（AppService 那条同样不支持，出处与置信度见 Docs/47 §四 T2）。
 
       ★ windows.appService 扩展 = in-app AppService（clashuwp-cli 的连接点）：
         · <b>不写 EntryPoint</b> —— 这正是要的形态。官方规则：Application 级
@@ -90,6 +102,18 @@
         · 拆成第二个 Application 的代价才是真的：它没有 UI，只能靠
           AppListEntry="none" 隐藏，而那个属性触发「无权创建无头应用」
           （1.0.72 就是因此被迫放弃隐藏，见 Docs/25）。
+          ★【2026-10-23 订正：这一句要分两维读，原文留着作记账】
+          1.0.72 那次把「缺 Executable / EntryPoint（真因，报 MakeAppx 80080204）」和
+          「删掉 AppListEntry=none」一起改了，从没拆开验过。臂 C（1.0.106）这个入口
+          三样齐全、带 AppListEntry=none，本地打包与注册一次通过，开始菜单仍只一条。
+          ★ 但<b>商店那一维仍然拦</b>：第三方两家一手写明，次级入口带 AppListEntry=none
+          会被 Store 包验收拒，除非开发者账号已拿到账号级 HeadlessAppBypass 豁免
+          （scottlerch/HostsFileEditor 撞的就是「主入口可见 + 第二个想隐藏」这个同形状，
+          他最后的处理是放弃隐藏；pierreaubert/sotf 同口径）。它不是清单里可声明的能力，
+          是打在账号上的标记，只能走 Partner Center 工单。
+           ⇒ 上架前二选一：删本入口的 AppListEntry 属性（开始菜单多一条插件宿主，
+          臂 C 的隔离与修复不依赖隐藏；⚠️ 删完的隔离性未装机复验），或申请账号级豁免。
+          证据表与判据边界在 Docs/47 第四节 T16/T17、第五节丙、第七节第 7/7b 条。
         · <uap:Task Type="vpnClient" />：装包即由 VPN 平台自动注册，
           <b>不需要</b>自己 BackgroundTaskBuilder.Register（官方 sample 注释）。
         · Extension 上的 Executable / EntryPoint 才是激活信息来源，
@@ -107,8 +131,26 @@
           app 日志同为前台 pid）；关掉前台窗口后平台先 Canceled 旧会话，再<b>另起一个后台
           宿主进程</b>重拨，隧道自己回来 —— 所以"关掉界面隧道仍在"成立，
           代价是一次约 2s 的平台重拨间隙。
-        ⇒ 不要为此上 uap10:SupportsMultipleInstances：那会让 windows.appService 的连接
-          另开实例、CLI 通道不再命中界面进程（Docs/13 的设计要重写），换来的只是省掉那次间隙。
+        ⇒ 旧判词（1.0.77~1.0.101，Docs/31 §4.3 / Docs/29 R6 / Docs/47 §一）是
+          "不要为此上 uap10:SupportsMultipleInstances"。
+        ★★【1.0.102 · Docs/53 这条判词由推升为实测，两臂都在<b>部署期</b>就被拒】
+          用户要求修掉那次 2 s 间隙 ⇒ 现读现试，两条臂各撞一条硬约束：
+            臂 A：Application 上写 uap10:SupportsMultipleInstances="true"、
+                  下面 bgtask Extension 照写 Executable
+                  ⇒ AppxManifest.xml(<b>142</b>,10) 0x80080204
+                    「在 SupportsMultipleInstances 为 true 时无法指定可执行文件」
+                    （142 行第 10 列 = 那个 Extension 的 Executable 属性）。
+            臂 B：保留多实例、把 Executable 删掉只留 EntryPoint
+                  ⇒ AppxManifest.xml(<b>150</b>,10) 0x80080204
+                    「因为此类型的任务需要自定义后台任务宿主」。
+          ⇒ 两条互斥，<b>vpnClient 的自定义宿主声明与多实例不能共存</b>，
+            这条杠杆对本包是<b>封死</b>的（不是"没试"了）。要真正消除这次间隙只剩两条路，
+            都不在本批：① 把插件拆成<b>独立的 VPN 插件包</b>（官方两包模型，
+            方向与 Docs/29 那次"插件回收进主工程"相反，且商店提交材料要重做）；
+            ② 关窗后让 UI 进程不死（UWP XAML 窗口没有可拦截的 Closing API，
+            多视图隐藏窗口那条属于未证实且商店政策敏感的旁门）。
+          判据存档：两条 ActivityId 在 Docs/53，报错来自注册期，未装机、未拨号，
+          对整机网络零影响。
     -->
     <Application Id="App"
       Executable="$targetnametoken$.exe"
@@ -126,14 +168,16 @@
         <uap:Extension Category="windows.appService">
           <uap:AppService Name="ClashUWP.Debug" />
         </uap:Extension>
-        <!-- VPN 插件后台任务声明（宿主进程身份见上方【进程隔离的实测依据】） -->
-        <Extension Category="windows.backgroundTasks"
-          Executable="$targetnametoken$.exe"
-          EntryPoint="ClashUWP.Vpn.VpnBackgroundTask">
-          <BackgroundTasks>
-            <uap:Task Type="vpnClient" />
-          </BackgroundTasks>
-        </Extension>
+        <!-- VPN 插件后台任务的声明【1.0.106 起挪到下面第二个 Application 入口 VpnHost】。
+          【为什么挪】★【Docs/53 臂 C】臂 A/臂 B 都在注册期被 0x80080204 拒掉（原文见上面
+          那段存档），剩下同一包里唯一没试过的杠杆就是<b>入口身份</b>：
+          单实例 ⇒ 这个 Extension 挂在 UI 入口 App 上时，vpnClient 的宿主就是 App 的进程，
+          关窗 reclaim 掉那个进程 ⇒ 平台 Canceled ⇒ 无头宿主重拨 ⇒ 约 2s 整机断流。
+          把它挂到另一个 Application 入口（AppListEntry=none、不摆开始菜单），
+          赌的是"后台任务宿主按入口分进程"。
+          ★【1.0.106 装机已证：赌对】⇒ 那 2s 断流从此消失，证据在 Docs/53 §五。
+          【Executable 这一行不能删】1.0.102 臂 B 实测：删掉只留 EntryPoint ⇒
+          AppxManifest.xml(150,10) 0x80080204「因为此类型的任务需要自定义后台任务宿主」。 -->
         <!--
           ★【1.0.53】协议激活：浏览器"一键导入 Clash 订阅"的入口。
           【为什么要注册两条】
@@ -162,6 +206,51 @@
             <uap:DisplayName>ClashUWP (Clash 订阅)</uap:DisplayName>
           </uap:Protocol>
         </uap:Extension>
+      </Extensions>
+    </Application>
+
+    <!--
+      ★★【1.0.106 · Docs/53 臂 C】vpnClient 后台任务的宿主从上面那个 UI 入口挪到这一个<b>独立入口</b>。
+      【要验的那一件事】上面 App 入口那段存档已经写死：同一个包里，
+      "多实例"与"进程内 vpnClient 任务"不能共存（0x80080204 两条互斥），
+      而单实例 ⇒ 关窗 reclaim 掉 UI 进程 ⇒ 平台 Canceled ⇒ 无头宿主重拨 ⇒ 约 2s 整机断流。
+      于是同包内只剩这一根杠杆没试：<b>入口身份</b> ——
+      后台任务的宿主进程是按 Application 入口分配的，把任务挂到一个不摆开始菜单
+      （AppListEntry=none）、也从不作为前台应用启动的第二个入口上，
+      UI 进程的生死就不该再牵连宿主。赌的就是这一句。
+      【判据（装机才有效）】拨号后比对两个 pid：界面进程 与 plugin.log 里
+      <c>bgtask 插件进程启动 … pid=</c> 那个。两个不同 ⇒ 赌对；同一个 ⇒ 平台仍按包族合并宿主，
+      本包无解，只能走"插件拆独立包"那条（Docs/53 §三）。
+      ★★【1.0.106 装机实测：赌对，本条判据已闭合】注册没被拒（臂 A/臂 B 的 0x80080204 没有再现），
+      装机后拨号：界面 pid=9488、宿主 pid=6368 <b>两个不同进程</b>；
+      07:41:25 关掉窗口 reclaim 掉 9488，6368 与隧道接口原样活着，
+      心跳 alive 严格 +13s 连续越过关窗时刻（117s → 130s），会话一路到用户主动断开（存活 276s）。
+      细则与长跑证据在 Docs/53 §五。
+      【为什么 EntryPoint 仍填 ClashUWP.App】这一入口永远不会被前台启动，
+      填成和 UI 一样的应用类是为了让宿主进程里的运行时/激活行为与今天<b>逐字相同</b>，
+      本实验只改"入口身份"这一个变量。
+    -->
+    <Application Id="VpnHost"
+      Executable="$targetnametoken$.exe"
+      EntryPoint="ClashUWP.App">
+      <uap:VisualElements
+        DisplayName="ClashUWP VPN 插件宿主"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        Description="ClashUWP 的 VPN 插件宿主入口（不对用户开放）"
+        BackgroundColor="transparent"
+        AppListEntry="none">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"/>
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <Extension Category="windows.backgroundTasks"
+          Executable="$targetnametoken$.exe"
+          EntryPoint="ClashUWP.Vpn.VpnBackgroundTask">
+          <BackgroundTasks>
+            <uap:Task Type="vpnClient" />
+          </BackgroundTasks>
+        </Extension>
       </Extensions>
     </Application>
   </Applications>

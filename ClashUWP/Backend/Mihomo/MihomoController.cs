@@ -872,34 +872,120 @@ namespace ClashUWP.Backend.Mihomo
             }
         }
 
+        /// <summary>组测速<b>整批</b>的超时（毫秒）。官方把它做成一个 ctx，罩的是全组并发拨测。</summary>
+        internal const int GroupTestBatchTimeoutMs = 8000;
+
+        /// <summary>
+        /// 组测速的<b>兜底</b>测试地址：这一组没配（或内核没报）自己的 <c>testUrl</c> 时用它。
+        /// 与单节点 delay 通道（<see cref="OneDelayAsync"/>）<b>同一个地址</b>，不另立标准；
+        /// 也与我们生成的 conf 里 url-test 段写的那个一致（<c>Vpn/KernelConfig.cs:542</c> 记的实测订阅形态）。
+        /// </summary>
+        internal const string DefaultGroupTestUrl = "http://www.gstatic.com/generate_204";
+
         /// <summary>
         /// 组测速接口的 URL。<b>纯函数</b>，离线夹具直测。
+        ///
+        /// ★【1.0.93 · 这条路由上一版写错了，这就是"测速不可用"的本体】
+        ///   旧实现拼的是 <c>PUT /proxies/{组}/healthcheck</c>，并把它按<b>推断</b>记的账写进了注释
+        ///   （"mihomo/clash REST 路由与 yacd 面板的用法一致如此"）。那条路由属于
+        ///   <b>clash（premium）的老 API</b>，<b>本内核 mihomo 没有</b>：
+        ///   官方 <c>hub/route/proxies.go:26-33</c> 里 <c>/proxies/{name}</c> 只挂了
+        ///   <c>GET /</c>、<c>GET /delay</c>、<c>PUT /</c>、<c>DELETE /</c> 四条 —— <b>没有 /healthcheck</b>；
+        ///   组级测速挂在另一棵树上：<c>hub/route/groups.go:21-26</c> 的
+        ///   <c>GET /group/{name}</c> 与 <c>GET /group/{name}/delay</c>。
+        ///   ⇒ 点一次吃一次 404，界面上一切"测速失败"都是这么来的。
+        ///   本轮按入仓的官方源码（<c>clashUWP研究\baseline\_mihomo</c>）定死，不再靠推断。
         ///
         /// ★ 组名进路径<b>一律 percent-encode</b>：订阅里的组名普遍带 emoji、带空格，
         ///   甚至可能带 <c>/</c>（<c>🚀 加速/代理</c> 这类写法真有机场在用）。不编码的话
         ///   一个 <c>/</c> 就把路由切断了 —— 那不是"测速失败"，是打到别的接口上去了。
         ///   同 <see cref="SelectCoreAsync"/> 那条"组名进 URL 一律编码"的实测口径。
+        ///   官方也认编码：<c>parseProxyName</c> 走的是 <c>getEscapeParam</c>（chi 解码路径参数）。
+        /// ★ <c>timeout</c> 是<b>必填项</b>：官方 <c>groups.go:69-72</c> 对
+        ///   <c>strconv.ParseInt(query.Get("timeout"), 10, 32)</c> 失败直接 400 ——
+        ///   少了这个参数不是"用默认值"，是"这一枪根本没打出去"。
+        /// ★ 而且这个 timeout 罩的是<b>整批</b>，不是单节点：<c>groups.go:82</c> 拿它建一个 ctx，
+        ///   <c>groupbase.go:237-256</c> 全组成员<b>并发</b>拨、<c>wg.Wait()</c> 等最慢的那个。
+        ///   ⇒ 所以这里给 8 s 而不是照抄单节点那条的 5000 ms：批里最后一个回来才算测完，
+        ///     卡太短会把慢节点误判成不通。
+        /// ★ <c>url</c> 必须给一个<b>真地址</b>：官方 <c>adapter/adapter.go:204-206</c> 对空串
+        ///   走 <c>urlToMetadata("")</c> → 直接返回 error → 每个节点都判失败 → 整批 504。
+        ///   空 url 不是"用默认值"，是"全员不通"。
+        /// ★ 传上去的 <c>url</c> 也编码（<c>EscapeDataString</c>）：与单节点那条的裸写法
+        ///   <b>解码后是同一个值</b>（Go 侧 <c>query.Get("url")</c> 会 percent-decode），
+        ///   但组自己的 <c>testUrl</c> 是订阅里带进来的，含 <c>&amp;</c> / <c>#</c> 的并不罕见，
+        ///   不编码就会把 query 截断。
         /// </summary>
-        internal static string GroupHealthCheckUrl(string group) =>
-            "http://127.0.0.1:9090/proxies/" + Uri.EscapeDataString(group) + "/healthcheck";
+        internal static string GroupHealthCheckUrl(string group, string testUrl, int timeoutMs)
+        {
+            string url = string.IsNullOrEmpty(testUrl) ? DefaultGroupTestUrl : testUrl;
+            return "http://127.0.0.1:9090/group/" + Uri.EscapeDataString(group) + "/delay" +
+                   "?timeout=" + timeoutMs.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                   "&url=" + Uri.EscapeDataString(url);
+        }
 
         /// <summary>
-        /// 让这个组立刻把成员全测一遍（安卓版那枚 ⚡ 的等价物：CMFA 是
-        /// <c>healthCheck(groupName)</c> 之后重载这一组的数据，<c>ProxyActivity.kt 93-101</c>）。
+        /// 解析 <c>GET /group/{name}/delay</c> 的响应体。官方渲染的是<b>裸对象</b>
+        /// <c>map[string]uint16</c>（<c>groups.go:93</c> 直接 <c>render.JSON(w, r, dm)</c>，
+        /// 没有 <c>{"data": …}</c> 外壳），键=节点名、值=延迟毫秒。
         ///
-        /// ★ 测速用的是<b>组自己在订阅里配的</b> <c>url:</c> / <c>timeout:</c> / <c>interval:</c>
-        ///   （内核侧 <c>group.Healthcheck</c> 读的就是这几个字段），本函数不传测试地址、
-        ///   不覆盖机场的设定 —— 与安卓一致。
-        /// ★ 自动组（url-test / fallback）同样能测，而且这才是它的正事：手动组测完
-        ///   只是把延迟刷新一下，自动组测完可能直接换赢家。所以这个按钮<b>不给
-        ///   "能不能手选"门控</b>，每组都有。
-        /// ★ 证据级别：<c>PUT /proxies/{name}/healthcheck</c> + 成功 204 这条按
-        ///   <b>推断</b>记账（mihomo/clash REST 路由与 yacd 面板的用法一致如此；
-        ///   官方 API 手册原文这一版没抓到 —— 沙箱无外网）。因此这里把内核回的
-        ///   <b>状态码与响应体原样带回</b>：204=方法对了，405=方法不对（该换 GET），
-        ///   404=路由不对。一次上机就定死，不搞"两种都试"的和稀泥。
-        /// ★ 响应 204 是"已触发"，不是"测完了"：延迟是异步写回 <c>history</c> 的，
-        ///   界面上的数会由 3 秒轮询带出来（与安卓"测完重载该组数据"同一效果）。
+        /// ★【★ 只含<b>拨通</b>的节点】官方 <c>groupbase.go:245-251</c> 只在
+        ///   <c>err == nil</c> 时往表里写，失败的成员<b>压根不出现在响应里</b>。
+        ///   ⇒ 界面少了几员就是"几员不通"，不是"内核漏返回"，这条读法必须写进结果文案。
+        /// ★【非数字一律跳过】全组不通时官方不走这里，而是 504 + <c>{"error": "…"}</c>
+        ///   （<c>groups.go:86-90</c>）；但错误体的形状<b>和成功响应同为对象</b>
+        ///   （键值都是<b>字符串</b>），所以按"值必须是数字"筛，一次把两种形状分开，
+        ///   不给"error 也算一个节点"留口子。
+        /// ★【值域】uint16：内核把超过 65535 ms 的数折到上限，别把 65535 读成"神速"。
+        /// </summary>
+        internal static System.Collections.Generic.Dictionary<string, long>
+            ReadGroupDelayMap(System.Text.Json.JsonElement root)
+        {
+            var dm = new System.Collections.Generic.Dictionary<string, long>(
+                System.StringComparer.Ordinal);
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Object) return dm;
+            foreach (var kv in root.EnumerateObject())
+            {
+                if (kv.Value.ValueKind != System.Text.Json.JsonValueKind.Number) continue;
+                if (!kv.Value.TryGetInt64(out long d) || d < 0) continue;
+                if (kv.Name.Length > 0) dm[kv.Name] = d;   // 节点名原样，不做任何加工
+            }
+            return dm;
+        }
+
+        /// <summary>
+        /// 让这个组立刻把成员全测一遍（安卓版那枚 ⚡ 的等价物）。
+        ///
+        /// ★【路由】<c>GET /group/{name}/delay?timeout=&amp;url=</c>，理由与证据见
+        ///   <see cref="GroupHealthCheckUrl"/>。
+        /// ★【测地址怎么取】先 <c>GET /group/{name}</c> 读这一组<b>自己配的</b>
+        ///   <c>testUrl</c>，拿到就用它、拿不到才用兜底地址 —— 这样才当得起旧注释里那句
+        ///   "不覆盖机场的设定"。官方依据：
+        ///   · 组对象确实把 <c>testUrl</c> 报出来了（<c>selector.go:72</c> /
+        ///     <c>urltest.go:174</c> / <c>fallback.go:90</c> / <c>loadbalance.go:230</c>）；
+        ///   · 但 <c>Selector</c> 在自己的值等于官方默认时<b>故意报空串</b>
+        ///     （<c>selector.go:63-67</c> 的注释原话是"让面板follow自己的设置"）⇒ 空串走兜底；
+        ///   · <c>URLTest</c> 组<b>会忽略我们传的 url</b>、改用它自己的
+        ///     <c>u.testUrl</c>（<c>urltest.go:191-193</c>）⇒ 传什么都不会污染它的设定；
+        ///     <c>Fallback</c>/<c>LoadBalance</c> 没有这个覆盖（它们用内嵌的
+        ///     <c>GroupBase.URLTest</c>，<c>groupbase.go:237</c>），所以<b>真会用我们传的地址</b>
+        ///     —— 这正是"先读组自己的 testUrl"必须做的原因。
+        ///   · 订阅里没写 <c>url:</c> 时内核也不会留空：<c>parser.go:139-149</c> 先取提供方的
+        ///     health-check URL，再退官方默认地址 ⇒ 空地址只可能来自 <c>Selector</c> 那个"故意留空"。
+        /// ★【★ 自动组的选择会被重置 —— 这是官方法定的副作用，不是我们的 bug】
+        ///   <c>groups.go:61-65</c>：命中 <c>SelectAble</c> 且<b>类型不是 Selector</b> 的组，
+        ///   内核在这个接口里先 <c>ForceSet("")</c> 并把缓存里的 selected 也写成空
+        ///   （<c>util.go:30-37</c> 的 <c>SelectAble</c> 只有 Fallback / URLTest / Selector 三家实现）
+        ///   ⇒ 点一次 ⚡，url-test / fallback 组的"现值"会短暂变成空/兜底，
+        ///      等它自己下一轮测速才重新定赢家。文案必须说出来，否则用户读成"我选的节点掉了"。
+        /// ★【结果是<b>同步</b>的，不是"已触发"】官方 <c>wg.Wait()</c> 之后才
+        ///   <c>render.JSON</c>（<c>groupbase.go:256-261</c> + <c>groups.go:93</c>），
+        ///   所以响应回来时延迟<b>已经写进节点的 history</b>（<c>adapter.go:170-177</c> 的 defer）。
+        ///   —— 旧注释那句"204 只代表已触发、要等下一次刷新"跟着错的路由一起作废：
+        ///   新路上<b>没有 204</b>，成功是 200 + 一张表。
+        /// ★【失败也回话，不抛】404=这个名字不是可测的组（Relay 不实现 <c>ProxyGroup</c>，
+        ///   <c>util.go:25-28</c> 只列了 Selector/URLTest/Fallback/LoadBalance ⇒ Relay 组必然 404）；
+        ///   400=timeout/expected 内核没收下；504=全员不通。
         /// </summary>
         internal static async Task<string> TriggerGroupHealthCheckAsync(string group)
         {
@@ -907,21 +993,97 @@ namespace ClashUWP.Backend.Mihomo
                 return "测速需要参数：给一个组名称";
             try
             {
-                // 一次要拨完整组成员，最慢的那员就是这里的上限；30 秒够机场常见
-                // （timeout 5000ms + 并发）的量级，也比"卡住不动"更容易看出来。
+                // 一次要拨完整组成员，最慢的那员就是上限；30 s 是 HTTP 客户端侧的余量，
+                // 真正的批上限是 URL 里的 timeout（内核到点会把各 goroutine 的 ctx 取消掉）。
                 using var http = NewLoopbackClient(30);
-                string url = GroupHealthCheckUrl(group);
-                using var req = new HttpRequestMessage(HttpMethod.Put, url);
-                using var resp = await http.SendAsync(req);
-                int code = (int)resp.StatusCode;
-                string body = await resp.Content.ReadAsStringAsync();
-                if (body.Length > 200) body = body[..200] + "…";
 
-                if (code is 200 or 204)
-                    return $"已触发「{group}」测速（{code}），延迟随下一次刷新出来";
-                return $"「{group}」测速失败 HTTP {code}" +
-                       (body.Length > 0 ? $" {body}" : "") +
-                       "　※ 若这里是 405，说明本内核这版走的是 GET 而不是 PUT（见注释的证据级别）";
+                // ① 先问这一组自己配的测试地址（拿不到不判失败：退兜底地址照测）。
+                string ownUrl = "", groupType = "";
+                int members = 0;
+                try
+                {
+                    using var meta = await http.GetAsync(
+                        "http://127.0.0.1:9090/group/" + Uri.EscapeDataString(group));
+                    if (meta.IsSuccessStatusCode)
+                    {
+                        string metaJson = await meta.Content.ReadAsStringAsync();
+                        using var doc = System.Text.Json.JsonDocument.Parse(metaJson);
+                        var root = doc.RootElement;
+                        ownUrl = GetString(root, "testUrl");
+                        groupType = GetString(root, "type");
+                        if (root.TryGetProperty("all", out var all) &&
+                            all.ValueKind == System.Text.Json.JsonValueKind.Array)
+                            members = all.GetArrayLength();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // 元数据是补充信息：读不到就按兜底地址测，绝不因为这一步把按钮判死。
+                    ClashUWP.Vpn.RollingLog.Info("group-hc",
+                        $"读 /group 元数据失败（用兜底测速地址）: {ex.GetType().Name}");
+                }
+
+                bool usedOwn = ownUrl.Length > 0;
+                string url = GroupHealthCheckUrl(group, ownUrl, GroupTestBatchTimeoutMs);
+                using var resp = await http.GetAsync(url);
+                int code = (int)resp.StatusCode;
+                // ★ 响应体<b>先按原文拿着</b>：32 员的一组，那张 map 轻轻松松超过 200 字符，
+                //   截断后再拿去解析必然失败（这一条就是本轮差点"修了还是坏"的地方）。
+                //   截断只用于非 200 那几条要把错误体带回界面的场合。
+                string body = await resp.Content.ReadAsStringAsync();
+
+                var sb = new StringBuilder();
+                sb.Append($"「{group}」");
+
+                if (code == 200)
+                {
+                    System.Collections.Generic.Dictionary<string, long> dm;
+                    try
+                    {
+                        using var doc = System.Text.Json.JsonDocument.Parse(body);
+                        dm = ReadGroupDelayMap(doc.RootElement);
+                    }
+                    catch (Exception ex)
+                    {
+                        return $"「{group}」测速回来了但解析失败 {ex.GetType().Name}：" +
+                               (body.Length > 200 ? body[..200] + "…" : body);
+                    }
+
+                    sb.Append($"测速完成：{dm.Count}");
+                    if (members > 0) sb.Append($"/{members}");
+                    sb.Append(" 通");
+
+                    if (dm.Count > 0)
+                    {
+                        string fastest = "";
+                        long best = long.MaxValue;
+                        foreach (var kv in dm)
+                            if (kv.Value < best) { best = kv.Value; fastest = kv.Key; }
+                        sb.Append($"，最快 {fastest} {best}ms");
+                    }
+                    // ★ 少列出来的那几员不是"内核没返回"，是本轮不通（groupbase.go:245-251）
+                    if (members > 0 && dm.Count < members)
+                        sb.Append($"（没列出的 {members - dm.Count} 员本轮不通）");
+
+                    sb.Append($"　※ 测速地址：{(usedOwn ? $"该组自己配的 {ownUrl}" : $"兜底 {DefaultGroupTestUrl}")}");
+                    if (groupType is "URLTest" or "url-test")
+                        sb.Append("（自动组会忽略这个地址，用它自己的）");
+                    if (groupType is "URLTest" or "url-test" or "Fallback" or "fallback")
+                        sb.Append("　※ 这一组的选择已被内核按官方口径重置（测速接口自带，groups.go:61-65），现值等它下一轮重新定");
+                    return sb.ToString();
+                }
+
+                sb.Append($"测速失败 HTTP {code}");
+                if (body.Length > 0)
+                    sb.Append(" " + (body.Length > 200 ? body[..200] + "…" : body));
+                sb.Append(code switch
+                {
+                    404 => "　※ 官方 /group/{name}/delay 只认 ProxyGroup（Selector/URLTest/Fallback/LoadBalance 四种），Relay 组不在这张表里",
+                    400 => "　※ 官方对 timeout/expected 解析失败直接 400（groups.go:69-79），这一枪没打出去",
+                    504 => "　※ 官方语义：这一组全员不通（get delay: all proxies timeout）",
+                    _ => "",
+                });
+                return sb.ToString();
             }
             catch (Exception ex)
             {
@@ -965,6 +1127,9 @@ namespace ClashUWP.Backend.Mihomo
         /// 【★ 延迟列怎么读】<c>delay=-</c> = 这个成员<b>从没被测过</b>。select 组带
         ///   <c>lazy: true</c> 时启动不测速，整列都是 <c>-</c> 是正常现象，不是"全挂了"；
         ///   要数就紧接着打 <c>delay</c> 命令或让 <c>mode global</c> 造流量。
+        ///   ★【1.0.93】<c>delay=0（本轮不通）</c> 才是"挂了"这一档 —— 官方测速失败时
+        ///   往 history 写的就是 <c>Delay=0</c>（<c>adapter/adapter.go:170-177</c>、
+        ///   <c>:190</c> 的 defer），不是"没有记录"。别把 0 读成"0 毫秒、神速"。
         ///   （同一份数据里 <c>alive</c> 全是 <c>true</c>，实测未测速时不可信，故不列。）
         /// </summary>
         internal static async Task<string> RunGroupsAsync()
@@ -983,6 +1148,7 @@ namespace ClashUWP.Backend.Mihomo
                            "可先 debug conf 看 proxies 有没有落到内核。)";
 
                 sb.Append($"可切换组={groups.Count}（* = 当前选中；delay=- 表示该成员还没被测过，不等于挂了；" +
+                          "delay=0 才是本轮不通；" +
                           "[组]=成员本身是嵌套组，[策略]=内置策略，二者都不是节点）");
                 foreach (var g in groups)
                 {
@@ -1014,7 +1180,12 @@ namespace ClashUWP.Backend.Mihomo
                             else if (mi.IsBuiltin) kind = " [策略]";
                         }
                         sb.Append($"\n   {mark} {name}{kind}");
-                        sb.Append(delay.TryGetValue(name, out long d) ? $" delay={d}ms" : " delay=-");
+                        // ★【1.0.93】0 不是"0 毫秒"，是"本轮不通"：官方在测速失败时往 history
+                        //   写的就是 Delay=0（adapter/adapter.go:170-177 + :190 的 defer）。
+                        //   文本通道要留可复盘的明确性，所以 0 直写"不通"，不让人猜。
+                        if (!delay.TryGetValue(name, out long d)) sb.Append(" delay=-");
+                        else if (d == 0) sb.Append(" delay=0（本轮不通）");
+                        else sb.Append($" delay={d}ms");
                     }
                 }
 

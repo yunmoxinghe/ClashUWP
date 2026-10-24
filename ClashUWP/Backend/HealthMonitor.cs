@@ -10,10 +10,14 @@ namespace ClashUWP.Backend
     /// <summary>
     /// 【后端 · 健康哨兵】对齐安卓版③「连不上自动退回直连」。
     ///
-    /// 谁武装它：两条路 —— UI 的「连接 VPN」按钮走 <see cref="VpnSession"/>，
-    /// debug 回路的 connect 命令走 <see cref="DebugCommandLoop"/>。
-    /// 两者都必须先武装再连接：全路由隧道一旦黑洞就是整机断网，
-    /// 哨兵是唯一把保护性交回直连的自动机制。
+    /// 谁武装它：三条路 —— UI 的「连接 VPN」按钮走 <see cref="VpnSession"/>，
+    /// debug 回路的 connect 命令走 <see cref="DebugCommandLoop"/>（两条都是先武装再连接），
+    /// ★【1.0.107】还有第三条：<see cref="VpnSession.AdoptLiveSessionIfUnprotected"/> ——
+    /// 3 秒轮询读到「会话活着但前台没哨兵」时认领（快速面板点连接 / 平台自发重拨 /
+    /// 臂 C 无头长期在线之后重开 app，这三种形状的会话都不是本前台拨的）。
+    /// 前两条必须先武装再连接：全路由隧道一旦黑洞就是整机断网，
+    /// 哨兵是唯一把保护性交回直连的自动机制；第三条补的正是 Docs/53 §五.⑥.2
+    /// 那条「前台哨兵只在前台发起连接时 Arm」的暴露面。
     ///
     /// ★ 它是后端而不是前端：判据、断开、删 profile、写 health.txt 全都不需要 UI，
     ///   而且必须能在没人盯着的时候自己收尾。
@@ -39,17 +43,37 @@ namespace ClashUWP.Backend
         ///   <see cref="DebugCommandLoop"/>，两条连接路径都必须先武装再连 ——
         ///   漏一条就等于那条路没有黑洞保护。
         /// </summary>
-        internal static void Arm()
+        internal static void Arm() => ArmCore(adopted: false);
+
+        /// <summary>
+        /// ★【1.0.107 · Docs/54】以<b>认领模式</b>武装哨兵：会话不是本前台拨的
+        /// （快速面板点连接 / 平台自发重拨 / 臂 C 无头会话之后重开 app），
+        /// 轮询读到 Connected 而 <see cref="IsActive"/> 为假时调用。
+        ///
+        /// 【与 <see cref="Arm"/> 的两点差别，都源自"这次没有我们自己的拨号"】
+        /// ① <b>没有硬上限</b>：1800 s 上限是"先武装再连接"那条路的保险丝，
+        ///   防的是拨号悬挂长期占网；认领的会话在武装那一刻已经 Connected 且健康，
+        ///   到点强拆一台健康隧道是净伤害（用户视角就是"每半小时自己掉线"）。
+        ///   认领模式的收尾判据只剩探针（连续两轮国内不可达）、重拨保险丝、
+        ///   物理兜底 —— 三条全是判据驱动，健康隧道一条都碰不到。
+        /// ② <b>重拨基线里没有"我们自己那一次"</b>：<c>connects - 0</c> 而不是
+        ///   <c>connects - 1</c>，否则每次平台重拨都被少记一次，828 死循环要多熬一轮才拆。
+        /// </summary>
+        internal static void AdoptArm() => ArmCore(adopted: true);
+
+        private static void ArmCore(bool adopted)
         {
             bool hadActive = _healthCts != null;
             Cancel();
             _healthCts = new CancellationTokenSource();
-            _ = RunAsync(_healthCts.Token);
+            _ = RunAsync(_healthCts.Token, adopted);
 
             // ★ 每次武装都留一行：哨兵是"黑洞时谁把网络交回直连"的唯一自动机制，
             //   事后必须能回答"这一次连接到底有没有保护"。旧写法靠人记，
             //   1.0.35 把武装收进 VpnSession 之后仍要用日志证明它真的发生了。
-            RollingLog.Info("health-arm", hadActive ? "重新武装（顶掉上一个哨兵）" : "武装健康哨兵");
+            RollingLog.Info("health-arm", adopted
+                ? (hadActive ? "重新武装（顶掉上一个哨兵，认领模式）" : "武装健康哨兵（认领模式：会话非本前台发起，无硬上限）")
+                : (hadActive ? "重新武装（顶掉上一个哨兵）" : "武装健康哨兵"));
         }
 
         /// <summary>解除哨兵（手动断开即取消：连接已经不在了，没必要再探）。</summary>
@@ -110,11 +134,11 @@ namespace ClashUWP.Backend
         ///   全程正常 ⇒ 前台黑洞判定与 1800 s 硬上限<b>整轮根本没在跑</b>，日志上却完全看不出来。
         ///   这条保护是"黑洞时谁把网络交回直连"的唯一自动机制，它瞎了必须出声。
         /// </summary>
-        private static async Task RunAsync(CancellationToken token)
+        private static async Task RunAsync(CancellationToken token, bool adopted)
         {
             try
             {
-                await RunCoreAsync(token).ConfigureAwait(false);
+                await RunCoreAsync(token, adopted).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -184,12 +208,17 @@ namespace ClashUWP.Backend
         ///   （单日 413 次、间隔 97±2 s 就是这么来的），一旦看到第 2 次非我们发起的
         ///   connect，立刻断开 + 删 profile —— 判据驱动，不再靠计时器。
         /// </summary>
-        private static async Task RunCoreAsync(CancellationToken token)
+        private static async Task RunCoreAsync(CancellationToken token, bool adopted)
         {
             const int intervalSeconds = 10;      // 每 10 秒一轮
             const int maxConsecutiveFailures = 2; // 连续 2 轮失败 → 判定黑洞
-            const int hardCapSeconds = 1800;      // 无条件兜底 30 分钟（判据失灵时的保险丝）
-            const int maxUnmanagedRedials = 1;    // 允许自愈 1 次，第 2 次非我们发起的 dial 就拆
+            const int hardCapOwnedSeconds = 1800; // 无条件兜底 30 分钟（判据失灵时的保险丝；只属"先武装再连接"那条路）
+            const int maxUnmanagedRedials = 1;    // 允许自愈 1 次，再多的非我们发起的 dial 就拆
+
+            // ★【1.0.107 · Docs/54】认领模式没有硬上限（理由在 <see cref="AdoptArm"/> 注释①）：
+            //   deadline 用 MaxValue，循环退出的判据只剩探针 / 重拨保险丝 / 物理兜底 /
+            //   下面的"会话已消失"出口 —— 四条全是判据驱动。
+            int hardCapSeconds = adopted ? int.MaxValue : hardCapOwnedSeconds;
 
             // ★【1.0.78 订正 · Docs/30 §8-A】兜底安全垫的武装点<b>挪到前置确认之后</b>（见下方
             //   tunnelUp 分支）。原先这里是"武装哨兵第一件事就起物理兜底"，而物理兜底的动作是
@@ -207,8 +236,9 @@ namespace ClashUWP.Backend
             var deadline = DateTime.Now.AddSeconds(hardCapSeconds);
 
             // ★ 基线 = 本哨兵被武装的时刻。之后每轮数「这之后出现过几次 connect-begin」，
-            //   减掉我们自己那一次，剩下的就是 RasMan 自发的重拨。
+            //   减掉我们自己那一次（认领模式本来就没拨，一次都不减），剩下的就是 RasMan 自发的重拨。
             DateTime armedAt = DateTime.Now;
+            int ownDials = adopted ? 0 : 1;
             sb.AppendLine($"基线时刻 {armedAt:HH:mm:ss}（只数这之后的 connect-begin，" +
                           $"允许非本次发起的重拨 {maxUnmanagedRedials} 次）");
 
@@ -324,10 +354,51 @@ namespace ClashUWP.Backend
             _physicalWatchdogCts = new CancellationTokenSource();
             _ = PhysicalNetworkWatchdogAsync(_physicalWatchdogCts.Token);
 
+            // ★【1.0.107 · Docs/54】会话消失检测的连续终态计数（见循环内注释）。
+            int goneRounds = 0;
+
             while (tunnelUp && DateTime.Now < deadline)
             {
                 try { await Task.Delay(TimeSpan.FromSeconds(intervalSeconds), token).ConfigureAwait(false); }
                 catch (TaskCanceledException) { return; } // 手动断开，正常退出
+
+                // ★【1.0.107 · Docs/54】会话消失出口：每轮顺带读一次状态（限时 3s，
+                //   与前置确认同一套口径；读不出只算"这轮没看见"，不参与计数）。
+                //   连续两轮终态（Disconnected / Profile缺失）⇒ 会话已经不在了，哨兵的对象消失。
+                //   【为什么要】旧写法的循环条件只有 deadline 与探针，会话被快速设置断开之后
+                //   哨兵会继续在直连网络上探到硬上限，然后 Disconnect + DropProfile ——
+                //   删掉的恰是承载快速面板条目的基础 profile（"条目自己消失"形状）。
+                //   认领模式没有硬上限，不补这条就会在死会话上永远探下去。
+                //   【为什么退出而不是收尾】会话已经没了，Disconnect 是空动作；
+                //   profile 更不能删 —— 它是快速面板的条目，删掉入口就消失（Docs/30 §8-A 同款代价）。
+                //   【为什么连两轮才认】给 RasMan 正常重拨的中间态让路；读数中毒（Docs/45）
+                //   误读成 Disconnected 的形状无实测样本，且退出只是"停止保护"不是"动手破坏"，
+                //   下一个观测者（轮询的认领）会在会话回来时重新武装 —— 代价不对称性成立。
+                string stNow;
+                try { stNow = await ReadStatusBoundedAsync(3000).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                catch (Exception ex)
+                {
+                    RollingLog.Warn("health", $"会话状态轮读异常（按没看见处理）：{ex.GetType().Name}: {ex.Message}");
+                    stNow = StatusUnreadable;
+                }
+                if (stNow == "Disconnected" || stNow == "Profile缺失")
+                {
+                    goneRounds++;
+                    if (goneRounds >= 2)
+                    {
+                        RollingLog.Info("health",
+                            $"会话已断开（连续 {goneRounds} 轮终态读数）⇒ 哨兵退出，不断开不删 profile（profile 是快速面板的条目）");
+                        sb.AppendLine($"{DateTime.Now:HH:mm:ss} 会话已断开（连续两轮终态）⇒ 哨兵退出，不动手");
+                        try { await LocalState.AppendTextAsync("health.txt", sb + "\r\n").ConfigureAwait(false); }
+                        catch (Exception ex) { RollingLog.Error("health-write", ex); }
+                        return;
+                    }
+                }
+                else
+                {
+                    goneRounds = 0;
+                }
 
                 string cn1 = await TcpProbeAsync("223.5.5.5", 6000).ConfigureAwait(false);
                 string cn2 = await TcpProbeAsync("119.29.29.29", 6000).ConfigureAwait(false);
@@ -335,12 +406,13 @@ namespace ClashUWP.Backend
                 string overseas = await TcpProbeAsync("8.8.8.8", 6000).ConfigureAwait(false); // 仅参考
 
                 // ★ 重拨检测（占网保险丝，取代原来的 240 s 计时器）：
-                //   武装之后出现的 connect-begin 减掉我们自己那一次，剩下的都是平台自发的。
+                //   武装之后出现的 connect-begin 减掉我们自己那一次（认领模式没拨过，
+                //   一次都不减 —— 见 <see cref="AdoptArm"/> 注释②），剩下的都是平台自发的。
                 //   允许 1 次是刻意留的自愈空间：实测 828 后平台立刻重拨，第二段会话
                 //   反而稳定（run 29-B/29-C 各活到哨兵上限），一刀切会让用户白掉线；
                 //   再多一次就说明进入了"97 s 一拆一拨"的死循环，立刻拆干净。
                 int connects = await CountRecentConnectsAsync(armedAt).ConfigureAwait(false);
-                int unmanaged = connects - 1;
+                int unmanaged = connects - ownDials;
 
                 bool roundOk = cn1 == "OK" || cn2 == "OK";
                 failures = roundOk ? 0 : failures + 1;

@@ -235,7 +235,17 @@ namespace ClashUWP.Backend
         // ── 切换 / 更新 ───────────────────────────────────────────────────
 
         /// <summary>
-        /// 把某份 profile 设为生效 = 复制到 <c>config.yaml</c>。
+        /// 把某份 profile 设为生效 = 复制到 <c>config.yaml</c>，并把隧道换到它上面。
+        ///
+        /// ★★【1.0.109 · 用户指令】整条流程按<b>「先断开 → 后修改 → 再重连」</b>走，顺序写在
+        ///   <see cref="VpnSession.SwitchSubscriptionAsync"/> 里（本类只交出"修改"那一段）：
+        ///   ① 先拆掉当前会话（只拆会话、不删条目）；
+        ///   ② 台上没有会话了，才写正文/记生效/热重载，才往 profile 存储里 Add/Update
+        ///      —— 这正是 Docs/45 §八.3 那条成因形状（活动会话期间写存储）与 Docs/52 那套
+        ///      "写入被欠到边沿"的根治；官方文档侧同一口径（Intune/VPNv2 已知问题、
+        ///      Windows 升级指引"先断开 VPN"、KB2826164），细则见 Docs/45 §九.2；
+        ///   ③ 只有①真的拆掉过会话才重拨目标订阅的 profile（空壳不拨号的口径不变）。
+        ///
         /// ★ 不重启内核：内核是常驻的，改了文件它不知道（这正是 1.0.49 加 <c>reload</c>
         ///   命令的原因）。所以这里只负责"文件就位"，由调用方决定要不要 reload。
         /// </summary>
@@ -248,37 +258,63 @@ namespace ClashUWP.Backend
             try
             {
                 string text = await ReadAllTextAsync(src);
-                await WriteAllTextAsync(ActiveName, text);
-                await SetActiveAsync(id);
                 var info = SubscriptionView.Parse(text, text.Length, DateTime.Now);
-                // ★ UX 对齐 Verge：切到即原地热重载（连接中），未连接时保证文件就位、下次连接生效。
-                var reload = await ReloadActiveConfigAsync();
-                // ★【1.0.62】该订阅的 profile 已在 fetch 时注册；这里确保显示名与生效态一致（幂等）。
                 var (_, url) = await GetActiveAsync();
                 var list = await ListAsync();
                 var self = list.FirstOrDefault(x => x.Id == id);
                 string shown = self != null ? DisplayName(self, list) : FallbackName(id, url);
-                string profName = self != null ? SystemProfileName(self, list) : FallbackName(id, url);
-                var reg = await VpnProfileSetup.EnsureSubscriptionProfileAsync(id, profName);
 
-                // ★★【1.0.86 · Docs/36 A 案】热重载不等于换了隧道：账本改了、
-                //   会话仍属旧订阅的 profile 时，插件每次（重）拨号都会按旧 subId 覆写
-                //   config.kernel.yaml，把上面那次热重载吃掉（本机实测见 Docs/36 E6/E8）。
-                //   ⇒ 必须把隧道会话本身切过来。放在 reg 之后：profile 先就位才谈得上连它。
-                //   无会话/已在该条上时它自己返回 Ok，属正常路径，不是"做了什么"。
-                (bool switched, string switchMsg) = await VpnSession.SwitchSubscriptionAsync(id);
+                // ★【1.0.109】这一段就是三段式里的"后修改"，由 VpnSession 在拆完会话之后调用。
+                // ★ UX 对齐 Verge：切到即原地热重载，未连接时保证文件就位、下次连接生效。
+                //   ★ 热重载失败<b>不拦重连</b>：会话已经在①里拆掉了，这时候停手就是把用户
+                //   留在断的上面；它的成败照样并进总成败（下面 <c>ok = reloadOk && switched</c>），
+                //   不许报"已切到"假成功 —— 口径同 Docs/35 M8/Q12。
+                // ★【1.0.95 · Docs/50】修改推的是<b>整份清单</b>，不再只推当前这一条
+                //   （面板条目名由 <see cref="SystemProfileName"/> 按整份清单算，单推一条追不上
+                //   另一条的期望名；1.0.62~1.0.94 的形状，用户报的"换了订阅条目没跟着动"就是它）。
+                //   ★【1.0.109 · 对 Docs/50 §五 判据 #2 的订正】那条把"切换那一轮必然 <c>跳过 ≥ 1</c>、
+                //   由紧随的 <c>边沿对账</c> 补上"写成了预期形状。三段式之后切到<b>另一条</b>订阅不再
+                //   有这一支 —— ① 拆完会话才进这里，那一刻没有会话，闸①不拦，<c>跳过 0</c> 当场落地。
+                //   仍然成立的是会话<b>本来就切在目标上</b>（<c>AlreadyTarget</c>，按口径不拆）那一支：
+                //   别的条目要改照旧被闸①欠给边沿。细则 Docs/55 §六.3。
+                bool reloadOk = true;
+                (bool switched, string switchMsg, bool redialed) =
+                    await VpnSession.SwitchSubscriptionAsync(id, async () =>
+                {
+                    await WriteAllTextAsync(ActiveName, text);
+                    await SetActiveAsync(id);
+                    var reload = await ReloadActiveConfigAsync();
+                    reloadOk = reload.Ok;
+                    string reg = await SyncSystemProfilesAsync("切换");
+                    return (true,
+                        $"{info.NodeCount} 节点 / {info.RuleCount} 规则　{reload.Message}　{reg}");
+                });
 
                 // ★【1.0.81 · M8/Q12】reload 失败则整体标失败，不报"已切"假成功。
-                // ★【1.0.86】同理，隧道没落到 Connected 也不能说"已切到"——
+                // ★【1.0.86】同理，隧道没落到"平台受理了新连接/无需切换"也不能说"已切到"——
                 //   这条正是 Docs/36 那个"前台显示新订阅、隧道还在旧订阅"的谎报源头。
-                bool ok = reload.Ok && switched;
+                // ★★【1.0.113 · Docs/58 · 用户指令"热重载也没成功，断开系统侧连接再重建"】
+                //   上面那句"reload 失败=整体失败"的前提已经不成立：1.0.81 那会儿<b>热重载是唯一</b>
+                //   让新订阅原地生效的手段；三段式（①拆会话→③重拨）之后，③拨出去的那条 profile
+                //   自带 <c>subId</c>，插件在 <c>Connect</c> 里直接按 <c>subscriptions/{id}.yaml</c>
+                //   当配置源，配置变了它自己还会 PUT /configs（2026-10-24 18:36:46 一手：
+                //   「配置已变 → 尝试热重载」+「PUT /configs?force=true -> 204」）。
+                //   ⇒ <c>redialed</c> 为真时隧道就是新订阅，②那次前台 reload 降格成
+                //   补充信息，不许再单独把整次切换判成"未完成"（它失败时用户手上明明是通的）。
+                //   ★ 没有重拨的那几支（NoSession / AlreadyTarget / SessionStateUnknown）照旧从严：
+                //   那一刻"配置就位"全靠这次 reload，失败就是没生效。
+                bool ok = switched && (redialed || reloadOk);
                 string head = ok ? $"已切到「{shown}」" : $"切到「{shown}」未完成";
-                return new Result(ok,
-                    $"{head}：{info.NodeCount} 节点 / {info.RuleCount} 规则　{reload.Message}　{reg}　隧道={switchMsg}", id);
+                if (ok && redialed && !reloadOk)
+                    head += "（隧道已按新订阅重建；原地热重载那一步没成，仅附在下文，不影响本次结果）";
+                return new Result(ok, $"{head}：{switchMsg}", id);
             }
             catch (Exception ex)
             {
-                return new Result(false, $"切换失败: {ex.GetType().Name}: {ex.Message}");
+                // ★【1.0.109】三段式里①已经拆掉了会话、异常却从②③里冒出去时，用户手上是
+                //   "没隧道"的状态 —— 回话必须把这条路指出来，不能只留一句异常。
+                return new Result(false,
+                    $"切换失败: {ex.GetType().Name}: {ex.Message}（隧道若已断开，点「连接 VPN」重拨）");
             }
         }
 
@@ -321,8 +357,29 @@ namespace ClashUWP.Backend
         ///      现在按本地清单 prune（<see cref="VpnProfileSetup.PruneOrphanProfilesAsync"/>，
         ///      只碰带 subId 且已断开的，删除照旧过那道闸；清单为空时不 prune）。
         /// 【不碰隧道】只写/删系统 profile 列表，不连接、不改 config.yaml。
+        ///
+        /// ★★【1.0.95 · Docs/50】这个方法从此有<b>三个触发点</b>，用 <paramref name="trigger"/>
+        ///   分辨，日志汇总行前缀跟着变（<c>启动对账：</c> / <c>切换对账：</c> / <c>边沿对账：</c>）：
+        ///     · <c>"启动"</c> —— 应用挂载时那一轮（1.0.62 起就有，默认值，判据行逐字不变）；
+        ///     · <c>"切换"</c> —— <see cref="ActivateAsync"/> 里替代"只推当前这一条"的那一轮；
+        ///     · <c>"边沿"</c> —— 前台 3 秒轮询发现会话换了（含落到断开）时补的那一轮。
+        ///   【为什么边沿那一轮 <paramref name="allowPrune"/>=false】prune 的删除判据要先读
+        ///   <c>ConnectionStatus</c>，而 Docs/45 那条读数中毒（0x80070006）最容易在会话边沿
+        ///   这一刻成立。<b>1.0.96 · Docs/51 已把"读不出来=没在连"这个放行修掉了</b>
+        ///   （<c>GracefulTeardown.EnsureTornDownAsync</c> 与 <c>WaitSessionDownAsync</c> 两处：
+        ///   读数异常一律拒绝删除），所以这里不 prune 不再是安全需要，只是<b>分工</b>：
+        ///   边沿那一轮的职责是"把被跳过的条目补上"，删条目仍只留给挂载那一轮，
+        ///   免得刚结束的会话与删除抢同一个 RPC。
+        ///   ★★【1.0.111 · Docs/56】这条<b>设计</b>从 1.0.95 起一直<b>没生效</b>：调用点
+        ///   （<c>MainComponent</c> 的边沿那轮）写成 <c>SyncSystemProfilesAsync("边沿")</c>，
+        ///   而默认值是 <c>true</c> ⇒ 1.0.95~1.0.110 的每条「边沿对账」都在跑 prune，
+        ///   Docs/50 §五 第 3 条那条装机判据从未成立（实测两行见 Docs/56 §二）。
+        ///   参数本身、汇总行文案、其余三个触发点都是对的，缺的只是调用点那一句 —— 已补。
+        ///   汇总行的"不 prune"文案改成按 <paramref name="trigger"/> 插值：边沿那句<b>逐字不变</b>
+        ///   （装机判据按字面匹配），补账那一轮从前会冒充边沿，现在如实写自己的触发点。
         /// </summary>
-        internal static async Task<string> SyncSystemProfilesAsync()
+        internal static async Task<string> SyncSystemProfilesAsync(
+            string trigger = "启动", bool allowPrune = true)
         {
             try
             {
@@ -355,12 +412,27 @@ namespace ClashUWP.Backend
                     }
                 }
                 // ③ 面板里"本地已经没有"的 profile 清掉（只碰已断开的，闸照过）
-                string prune = await VpnProfileSetup.PruneOrphanProfilesAsync(
-                    list.Select(p => p.Id).ToList());
+                //   ★【1.0.95 · Docs/50】边沿那一轮不 prune，理由见方法头注释。
+                string prune = allowPrune
+                    ? await VpnProfileSetup.PruneOrphanProfilesAsync(
+                        list.Select(p => p.Id).ToList())
+                    : $"本轮不 prune（{trigger}只补条目，删除留给挂载那一轮）";
 
-                string msg = $"启动对账：订阅 {list.Count} 份 + 基础 profile 1 条，" +
+                string msg = $"{trigger}对账：订阅 {list.Count} 份 + 基础 profile 1 条，" +
                              $"新增 {added} / 更新 {updated} / 已就位 {present} / " +
                              $"跳过 {skipped} / 失败 {failed}；{prune}";
+                // ★【1.0.104】台账里"本地清单已经没有这条订阅"的欠账永远不会有人再补
+                //   （Ensure 只为清单里的 id 跑，而 Ensure 是唯一销账的地方）⇒ 留着
+                //   = Dirty 一直真 = 前台每 15 秒白扫一轮。清单为空时它自己不动盘。
+                string owedPrune = await ReconcileOwed.PruneStaleAsync(
+                    list.Select(p => p.Id).Append(ReconcileOwed.BaseKey).ToList());
+                if (owedPrune.Length > 0) msg += $"；{owedPrune}";
+                // ★【1.0.101 · Docs/52】被写入闸欠下来的条目必须在这一行里点名 ——
+                //   "跳过 2" 只说明这一轮没写，不说明<b>还欠着谁、为什么欠</b>。
+                //   台账为空时不碰盘（SnapshotAsync 读不到文件回空串）。
+                string owed = await ReconcileOwed.SnapshotAsync();
+                ReconcileOwed.SetDirty(owed.Length > 0);
+                if (owed.Length > 0) msg += $"；仍欠：{owed}";
                 RollingLog.Info("profile-sub-sync", msg);
                 return msg;
             }
@@ -368,7 +440,7 @@ namespace ClashUWP.Backend
             {
                 // 对账失败不该影响启动（面板少几条，fetch/activate 时还会再补）。
                 RollingLog.Warn("profile-sub-sync", $"失败: {ex.GetType().Name}: {ex.Message}");
-                return $"启动对账失败: {ex.GetType().Name}: {ex.Message}";
+                return $"{trigger}对账失败: {ex.GetType().Name}: {ex.Message}";
             }
         }
 
@@ -382,8 +454,10 @@ namespace ClashUWP.Backend
         ///
         /// 【★ 刻意不做的事】
         ///   · 不热重载：内核跑的就是这份配置，再 PUT 一遍是无谓动作；
-        ///   · 不调 EnsureSubscriptionProfileAsync：profile 此刻正连着，
-        ///     对活动连接对象再 Add 一次没有实测背书，绝不在线上做。
+        ///   · 不调 <see cref="VpnProfileSetup.EnsureSubscriptionProfileResultAsync"/>：
+        ///     profile 此刻正连着，对活动连接对象再 Add 一次没有实测背书，绝不在线上做。
+        ///     ★【1.0.95 · Docs/50】这条改名/补齐的活儿由调用方（前台轮询）在<b>会话边沿</b>
+        ///       另推一轮 <see cref="SyncSystemProfilesAsync"/> 完成，不掺在回填里。
         /// </summary>
         internal static async Task<Result> AdoptAsync(string id)
         {
@@ -420,14 +494,14 @@ namespace ClashUWP.Backend
         /// 让新订阅<b>原地生效、不必断重连</b>。
         /// ★ 内核未连接时只保证文件就位（下次 Connect 自动加载），返回明确的"未连接"提示，
         ///   不会把"没热重载"伪装成失败。
-        /// ★ 改写逻辑全部在 Vpn 组件内（<see cref="ClashUWP.Vpn.SubscriptionReload"/>），
-        ///   本方法只负责"拿路径 → PUT /configs"，不重复实现 transform。
+        /// ★ 改写逻辑的单一实现在 <c>Vpn\KernelConfig</c>（无状态纯函数，插件侧同一个入口），
+        ///   本类只经 <see cref="SubscriptionReload"/> 拿路径 → PUT /configs，不重复实现 transform。
         /// </summary>
         internal static async Task<Result> ReloadActiveConfigAsync()
         {
             try
             {
-                string? path = ClashUWP.Vpn.SubscriptionReload.RegenerateEffectiveFile();
+                string? path = SubscriptionReload.RegenerateEffectiveFile();
                 if (string.IsNullOrEmpty(path))
                     // ★【1.0.75】null 有两种成因，都得说给用户听：
                     //   组件侧"空壳不热重载"（改写结果零出站）也返回 null，

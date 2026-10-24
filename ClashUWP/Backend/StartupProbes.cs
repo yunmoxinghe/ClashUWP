@@ -76,9 +76,9 @@ namespace ClashUWP.Backend
                 // ★【1.0.88 · Docs/38 官方第④条】探测也是拨号，官方按<b>至多一条活动会话</b>建模
                 //   （sample L80 "There should be zero or one of these at all times"）⇒
                 //   已经有隧道在飞时不再连这条 probe（它会占用插件唯一那份 activeChannel）。
-                //   判据共用前台那一份 <see cref="ClashUWP.Vpn.VpnProfileSetup.FindActiveSessionAsync"/>，
+                //   判据共用前台那一份 <see cref="VpnProfileSetup.FindActiveSessionAsync"/>，
                 //   不在这里另写一遍"什么叫有会话"。结果照旧落盘，跳过这件事本身要看得见。
-                var live = await ClashUWP.Vpn.VpnProfileSetup.FindActiveSessionAsync();
+                var live = await VpnProfileSetup.FindActiveSessionAsync();
                 if (live != null)
                 {
                     sb.AppendLine($"跳过=已有活动会话 [{live.ProfileName}]（官方建模至多一条，探测不得并行拨号）");

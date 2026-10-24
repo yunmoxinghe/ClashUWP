@@ -15,6 +15,9 @@
   <ItemGroup>
     <Compile Include="..\..\ClashUWP\Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
     <Compile Include="..\..\ClashUWP\Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
+    <!-- ★ 1.0.93 把 settings.txt 的行解析收成共享层 SettingsParse 之后，本 csproj 漏了这条链接
+         （YamlShapeTest 同期补了），于是 LocalSettings.cs 里的 CS0103 让这个夹具编译不过。 -->
+    <Compile Include="..\..\ClashUWP\Vpn\SettingsParse.cs" Link="SettingsParse.cs" />
     <Compile Include="..\..\ClashUWP\Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
   </ItemGroup>
 </Project>

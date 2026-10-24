@@ -23,6 +23,10 @@ namespace ClashUWP.Backend.Mihomo
     ///     而不是显示"未测" —— CMFA 的判据是 <c>if (proxy.delay in 0..Short.MAX_VALUE)</c>
     ///     才画那颗延迟胶囊，没测过就是没有；把"没有"写成两个字，在一整屏
     ///     <c>lazy: true</c> 的订阅里只会变成噪音（<c>select</c> 组首连必然全员未测）。
+    ///   ★【1.0.93】<c>0</c> 是<b>本轮不通</b>这一档，不是"0 毫秒"：官方测速失败时往 history
+    ///     写的就是 <c>Delay=0</c>（<c>adapter/adapter.go:170-177</c>、<c>:190</c> 的 defer），
+    ///     UI 据此把它渲染成"不通"。这条<b>只引官方源码</b>，不引安卓 —— 本机没有 CMFA 源码
+    ///     可查它那颗胶囊怎么画 0，见 Docs/49。
     ///     文本通道（debug <c>groups</c>）仍写 <c>delay=-</c>，那里要的是可复盘的明确性。
     ///   · 内置策略名（DIRECT/REJECT/GLOBAL/PASS…）不是组，不列；
     ///   · <b>成员要带分类</b>（组 / 内置策略 / 真节点），见 <see cref="Member"/>。
@@ -83,7 +87,8 @@ namespace ClashUWP.Backend.Mihomo
         }
 
         /// <summary>
-        /// 组里的一个成员。<see cref="DelayMs"/> 为 -1 表示<b>从没测过</b>。
+        /// 组里的一个成员。<see cref="DelayMs"/> 为 -1 表示<b>从没测过</b>，
+        /// 为 0 表示<b>本轮不通</b>（官方失败时写 Delay=0，见文件顶部那条口径）。
         ///
         /// 【★ 为什么成员要带分类】安卓的分类是内核在 Go 里做好的
         ///   （<c>convertProxies</c>：能转成 <c>outboundgroup.ProxyGroup</c> 的就是组），

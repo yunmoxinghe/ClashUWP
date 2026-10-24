@@ -74,7 +74,7 @@ namespace ClashUWP.Vpn
         ///
         /// ★【1.0.35】不再有"只传文本"的重载：应用分流名单是这次改写的<b>输入之一</b>，
         ///   漏传就等于"静默不注入"。<see cref="ClashVpnPlugin"/> 步 4.1 与
-        ///   <see cref="SubscriptionReload"/> 两条路必须都走这一个入口、
+        ///   <see cref="ClashUWP.Backend.SubscriptionReload"/> 两条路必须都走这一个入口、
         ///   产出<b>逐字相同</b>的那份 <c>config.kernel.yaml</c>
         ///   （Docs/12 §9.4 的"单源"约定：少一条注入，热重载就会把名单覆盖回订阅原文）。
         /// </summary>

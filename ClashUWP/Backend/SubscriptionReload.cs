@@ -2,7 +2,9 @@ using System;
 using System.IO;
 using Windows.Storage;
 
-namespace ClashUWP.Vpn
+using ClashUWP.Vpn;
+
+namespace ClashUWP.Backend
 {
     /// <summary>
     /// 【UX 对齐 Verge】前台切/更新订阅后调用：把当前生效的 <c>config.yaml</c> 改写成内核实际读取的

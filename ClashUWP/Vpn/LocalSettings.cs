@@ -557,38 +557,31 @@ namespace ClashUWP.Vpn
                 StorageFile file = ApplicationData.Current.LocalFolder
                     .GetFileAsync("settings.txt").AsTask().GetAwaiter().GetResult();
                 string text = FileIO.ReadTextAsync(file).AsTask().GetAwaiter().GetResult();
-                var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (string raw in text.Split('\n'))
-                {
-                    string line = raw.Trim();
-                    if (line.Length == 0 || line.StartsWith("#"))
-                        continue;
-                    int idx = line.IndexOf('=');
-                    if (idx <= 0)
-                        continue;
-                    map[line.Substring(0, idx).Trim()] = line.Substring(idx + 1).Trim();
-                }
+                // ★【1.0.93】行格式解析收成一份（<see cref="SettingsParse"/>）：
+                //   以前前台 Backend\AppSettings 里另有一份逐字相同的循环，
+                //   靠注释维系口径 ⇒ 注释不能编译，分叉不会报警。
+                var map = SettingsParse.Parse(text);
 
-                DnsIntoTunnel = ReadBool(map, "dnsInTunnel", DnsIntoTunnel);
-                ResidentBridge = ReadBool(map, "residentBridge", ResidentBridge);
-                HotReload = ReadBool(map, "hotReload", HotReload);
-                NodeExclusions = ReadBool(map, "nodeExclusions", NodeExclusions);
-                SelfSplitTunnel = ReadInt(map, "selfSplitTunnel", SelfSplitTunnel);
-                OuterTarget = ReadString(map, "outerTarget", OuterTarget);
-                OuterPort = ReadString(map, "outerPort", OuterPort);
-                IncludeMode = ReadString(map, "includeMode", IncludeMode);
-                EncapReturn = ReadInt(map, "encapReturn", EncapReturn, 0, 5);
-                ReceiveBatch = ReadInt(map, "receiveBatch", ReceiveBatch, 0, 64);
-                SessionWatchdog = ReadBool(map, "sessionWatchdog", SessionWatchdog);
-                StatusToast = ReadBool(map, "statusToast", StatusToast);
-                FakeIp = ReadBool(map, "fakeIp", FakeIp);
-                FailFast = ReadBool(map, "failFast", FailFast);
-                SessionReset = ReadInt(map, "sessionReset", SessionReset, 0, 2);
-                NetFollow = ReadInt(map, "netFollow", NetFollow, 0, 2);
-                Ipv6 = ReadInt(map, "ipv6", Ipv6, 0, 2);
-                Ipv6FakeRange = ReadString(map, "ipv6FakeRange", Ipv6FakeRange);
-                Ipv6ClientAddress = ReadString(map, "ipv6ClientAddress", Ipv6ClientAddress);
-                DnsConfigEnabled = ReadBool(map, "dnsConfig", DnsConfigEnabled);
+                DnsIntoTunnel = SettingsParse.Bool(map, "dnsInTunnel", DnsIntoTunnel);
+                ResidentBridge = SettingsParse.Bool(map, "residentBridge", ResidentBridge);
+                HotReload = SettingsParse.Bool(map, "hotReload", HotReload);
+                NodeExclusions = SettingsParse.Bool(map, "nodeExclusions", NodeExclusions);
+                SelfSplitTunnel = SettingsParse.Int(map, "selfSplitTunnel", SelfSplitTunnel);
+                OuterTarget = SettingsParse.String(map, "outerTarget", OuterTarget);
+                OuterPort = SettingsParse.String(map, "outerPort", OuterPort);
+                IncludeMode = SettingsParse.String(map, "includeMode", IncludeMode);
+                EncapReturn = SettingsParse.Int(map, "encapReturn", EncapReturn, 0, 5);
+                ReceiveBatch = SettingsParse.Int(map, "receiveBatch", ReceiveBatch, 0, 64);
+                SessionWatchdog = SettingsParse.Bool(map, "sessionWatchdog", SessionWatchdog);
+                StatusToast = SettingsParse.Bool(map, "statusToast", StatusToast);
+                FakeIp = SettingsParse.Bool(map, "fakeIp", FakeIp);
+                FailFast = SettingsParse.Bool(map, "failFast", FailFast);
+                SessionReset = SettingsParse.Int(map, "sessionReset", SessionReset, 0, 2);
+                NetFollow = SettingsParse.Int(map, "netFollow", NetFollow, 0, 2);
+                Ipv6 = SettingsParse.Int(map, "ipv6", Ipv6, 0, 2);
+                Ipv6FakeRange = SettingsParse.String(map, "ipv6FakeRange", Ipv6FakeRange);
+                Ipv6ClientAddress = SettingsParse.String(map, "ipv6ClientAddress", Ipv6ClientAddress);
+                DnsConfigEnabled = SettingsParse.Bool(map, "dnsConfig", DnsConfigEnabled);
                 Source = "settings.txt";
             }
             catch
@@ -677,52 +670,9 @@ namespace ClashUWP.Vpn
             return true;
         }
 
-        /// <summary>读字符串开关（空值一律回落 fallback —— 空 HostName 会让 ConnectAsync 抛）。</summary>
-        private static string ReadString(Dictionary<string, string> map, string key, string fallback)
-        {
-            if (!map.TryGetValue(key, out string? v) || v.Length == 0)
-                return fallback;
-            return v;
-        }
-
-        /// <summary>读整数开关（越界/非数字一律回落 fallback）。</summary>
-        /// <summary>读整数开关。<b>区间由调用方给</b>，越界/非数字回落 fallback。</summary>
-        ///
-        /// ★ 这里曾经是数据面实验的一个<b>真缺陷</b>（Docs/09 C5）：老实现硬编码
-        ///   <c>parsed &gt;= 0 &amp;&amp; parsed &lt;= 2</c>，而 <c>encapReturn</c> 的档 3/4/5
-        ///   都 &gt; 2 —— 于是 <c>settings.txt</c> 写 <c>encapReturn=3</c> 会被静默回落成 2，
-        ///   实验臂<b>看着切换了、其实没切</b>。run 36 之所以能读到档 3 的数，是因为那时
-        ///   上界还没生效/版本不同，事后没法保证每次单变量都真的单变量。
-        ///   ⇒ 现在每个开关自带合法区间，非法值仍然回落（保护产品默认路径），
-        ///     但<b>合法区间按开关自己的取值表给</b>。
-        /// </summary>
-        private static int ReadInt(Dictionary<string, string> map, string key, int fallback)
-            => ReadInt(map, key, fallback, 0, 2);
-
-        private static int ReadInt(Dictionary<string, string> map, string key, int fallback,
-                                   int minInclusive, int maxInclusive)
-        {
-            if (!map.TryGetValue(key, out string? v))
-                return fallback;
-            return int.TryParse(v, out int parsed) &&
-                   parsed >= minInclusive && parsed <= maxInclusive
-                ? parsed
-                : fallback;
-        }
-
-        private static bool ReadBool(Dictionary<string, string> map, string key, bool fallback)
-        {
-            if (!map.TryGetValue(key, out string? v))
-                return fallback;
-            if (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase) ||
-                v.Equals("on", StringComparison.OrdinalIgnoreCase) ||
-                v.Equals("yes", StringComparison.OrdinalIgnoreCase))
-                return true;
-            if (v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase) ||
-                v.Equals("off", StringComparison.OrdinalIgnoreCase) ||
-                v.Equals("no", StringComparison.OrdinalIgnoreCase))
-                return false;
-            return fallback;
-        }
+        // 【1.0.93】这里原有 ReadString / ReadInt / ReadBool 三个私有解析器，
+        //   与前台 Backend\AppSettings 里那份逐字相同、靠注释维系一致。
+        //   现在单一实现搬到 <see cref="SettingsParse"/>（含 Docs/09 C5 那条区间教训），
+        //   本类只负责"同步等异步把文件读出来 + 把值落到自己的静态缓存"。
     }
 }

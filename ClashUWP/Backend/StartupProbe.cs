@@ -63,7 +63,12 @@ namespace ClashUWP.Backend
                     if (p is VpnPlugInProfile pp)
                     {
                         // ConnectionStatus 只在具体类型上，IVpnProfile 接口没有。
-                        sb.AppendLine($"    ConnectionStatus={pp.ConnectionStatus}");
+                        // ★【1.0.97 · Docs/51】这里原来裸读 <c>pp.ConnectionStatus</c>：与
+                        //   ProfileDump 同一个病 —— 一条读数中毒就抛穿 foreach，<b>probe.txt
+                        //   停在中毒那条上、后面的条目一行不剩</b>，app.log 里只留一行
+                        //   <c>probe 启动探针失败 | COMException: 句柄无效</c>，看着像"探针没跑"。
+                        //   取证面自己先崩等于销毁现场，降级归一到 <see cref="VpnProfileSetup.StatusOf"/>。
+                        sb.AppendLine($"    ConnectionStatus={VpnProfileSetup.StatusOf(pp)}");
                         sb.AppendLine($"    PluginPackageFamilyName={pp.VpnPluginPackageFamilyName}");
                         sb.AppendLine($"    RequireVpnClientAppUI={pp.RequireVpnClientAppUI}");
                         sb.AppendLine($"    CustomConfiguration={(pp.CustomConfiguration?.Length ?? 0)} chars");

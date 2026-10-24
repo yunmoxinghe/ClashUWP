@@ -229,11 +229,21 @@ namespace ClashUWP.Frontend
                     //     "账本与隧道长期分叉"不再是正常态；而边沿触发为此付出的代价是致命的：
                     //     它只看 connectedSub 变没变，分叉时那个值一次都没变 ⇒
                     //     唯一能发现错位的观察者失明（Docs/36 E10：整份 app.log 零条 adopt）。
-                    //   【1.0.72 那条撤销坑怎么防】改为"切换进行中让路"（VpnSession.SwitchInProgress），
+                    //   【1.0.72 那条撤销坑怎么防】改为"切换进行中让路"（ProfileGate.SwitchInProgress），
                     //     而不是"长期不比对"。首轮也不再只记基线不判定 —— 启动时"生效 B / 隧道 A"
                     //     现在就是要按隧道（真相）跟账的形状，不再当残留放过。
                     string lastConnectedSub = "";
                     bool firstPoll = true;
+                    // ★【1.0.95 · Docs/50】"欠一次对账"的旗子：会话边沿（连→断、A→B）置真，
+                    //   切换让路期间保持真，切换一结束立刻补一轮 <c>边沿对账</c> 再清零。
+                    //   它是<b>轮询循环的局部量</b>，不跨进程也不跨调用路径共享（Docs/48 §三 那条
+                    //   "只有跨进程契约才允许共享可变态"的规矩与此无关 —— 这里就一个前台循环在读）。
+                    bool pendingRealign = false;
+                    // ★【1.0.101 · Docs/52】补扫节拍计数：台账脏着时每 ~15 秒补一轮对账。
+                    //   为什么边沿那一次不够（见下面使用处的注释）。
+                    int owedTick = 0;
+                    // ★【1.0.104】上一次补扫<b>结束时</b>的台账快照，用来认出"补不动"（见使用处）。
+                    string owedAfterLastSweep = "";
                     // ★【1.0.80】轮询异常要出声，但<b>只在"错误类型变了"时出声</b>：
                     //   这里是 3 秒一次的循环，每轮都记就成了刷屏（滚动日志的行格式是
                     //   看门狗的机器契约，热路径禁记）。旧写法是裸 <c>catch { }</c>，
@@ -255,8 +265,36 @@ namespace ClashUWP.Frontend
                                 RollingLog.Info("selection-replay", replayMsg);
                             // ★ 同时刷新 VPN 连接状态：系统快速设置发起的连接绕过了我们的
                             //   按钮，前台没有回调，只能靠轮询反映真实 ConnectionStatus。
-                            string status = await VpnSession.StatusAsync();
+                            // ★【1.0.96 · Docs/51】这一句单独兜一层：状态读数失败只许影响这一行
+                            //   （画成「状态读不出」），既不许把异常文本留在状态槽里，
+                            //   也不许把整轮轮询（回填 + 边沿对账）一起带走。
+                            string status;
+                            try
+                            {
+                                status = await ProfileGate.StatusAsync();
+                            }
+                            catch (Exception exStatus)
+                            {
+                                status = ProfileGate.StatusUnreadable;
+                                string kindStatus =
+                                    $"状态读数失败 {exStatus.GetType().Name}: {exStatus.Message}";
+                                if (kindStatus != lastPollError)
+                                {
+                                    RollingLog.Warn("ui-poll",
+                                        $"本轮状态读不出（同类不再重复记）：{kindStatus}");
+                                    lastPollError = kindStatus;
+                                }
+                            }
                             _setVpnStatus(status);
+
+                            // ★【1.0.107 · Docs/54】凡读到活会话而前台还没有哨兵 ⇒ 认领
+                            //   （<see cref="VpnSession.AdoptLiveSessionIfUnprotected"/>）。
+                            //   覆盖三种"会话不是本前台发起"的形状：快速面板点连接、
+                            //   平台自发重拨、臂 C 无头长期在线之后重开 app。
+                            //   这一层只负责"别让保护缺位"；哨兵自己会再前置确认，
+                            //   判据不可信不动手的闸在 HealthMonitor 里原样保留。
+                            if (status == "Connected")
+                                ProfileGate.AdoptLiveSession();
 
                             // ★★【1.0.86 · Docs/36 B 案】回填改成<b>电平触发</b>。
                             //   【为什么边沿不够】边沿只看"connectedSub 变没变"，而 Docs/36 那次
@@ -269,11 +307,17 @@ namespace ClashUWP.Frontend
                             //   【为什么要让路给切换】A 案的切换有几秒窗口：账本已改成新订阅、
                             //   旧会话还没断干净，这一刻闯进来就会把用户刚点的切换撤销
                             //   （= 1.0.72 那条坑换个方向复发）。切换进行中一律不动账本。
-                            string connectedSub = await VpnSession.ConnectedSubAsync();
+                            string connectedSub = await ProfileGate.ConnectedSubAsync();
                             _setConnectedSub(connectedSub);
 
                             // 并发观测仍按边沿：只在读数变化时查一次，不每 3 秒查一遍。
                             bool changed = connectedSub != lastConnectedSub;
+                            // ★【1.0.95 · Docs/50】会话边沿 ⇒ 欠一次对账（真正推的位置在下面）。
+                            //   【为什么在算完 changed 就当场合上，不在下面补】firstPoll 在
+                            //   <c>if (firstPoll)</c> 分支里会被就地置 false，等走到推送那段
+                            //   已经分不清"本轮是不是首轮"了 ⇒ 首轮会多推一遍重复的边沿对账。
+                            if (changed && !firstPoll)
+                                pendingRealign = true;
                             if (firstPoll)
                             {
                                 firstPoll = false;
@@ -286,7 +330,7 @@ namespace ClashUWP.Frontend
                             {
                                 // ★【快速面板改造】切换瞬间顺带看一眼有没有"两条同时 Connected"：
                                 //   平台对同插件并行没有实测背书，这里只记日志不拆会话。
-                                string parallel = await VpnSession.ParallelConnectedAsync();
+                                string parallel = await ProfileGate.ParallelConnectedAsync();
                                 if (parallel.Length > 0)
                                     RollingLog.Warn("profile-parallel",
                                         $"多条 profile 同时 Connected：{parallel}（并发行未实测，仅记录）");
@@ -296,12 +340,76 @@ namespace ClashUWP.Frontend
                             }
                             lastConnectedSub = connectedSub;
 
+                            // ★★【1.0.95 · Docs/50】"跳过（断开后再对账）"这句话的执行者在这儿。
+                            //   【为什么挂在会话边沿】Ensure/prune 对非 Disconnected 的条目一律跳过，
+                            //   而刚被换下/刚断开的那条恰好在这一刻回到 Disconnected —— 它唯一能被改的
+                            //   状态。1.0.62~1.0.94 全仓只有"应用挂载"一处会重跑对账 ⇒ 跳过一次就漂到
+                            //   下次重启应用，这就是"换了订阅、面板条目没跟着动"的成因。
+                            //   【为什么记 pendingRealign 而不是当场推】A 案的切换有几秒窗口，窗口里推
+                            //   等于跟切换抢同一条 profile（同下面 adopt 那条让路纪律）；但让路时<b>边沿
+                            //   不能丢</b> —— 丢了就再也没有"变化"可言（切换结束后 connectedSub 稳定在新值上），
+                            //   那条被跳过的 profile 就永远补不上。记一次"欠对账"，切换一结束立刻补，
+                            //   用户这一次动作内闭合。
+                            //   【首轮不算边沿】挂载那一轮 <see cref="SubscriptionManager.SyncSystemProfilesAsync"/>
+                            //   已经跑过（上面那个 UseEffect），首轮再推纯属重复 —— 合上边沿的地方在
+                            //   上面算完 changed 那里，不在这一行。
+                            //   【不 prune】1.0.96 · Docs/51 把"读不出=没在连 ⇒ 放行删除"修掉之后，
+                            //   这一条<b>不再是安全兜底，只是分工</b>（Docs/50 §二.2 第 3 条）：
+                            //   删条目只留给挂载那一轮，边沿这一轮只补条目，免得刚结束的会话
+                            //   与删除抢同一个 RPC。★【1.0.111 · Docs/56】这句从前是<b>空头话</b>：
+                            //   下面那行调用没带 <c>allowPrune: false</c>（默认值是 true），
+                            //   所以 1.0.95~1.0.110 每一条「边沿对账」汇总行结尾都是
+                            //   <c>prune 幽灵 profile：删 N / 留 M</c> 而不是 Docs/50 §五 第 3 条
+                            //   要求的「本轮不 prune（…）」—— 那条装机判据从未成立过（实测见 Docs/56 §二）。
+                            if (pendingRealign && !ProfileGate.SwitchInProgress)
+                            {
+                                pendingRealign = false;
+                                await ProfileGate.ReconcileAsync(
+                                    "边沿", allowPrune: false);
+                            }
+
+                            // ★★【1.0.101 · Docs/52】"欠对账"台账还脏着 ⇒ 光靠会话边沿那一次不够。
+                            //   【为什么不够】边沿那一轮跑在"connectedSub 刚变空"这一刻，
+                            //   而平台那条会话此刻常常还在 <c>Disconnecting</c>；写入闸
+                            //   （<c>VpnProfileSetup.ProveStoreWriteSafeAsync</c>）照旧判"不干净"，
+                            //   于是这一轮又把它欠回去 —— 之后 connectedSub 一直是空，再也没有边沿，
+                            //   那条 profile 就漂到下次挂载。这不是理论：Docs/38 实测过
+                            //   <c>DisconnectProfileAsync</c> 返回 Ok 之后会话还要一段时间才收干净。
+                            //   【所以】按 5 轮一次（≈15 s）补扫，直到台账空（<c>Dirty</c> 由对账轮
+                            //   用文件真值刷新）。判据"没会话"用 <c>connectedSub</c> 只是省事的粗筛，
+                            //   真正的闸在 Ensure 里面，粗筛错了最多是白扫一轮。
+                            //   【不刷屏】这一轮走 <c>profile-sub-sync</c> 汇总行，不额外记；
+                            //   <c>Dirty</c> 是进程内提示位，不为它读盘。
+                            //   【★ 1.0.104：补扫必须有"补不动"的出口】拦着一条欠账的不一定是会话，
+                            //   也可能是<b>这条条目自己读数中毒</b>（Docs/45：状态读不出 ⇒ 既不满足
+                            //   "断开后再对账"，也永远不会自己变干净）。那种情况下每 15 秒扫一轮
+                            //   = 零进展 + 每轮两条日志 + 反复撞 VpnManagementAgent 的 RPC。
+                            //   判据用"连续两轮补扫结束时台账快照逐字相同"来认它 —— 这个比对成立的前提
+                            //   是 <c>ReconcileOwed.MarkAsync</c> 从 1.0.104 起<b>判据没变就不写盘</b>
+                            //   （旧写法每轮盖一个新时间戳，快照永远在变，等于没有这个出口）。
+                            //   停扫只放下提示位，文件原样留着当证物；判据一变会重新置脏，
+                            //   会话边沿/切换/挂载那几轮也照扫，所以不会漏补。
+                            if (!pendingRealign && ProfileGate.OwedDirty &&
+                                ++owedTick >= 5 && !ProfileGate.SwitchInProgress)
+                            {
+                                owedTick = 0;
+                                await ProfileGate.ReconcileAsync("补账", allowPrune: false);
+                                string afterSweep = await ProfileGate.OwedSnapshotAsync();
+                                if (afterSweep.Length > 0 && afterSweep == owedAfterLastSweep)
+                                {
+                                    ProfileGate.OwedSetDirty(false);
+                                    RollingLog.Warn("profile-owed",
+                                        $"补账连续两轮判据逐字相同，暂停补扫（下次边沿/切换/挂载照旧会试）：{afterSweep}");
+                                }
+                                owedAfterLastSweep = afterSweep;
+                            }
+
                             if (connectedSub.Length > 0
-                                && !VpnSession.SwitchInProgress
+                                && !ProfileGate.SwitchInProgress
                                 && !string.Equals(connectedSub, _subActive.Id,
                                                   StringComparison.OrdinalIgnoreCase))
                             {
-                                var adopt = await SubscriptionManager.AdoptAsync(connectedSub);
+                                var adopt = await ProfileGate.AdoptSubscriptionAsync(connectedSub);
                                 if (adopt.Ok)
                                 {
                                     _setActionHint(adopt.Message);
@@ -372,14 +480,22 @@ namespace ClashUWP.Frontend
                     try
                     {
                         _setSubInfo(await SubscriptionView.LoadAsync());
-                        _setSubProfiles(await SubscriptionManager.ListAsync());
-                        _setSubActive(await SubscriptionManager.GetActiveAsync());
+                        _setSubProfiles(await ProfileGate.ListSubscriptionsAsync());
+                        _setSubActive(await ProfileGate.GetActiveSubscriptionAsync());
                         // ★【1.0.62】启动对账：老版本拉过的订阅还没有系统 profile，
                         //   不补注册的话快速设置面板里就是空的（详见 SyncSystemProfilesAsync）。
                         //   放在读列表之后：有列表才有得补；失败只进日志，不挡 UI。
                         // ★【1.0.72】汇总行由 SyncSystemProfilesAsync 自己记（1.0.62~1.0.71
                         //   里外各记一遍，同一毫秒出现两条一模一样的 profile-sub-sync）。
-                        await SubscriptionManager.SyncSystemProfilesAsync();
+                        // ★【1.0.101 · Docs/52】欠账要在界面上露一句：这一批起"会话期间不写存储"，
+                        //   开机时正连着 ⇒ 有条目建不出来。★ 人话在前、判据在后
+                        //   （1.0.100 的教训：提示行只有一两行宽，术语在前头会把出口挤没）。
+                        string sync0 = await ProfileGate.ReconcileAsync("启动");
+                        int owed0 = await ProfileGate.OwedCountAsync();
+                        if (owed0 > 0)
+                            _setActionHint($"有 {owed0} 条 VPN 条目还欠着（这个应用不在连接期间改系统 VPN 条目，" +
+                                           "断开后会自动补上）" +
+                                           $"　内部判据：{sync0}");
                     }
                     catch { /* 读不到就显示"不存在"，不让 UI 白屏 */ }
 
@@ -502,23 +618,39 @@ namespace ClashUWP.Frontend
             Page(
                 Section("VPN 控制",
                     TextBlock($"当前状态：{vpnStatus}"),
+                    // ★【1.0.96 · Docs/51 · Docs/45 修法第 3 条】读数不可信时界面上必须有一句<b>出口</b>。
+                    //   本轮实机的教训：状态标签停在一个说不清的文本上、按钮按下去没反应，
+                    //   而这条路只有 系统设置→VPN 走得通 —— 上一条撞同样墙的人不该自己找。
+                    vpnStatus == ProfileGate.StatusUnreadable
+                        ? TextBlock("读不到 VPN 状态（平台侧这条 profile 的句柄已失效）。" +
+                                    "本应用的连接与断开在这种情况下只会拒绝动作、不会瞎拨；" +
+                                    "请打开 系统设置→VPN（或 ncpa.cpl）看这条的真实状态，断开后再回来点连接")
+                            .Foreground(Theme.SecondaryText)
+                        : Empty(),
                     // ★★【1.0.86 · Docs/36 B 案兜底】隧道与账本对不上时，这句话必须画在界面上。
                     //   A 案负责让它一致，这一行负责在它不一致时<b>不骗人</b> ——
                     //   本项目纪律：静默或指错的失败一律算没修。
                     DivergenceLine(subActive, connectedSub),
                     actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty(),
                     HStack(8,
-                        Button("建/重建 profile", () => _ = RunAsync(_setActionHint, "重建中…", VpnSession.RecreateAsync)),
+                        Button("建/重建 profile", () => _ = RunAsync(_setActionHint, "重建中…", ProfileGate.RebuildAsync)),
                         // ★【快速面板改造】按钮从"连基础 profile"改为"连<b>当前生效订阅</b>的
                         //   系统 profile"——与用户在快速设置里点那条订阅是同一条平台路径，
                         //   连完快速面板亮的就是那条订阅（基础条目已隐藏，不再出现
                         //   "app 里点了连接、面板亮的是裸 ClashUWP"的错位）。
                         //   没有生效订阅就禁用（哥哥的拍板）：基础 profile 只留给诊断路径，
                         //   不再当用户的连接入口。
-                        Button("连接 VPN", () => _ = RunAsync(_setVpnStatus, "连接中…",
-                                () => VpnSession.ConnectAsync(subActive.Id)))
+                        // ★★【1.0.96 · Docs/51】这两个按钮的回话从 <c>_setVpnStatus</c> 改道
+                        //   <c>_setActionHint</c>。【为什么要改】<c>vpnStatus</c> 那个槽是
+                        //   <b>读数</b>专用的（3 秒轮询写它），而按钮返回的是<b>动作回话</b>——
+                        //   两件事塞进同一个槽，于是 0x80070006 那次「未发起=读状态异常:COMException:
+                        //   句柄无效。」被当成"当前状态"原样画在页面上，而且因为轮询那一轮
+                        //   正好也读不出（异常被 <c>catch</c> 兜住、槽不再更新），那句内部判据
+                        //   就永久钉在标题位置。分工从此写死：<b>状态槽只放读数，动作回话走提示行</b>。
+                        Button("连接 VPN", () => _ = RunAsync(_setActionHint, "连接中…",
+                                () => ProfileGate.ConnectAsync(subActive.Id)))
                             .IsEnabled(subActive.Id.Length > 0),
-                        Button("断开 VPN", () => _ = RunAsync(_setVpnStatus, "断开中…", VpnSession.DisconnectAsync))),
+                        Button("断开 VPN", () => _ = RunAsync(_setActionHint, "断开中…", ProfileGate.DisconnectAsync))),
                     subActive.Id.Length == 0
                         ? TextBlock("尚未设置生效订阅：先到「订阅」页拉取并启用一份，再连接")
                             .Foreground(Theme.SecondaryText)
@@ -746,7 +878,7 @@ namespace ClashUWP.Frontend
             if (subId.Length == 0) return "(无)";
             var p = _subProfiles.FirstOrDefault(x =>
                 string.Equals(x.Id, subId, StringComparison.OrdinalIgnoreCase));
-            return p != null ? SubscriptionManager.DisplayName(p, _subProfiles) : subId;
+            return p != null ? ProfileGate.DisplayName(p, _subProfiles) : subId;
         }
 
         /// <summary>
@@ -1025,8 +1157,16 @@ namespace ClashUWP.Frontend
                 ? $" · {m.ProviderName}" : "";
             string body = kind + src;
 
-            // 延迟：没测过就<b>不写</b>（见 KernelView 顶部那条口径）。
-            string delay = m.DelayMs >= 0 ? $"{m.DelayMs}ms" : "";
+            // 延迟三档：<b>没测过不写</b>（KernelView 顶部口径）、<b>0 写"不通"</b>、>0 写毫秒。
+            // ★【1.0.93】0 必须单列：官方在测速失败时往 history 写的就是 <c>Delay=0</c>
+            //   （<c>adapter/adapter.go:170-177</c> + <c>:190</c> 的 defer：alive=false 时 record.Delay 归零），
+            //   而不是"没有这条记录"。按老写法 <c>>=0</c> 一律拼 "Nms"，本轮不通的那一员
+            //   就显示成 "0ms" —— 在一列数字里它会被读成"这员最快"，正好读反。
+            //   组测速（<c>GET /group/{name}/delay</c>）只回拨通的节点，所以点一次 ⚡
+            //   之后不通的成员必然以 0 落进 history，这不是边角情形而是主路径。
+            string delay = m.DelayMs > 0 ? $"{m.DelayMs}ms"
+                       : m.DelayMs == 0 ? "不通"
+                       : "";
             if (body.Length > 0 && delay.Length > 0) return $"{body}　{delay}";
             return body.Length > 0 ? body : delay;
         }
@@ -1071,7 +1211,7 @@ namespace ClashUWP.Frontend
                     string id = p.Id;
                     // ★【1.0.72】显示响应头带来的订阅名（如「星链机场」），
                     //   不再把 URL 派生的长 id 直接糊在按钮上；重名时 DisplayName 会补 host。
-                    string shown = SubscriptionManager.DisplayName(p, profiles);
+                    string shown = ProfileGate.DisplayName(p, profiles);
                     items.Add(Button(
                         $"{(isActive ? "▶ " : "  ")}{shown}  {p.NodeCount}节点/{p.RuleCount}规则  " +
                         $"{p.SizeBytes / 1024.0:F1}KB  {p.FetchedAt:MM-dd HH:mm}",
@@ -1090,7 +1230,7 @@ namespace ClashUWP.Frontend
                 return;
             }
             _setActionHint("拉取中…");
-            var r = await SubscriptionManager.FetchAsync(_subUrl, activate: true);
+            var r = await ProfileGate.FetchSubscriptionAsync(_subUrl, activate: true);
             _setActionHint(r.Message);
             await RefreshSubscriptionsAsync();
         }
@@ -1098,16 +1238,18 @@ namespace ClashUWP.Frontend
         private async Task UpdateSubscriptionAsync()
         {
             _setActionHint("更新中…");
-            var r = await SubscriptionManager.UpdateActiveAsync();
+            var r = await ProfileGate.UpdateActiveSubscriptionAsync();
             _setActionHint(r.Message);
             await RefreshSubscriptionsAsync();
         }
 
         private async Task UseSubscriptionAsync(string id)
         {
-            _setActionHint($"切换到 {id}…");
+            // ★【1.0.109 · 用户指令】切订阅从此是三段式（先断开 → 后修改 → 再重连），
+            //   连着时这一句会真的先拆掉当前会话再重拨，最长等 20 s 收尾 —— 提示语要说清在等什么。
+            _setActionHint($"切换到 {id}…（先断开 → 后修改 → 再重连）");
             // ★ UX 对齐 Verge：点一下即原地热重载（连接中），返回信息里已含重载结果。
-            var r = await SubscriptionManager.ActivateAsync(id);
+            var r = await ProfileGate.ActivateSubscriptionAsync(id);
             _setActionHint(r.Message);
             await RefreshSubscriptionsAsync();
         }
@@ -1119,7 +1261,7 @@ namespace ClashUWP.Frontend
         private async Task ReloadConfigAsync()
         {
             _setActionHint("重载中…");
-            var r = await SubscriptionManager.ReloadActiveConfigAsync();
+            var r = await ProfileGate.ReloadActiveConfigAsync();
             _setActionHint(r.Message);
             await RefreshSubscriptionsAsync();
         }
@@ -1129,8 +1271,8 @@ namespace ClashUWP.Frontend
             try
             {
                 _setSubInfo(await SubscriptionView.LoadAsync());
-                _setSubProfiles(await SubscriptionManager.ListAsync());
-                _setSubActive(await SubscriptionManager.GetActiveAsync());
+                _setSubProfiles(await ProfileGate.ListSubscriptionsAsync());
+                _setSubActive(await ProfileGate.GetActiveSubscriptionAsync());
             }
             catch (Exception ex)
             {
@@ -1397,19 +1539,26 @@ namespace ClashUWP.Frontend
         }
 
         /// <summary>
-        /// 组测速（安卓那枚 ⚡）：<c>PUT /proxies/{组}/healthcheck</c> 让内核把这组成员全拨一遍。
+        /// 组测速（安卓那枚 ⚡）：<c>GET /group/{组}/delay?timeout=&amp;url=</c>
+        /// 让内核把这组成员全拨一遍（<c>MihomoController.TriggerGroupHealthCheckAsync</c>，
+        /// 路由证据与官方语义全部记在那里）。
         /// ★ 与 <see cref="SelectAsync"/> / <see cref="RefreshProviderAsync"/> 同构：结果进
         ///   <c>actionHint</c>，随后立刻刷一次快照。
-        /// ★ 但<b>别期待当场就出数</b>：204 只代表"已触发"，延迟是内核测完异步写回
-        ///   <c>history</c> 的，所以这一次 reload 可能还是旧值，随后的 3 秒轮询才会把
-        ///   新延迟带上来 —— 这句话必须写在返回文案里，否则"点了没变"会被读成"按钮坏了"
-        ///   （1.0.75 那条"界面一言不发所以没人知道后端在报错"的教训，同一个方向的坑）。
+        /// ★【1.0.93 订正】"点了不会当场出数"这句话<b>跟着错的路由一起作废</b>：
+        ///   旧实现打的是 <c>PUT /proxies/{组}/healthcheck</c>（clash premium 的老 API，
+        ///   本内核没有 ⇒ 必然 404），它对应的"204=已触发、延迟异步写回"那套说法也不成立。
+        ///   官方在新路上是<b>等整批拨完才返回</b>（<c>groupbase.go:256</c> 的 <c>wg.Wait()</c>
+        ///   在 <c>render.JSON</c> 之前），响应回来时延迟已经写进各节点的 history，
+        ///   所以下面这一次 <c>LoadAsync</c> 就能看到新数 —— 不需要等 3 秒轮询。
+        /// ★ 上限取的是<b>整批</b>（内核拿一个 ctx 罩全组并发），慢机场的一轮可能跑到
+        ///   <c>GroupTestBatchTimeoutMs</c>（现 8 s），所以先落一条"测速中"再等结果，
+        ///   免得界面在那几秒里一言不发（1.0.75 那条教训）。
         /// </summary>
         private async Task HealthCheckAsync(string group)
         {
             try
             {
-                _setActionHint($"测速中：{group}（要拨完这组所有成员，几秒到几十秒）");
+                _setActionHint($"测速中：{group}（要拨完这组所有成员，最慢决定这一轮的成败）");
                 string result = await MihomoController.TriggerGroupHealthCheckAsync(group);
                 _setActionHint(result);
                 _setSnap(await KernelView.LoadAsync());

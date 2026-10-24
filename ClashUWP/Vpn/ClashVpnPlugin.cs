@@ -490,6 +490,36 @@ namespace ClashUWP.Vpn
             //        to simplify demuxing operations between two VPN connection instances."
             channel.LogDiagnosticMessage("ClashUWP: Channel Id = " + channel.Id);
 
+            // 步 2.5 · ★【1.0.115】插件侧执行 "There can only be one VPN profile per process"。
+            //   平台不保证"先断旧再连新"的顺序（Docs/43 官方 sample clean-room 实测：
+            //   A 处于 Connecting/Connected 时拨 B，官方代码压根没有闸，B 的 await
+            //   ≥5 分 56 秒不返回且无出口）。快速设置面板点另一条订阅时，前台三段式
+            //   （Docs/55 先断开→后修改→再重连）完全被绕过，Connect(B) 直接到这里，
+            //   而 A 的 channel 还活着。旧代码直接覆盖 s_activeChannel，A 的 Stop()
+            //   永远没人调 ⇒ 平台侧 A 一直挂着，Windows UI 停在"验证你的登录信息"。
+            //   现在：插件自己收尾旧会话，再处理新连接。
+            //   ★ 后续平台若再回调 Disconnect(old)，现有守卫（:2097 ReferenceEquals）
+            //     会跳过清 null，DisconnectCore 里各 Stop 均幂等，old.Stop() 二次调用
+            //     在 try/catch 里 ⇒ 不会炸。
+            VpnChannel? oldChannel = s_activeChannel;
+            if (oldChannel != null && !ReferenceEquals(oldChannel, channel))
+            {
+                RollingLog.Info("connect",
+                    $"旧会话仍在（channel={oldChannel.Id}），插件侧先收尾再接纳新连接（one-profile-per-process）");
+                try
+                {
+                    _started = false;
+                    DisconnectCore(oldChannel);
+                    oldChannel.Stop();
+                }
+                catch (Exception exOld)
+                {
+                    RollingLog.Warn("connect",
+                        $"收尾旧会话异常（继续处理新连接）: {exOld.GetType().Name}: {exOld.Message}");
+                }
+                s_activeChannel = null;
+            }
+
             // 步 3 · 读自己定义那段 XML。
             //
             // ⚠️ 名字不对称，这里是最大的一个坑：

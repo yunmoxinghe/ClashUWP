@@ -49,8 +49,12 @@ namespace ClashUWP.Vpn
     ///   ④ 删完做一次<b>残留自检</b>：IP 字面量探 + 域名探，两个结果交叉判读，
     ///      把"整机断网"和"只剩 DNS 残留"分开（这一步只读不写，不需要管理员）。
     ///
-    /// ★ 前台（<c>VpnProfileSetup</c>，靠 AssemblyInfo.cs 的 InternalsVisibleTo 看到本类）
-    ///   和插件内的看门狗<b>共用这一份实现</b>，两条路不再有第二种拆法。
+    /// ★ 前台（<c>ClashUWP.Backend.VpnProfileSetup</c>）和插件内的看门狗<b>共用这一份实现</b>，
+    ///   两条路不再有第二种拆法。
+    ///   【1.0.93 订正】原注释说前台"靠 AssemblyInfo.cs 的 InternalsVisibleTo 看到本类"——
+    ///   那是 1.0.76 合并工程<b>之前</b>跨 nupkg 时代的写法：现在前台与插件同属一个程序集，
+    ///   <c>internal</c> 天然可见，全仓也搜不到任何 <c>InternalsVisibleTo</c>（本类头注释里那句
+    ///   <c>AssemblyInfo.cs</c> 早就不存在了）。分层与归属口径见 Docs/48。
     /// </summary>
     internal static class GracefulTeardown
     {
@@ -178,6 +182,18 @@ namespace ClashUWP.Vpn
         internal static async Task<(bool ok, string report)> EnsureTornDownAsync(VpnPlugInProfile profile)
         {
             string st0 = SafeStatus(profile);
+            if (st0.StartsWith("读状态异常", StringComparison.Ordinal))
+            {
+                // ★★★【1.0.96 · Docs/51】Docs/45 修法第 6 条在这里落地。
+                //   原先这两句是 <c>st0 != "Connected" ⇒ (true, "无需断开")</c>，
+                //   也就是<b>把一次失败的读数当成"没连着"的证据</b>去放行删除。
+                //   而"删在平台仍记着会话的那一刻"正是 2026-10-16 那次
+                //   孤儿 NRPT + 死接口幽灵路由 = 整机断网的成因，所以读数不可信时必须拒绝。
+                //   出口不是"永远删不掉"：<c>VpnProfileSetup</c> 的中毒条目重建路径
+                //   用自己的两条<b>与该属性无关</b>的判据（全清单没有活动会话 + 内核不可达）
+                //   证明"确实没有会话"之后再删，见 Docs/51。
+                return (false, $"状态读不出（{st0}）⇒ 不能按\u201c没连着\u201d放行删除");
+            }
             if (st0 != "Connected")
                 return (true, $"无需断开（状态={st0}）");
 
@@ -285,8 +301,11 @@ namespace ClashUWP.Vpn
         /// <summary>
         /// 轮询到目标 profile 的连接状态<b>连续两轮</b>不是 Connected（或 profile 已消失）。
         /// 每轮<b>重新取</b> profile，不信任旧对象上可能缓存的状态。
+        /// ★【1.0.109】由 <c>private</c> 放开成 <c>internal</c>：切订阅的第一段碰到
+        ///   <c>Disconnecting</c> 时，按官方口径不能再发第二次断开（<c>DisconnectOnClick:532</c>
+        ///   只在 <c>Connected</c> 上发），只等它落地 —— 等的那一步就是这里，不必为此再发一次断开。
         /// </summary>
-        private static async Task<(bool ok, string report)> WaitSessionDownAsync(string profileName)
+        internal static async Task<(bool ok, string report)> WaitSessionDownAsync(string profileName)
         {
             var seen = new List<string>();
             int downRounds = 0;
@@ -298,14 +317,18 @@ namespace ClashUWP.Vpn
                 catch (Exception ex) { st = "读状态异常:" + ex.GetType().Name; }
                 seen.Add(st);
 
-                if (st != "Connected")
-                {
-                    if (++downRounds >= 2)
-                        return (true, $"等到收尾={string.Join(">", seen)}（{(i + 1)} s）");
-                }
-                else
+                if (st == "Connected")
                 {
                     downRounds = 0;
+                }
+                else if (!st.StartsWith("读状态异常", StringComparison.Ordinal))
+                {
+                    // ★【1.0.96 · Docs/51】Docs/45 记的那笔假判据：旧写法是 <c>st != "Connected"</c>，
+                    //   于是"两次读状态异常"就能把"等到收尾"凑满 —— 收尾闸被同一个坏读数<b>自己</b>放行。
+                    //   读数失败的一轮不算"收到尾"，只算"这一轮没看见"（<c>ProfileGone</c> 才是真消失）。
+                    //   代价照实写：中毒期间这条路会走满 <c>WaitSeconds</c> 再回"未等到收尾"，删除被拒。
+                    if (++downRounds >= 2)
+                        return (true, $"等到收尾={string.Join(">", seen)}（{(i + 1)} s）");
                 }
             }
             return (false, $"未等到收尾，最后状态={string.Join(">", seen)}");

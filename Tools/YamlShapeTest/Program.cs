@@ -56,7 +56,8 @@ internal static class Program
         // ★【1.0.84】"选择节点这个组显示成一个节点" —— 一列混排的组行判定数据面
         MemberRows();
 
-        // ★【1.0.84】组测速（安卓那枚 ⚡）的路由拼装：组名里的空格/emoji// 必须编码
+        // ★【1.0.84 → 1.0.93 重写】组测速（安卓那枚 ⚡）：路由从 PUT /proxies/…/healthcheck
+        //   改成官方唯一的 GET /group/{组}/delay；编码判据留着，另加响应体解析
         GroupHealthCheckUrl();
 
         Console.WriteLine(_fail == 0 ? "ALL OFFLINE TESTS PASSED" : _fail + " FAIL");
@@ -912,30 +913,69 @@ internal static class Program
               KernelView.Find(groups, "🔰选择节点") is null);
     }
 
-    // ── ★【1.0.84】组测速（安卓那枚 ⚡）的路由拼装 ───────────────────────
-    // 唯一可离线钉的纯逻辑是 URL 拼装：组名进路径必须 percent-encode。订阅里组名带
-    // emoji、带空格是常态，<b>带 "/" 的组名也真有机场在用</b>（如「🚀 加速/代理」）——
-    // 不编码就不是"测速失败"，而是把请求打到另一条路由上去了。
+    // ── ★【1.0.93】组测速（安卓那枚 ⚡）：路由拼装 + 响应解析 ──────────────────
+    // 【为什么这轮重写这里】旧实现打的是 <c>PUT /proxies/{组}/healthcheck</c> —— 那是
+    //   <b>clash premium 的老 API，本内核 mihomo 没有这条路由</b>（官方
+    //   hub/route/proxies.go:26-33 里 /proxies/{name} 只挂 GET /、GET /delay、PUT /、DELETE /），
+    //   点一次必吃 404 ⇒ 这就是"测速不可用"的本体。
+    //   新路 = GET /group/{组}/delay?timeout=&url=（官方 hub/route/groups.go:21-26、69-93）。
+    // 【能离线钉的两件事】① URL 拼装：组名编码、timeout 必填、组自己的 testUrl 优先并编码；
+    //   ② 响应解析：官方成功体是裸 map[string]uint16 且<b>只含拨通的节点</b>
+    //   （groupbase.go:245-251 仅在 err==nil 时写表），504 的错误体同为对象但值是字符串
+    //   ⇒ 靠"值必须是数字"把两种形状一次分开。
 
     private static void GroupHealthCheckUrl()
     {
-        const string Prefix = "http://127.0.0.1:9090/proxies/";
-        const string Suffix = "/healthcheck";
-        static string Segment(string url) =>
-            url[Prefix.Length..(url.Length - Suffix.Length)];
+        const string Prefix = "http://127.0.0.1:9090/group/";
 
-        string plain = MihomoController.GroupHealthCheckUrl("G");
-        Check("测速: 路由形状 = /proxies/{组}/healthcheck",
-              plain == Prefix + "G" + Suffix, plain);
+        string plain = MihomoController.GroupHealthCheckUrl("G", "", 8000);
+        Check("测速: 路由形状 = /group/{组}/delay（不再是 /proxies/…/healthcheck）",
+              plain.StartsWith(Prefix + "G/delay?") &&
+              !plain.Contains("/proxies/") && !plain.Contains("healthcheck"), plain);
 
-        string emoji = MihomoController.GroupHealthCheckUrl("🔰 选择节点");
+        Check("测速: timeout 原样进 query（官方 ParseInt 失败直接 400，少它等于这一枪没打出去）",
+              plain.Contains("?timeout=8000&url="), plain);
+
+        Check("测速: 组没配 testUrl 时用兜底地址（与单节点 delay 通道同一个地址，不另立标准）",
+              plain.EndsWith("&url=" + System.Uri.EscapeDataString(MihomoController.DefaultGroupTestUrl)),
+              plain);
+
+        string emoji = MihomoController.GroupHealthCheckUrl("🔰 选择节点", "", 5000);
         Check("测速: emoji + 空格的组名按 EscapeDataString 原样编码（不多编、不漏编）",
-              emoji == Prefix + System.Uri.EscapeDataString("🔰 选择节点") + Suffix, emoji);
+              emoji.StartsWith(Prefix + System.Uri.EscapeDataString("🔰 选择节点") + "/delay"), emoji);
 
         // 关键防线：组名里的 "/" 必须被编码掉，否则路由被切成两段、打到别的接口上。
-        string slashy = MihomoController.GroupHealthCheckUrl("加速/代理");
+        string slashy = MihomoController.GroupHealthCheckUrl("加速/代理", "", 5000);
         Check("测速: 组名里的 / 被编码成 %2F（否则一条请求落在两段路由）",
-              !Segment(slashy).Contains('/') && Segment(slashy).Contains("%2F"), slashy);
+              slashy.StartsWith(Prefix + "%E5%8A%A0%E9%80%9F%2F%E4%BB%A3%E7%90%86/delay"), slashy);
+
+        string own = MihomoController.GroupHealthCheckUrl("G",
+            "http://x.example.com/generate_204?a=1&b=2", 8000);
+        Check("测速: 组自己配的 testUrl 优先用（不覆盖机场的设定）",
+              own.EndsWith("&url=" + System.Uri.EscapeDataString(
+                  "http://x.example.com/generate_204?a=1&b=2")), own);
+        Check("测速: 带 & 的测速地址编码后只剩一个裸 &（query 不被截断）",
+              own.LastIndexOf('&') == own.IndexOf("&url=", StringComparison.Ordinal), own);
+
+        using var ok = JsonDocument.Parse("""{"🇯🇵 日本1":123,"🇭🇰 香港2":45}""");
+        var dm = MihomoController.ReadGroupDelayMap(ok.RootElement);
+        Check("测速解析: 裸对象按 名字→延迟 收下（节点名原样，不做加工）",
+              dm.Count == 2 && dm["🇯🇵 日本1"] == 123 && dm["🇭🇰 香港2"] == 45,
+              string.Join(",", dm.Select(kv => kv.Key + "=" + kv.Value)));
+
+        using var err = JsonDocument.Parse("""{"error":"get delay: all proxies timeout"}""");
+        Check("测速解析: 错误体不算任何节点（全组不通时官方回 504 + 字符串值，两种形状靠值类型分）",
+              MihomoController.ReadGroupDelayMap(err.RootElement).Count == 0);
+
+        using var mixed = JsonDocument.Parse("""{"活的":7,"死的":0,"没测过":null}""");
+        var dm2 = MihomoController.ReadGroupDelayMap(mixed.RootElement);
+        Check("测速解析: 数字值原样留下（0 是官方「本轮不通」的写法，渲染归上层），非数字跳过",
+              dm2.Count == 2 && dm2["死的"] == 0 && dm2["活的"] == 7,
+              string.Join(",", dm2.Select(kv => kv.Key + "=" + kv.Value)));
+
+        using var arr = JsonDocument.Parse("[]");
+        Check("测速解析: 不是对象（异常形状）给空表，不抛",
+              MihomoController.ReadGroupDelayMap(arr.RootElement).Count == 0);
     }
 
     private static string Join(List<string> lines) =>

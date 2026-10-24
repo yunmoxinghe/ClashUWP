@@ -200,7 +200,7 @@ namespace ClashUWP.Vpn
         /// 同步读名单（插件在 Connect 这个同步回调里用；读不到就返回空名单，
         /// 与 <see cref="LocalSettings.Load"/> 同一个口径：缺文件是正常路径，不是错误）。
         /// ★ 调用点有<b>两处</b>，都是"重新生成内核配置"的那一刻：
-        ///   <c>ClashVpnPlugin</c> 步 4.1（连接时）与 <see cref="SubscriptionReload"/>（热重载时）。
+        ///   <c>ClashVpnPlugin</c> 步 4.1（连接时）与 <see cref="ClashUWP.Backend.SubscriptionReload"/>（热重载时）。
         ///   ⇒ "前台改完名单"要么断开再连、要么点一次热重载，<b>不需要</b>重建 profile 或重装。
         /// </summary>
         public static AppSplit Load()

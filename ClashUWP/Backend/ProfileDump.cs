@@ -55,7 +55,10 @@ namespace ClashUWP.Backend
                     // ProfileName/Routes/AlwaysOn 等），只在具体类型上，所以放这里。
                     if (p is Windows.Networking.Vpn.VpnPlugInProfile pp)
                     {
-                        sb.AppendLine($"    ConnectionStatus={pp.ConnectionStatus}");
+                        // ★【1.0.96 · Docs/51】这里原来裸读 <c>pp.ConnectionStatus</c>：
+                        //   一条读数中毒的条目会抛穿整个 foreach，<b>后面的条目一行都不剩</b> ——
+                        //   而 dump 恰恰是出事后唯一的取证面，取证面自己先崩等于销毁现场。
+                        sb.AppendLine($"    ConnectionStatus={VpnProfileSetup.StatusOf(pp)}");
                         sb.AppendLine($"    PluginPackageFamilyName={pp.VpnPluginPackageFamilyName}");
                         sb.AppendLine($"    RequireVpnClientAppUI={pp.RequireVpnClientAppUI}");
                         sb.AppendLine($"    CustomConfiguration={(pp.CustomConfiguration?.Length ?? 0)} chars");
@@ -95,7 +98,7 @@ namespace ClashUWP.Backend
             {
                 // ConnectionStatus 只在具体类型 VpnPlugInProfile 上（IVpnProfile 没有）。
                 if (p is Windows.Networking.Vpn.VpnPlugInProfile pp)
-                    sb.AppendLine($"[{pp.ProfileName}] ConnectionStatus={pp.ConnectionStatus}");
+                    sb.AppendLine($"[{pp.ProfileName}] ConnectionStatus={VpnProfileSetup.StatusOf(pp)}");
                 else
                     sb.AppendLine($"[{p.ProfileName}] ({p.GetType().Name})");
             }
