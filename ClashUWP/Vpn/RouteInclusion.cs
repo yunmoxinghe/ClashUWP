@@ -298,6 +298,31 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
+        /// 读台账时补回<b>被上一代代码写空</b>的那一类条目。
+        /// ★【1.0.127 · 1.0.126 的第三处漏项】1.0.126 只修了<b>生产端</b>
+        ///   （<c>NodeRoutes</c> 里两处按族筛掉 v6 的地方），漏了<b>读取端</b>：
+        ///   <c>NodeRoutes</c> 在台账没过 TTL（6 小时）时<b>整轮跳过解析</b>
+        ///   （<c>if (forceAll || (!fresh && hosts.Count > 0))</c>），
+        ///   于是 1.0.126 之前落盘的 "v6 字面量键 = 空值" 行被原样读回、再原样写回，
+        ///   装机取证直接读到 <c>v6ex=0</c> —— 修好的生产端从未跑过。
+        ///   判据：<b>键本身是不是地址字面量</b>。是，就不需要解析，键就是答案；
+        ///   域名键的空值<b>不许</b>凭空填（那是"解析失败/无 AAAA"的真实记录，
+        ///   下一次进解析分支自然会重量）。
+        ///   补出来的形态与解析器的规范输出一致（<c>IPAddress.ToString()</c>），
+        ///   所以台账落盘行、<c>Describe</c>、滚动快照三处同时变诚实。
+        /// </summary>
+        internal static List<string> RepairLedgerEntry(string host, List<string> addresses)
+        {
+            if (addresses.Count > 0)
+                return addresses;
+            if (!IPAddress.TryParse(host, out IPAddress? literal))
+                return addresses;
+            if (literal.AddressFamily is not (AddressFamily.InterNetwork or AddressFamily.InterNetworkV6))
+                return addresses;
+            return new List<string> { literal.ToString() };
+        }
+
+        /// <summary>
         /// 单个 v6 地址是不是全局单播（<c>2000::/3</c>，即首字节高 3 位是 <c>001</c>）。
         /// 环回 <c>::1</c>、链路本地 <c>fe80::/10</c>（含废弃的 site-local <c>fec0::/10</c>）、
         /// ULA <c>fc00::/7</c>、组播 <c>ff00::/8</c>、未指定 <c>::</c> 都不满足这个位型，

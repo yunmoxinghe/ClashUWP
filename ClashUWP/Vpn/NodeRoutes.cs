@@ -42,6 +42,12 @@ namespace ClashUWP.Vpn
     ///   Connect 是平台同步回调，不能在这儿长时间等 DNS：命中未过期缓存就用缓存，
     ///   只有缓存缺失/过期才现场解析，且整体限时。刷新失败一律回退上一份缓存 ——
     ///   「少几条排除路由」远好于「插件抛异常导致连接失败」。
+    ///   ★★【1.0.127 订正】"没过 TTL 就整轮不解析"这一条，让 1.0.126 的<b>生产端</b>修复
+    ///     在装机上<b>一次都没跑过</b>：旧文件里的 "v6 字面量键 = 空值" 被原样读回、
+    ///     再原样写回，判据是 <c>routes arm=1 … v6ex=0</c>（手工补 <c>Stale=</c> 逼一次重量才变 <c>v6ex=3</c>）。
+    ///     所以补漏放在<b>读取</b>这一层：<see cref="RouteInclusion.RepairLedgerEntry"/> 只把
+    ///     "键本身是地址字面量"的空值补成该地址（字面量不需要解析，键就是答案），
+    ///     域名键的解析失败保持为空。下一次落盘时台账里就不再有这种疤了。
     /// </summary>
     internal static partial class NodeRoutes
     {
@@ -313,9 +319,14 @@ namespace ClashUWP.Vpn
                     int idx = l.IndexOf('=');
                     string host = l.Substring(0, idx).Trim();
                     string ips = l.Substring(idx + 1).Trim();
-                    map[host] = ips.Length == 0
-                        ? new List<string>()
-                        : ips.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+                    // ★【1.0.127】空值不等于"这条没得用"：v6/v4 <b>字面量</b>键的空值是
+                    //   上一代按族筛掉时写下的伤疤。台账没过 TTL 时整轮解析都被跳过
+                    //   （见 BuildExclusionCidrs 的 forceAll 条件），所以必须在<b>读取</b>这一层补，
+                    //   否则 1.0.126 修好的生产端永远没机会跑。域名键的空值保持为空。
+                    map[host] = RouteInclusion.RepairLedgerEntry(host,
+                        ips.Length == 0
+                            ? new List<string>()
+                            : ips.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList());
                 }
             }
             catch

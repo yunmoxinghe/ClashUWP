@@ -113,6 +113,13 @@ internal static class Program
         //   内核能力不一样。只有离线能钉。
         Ipv6ArmFixShapes126();
 
+        // ★★【1.0.127 · 1.0.126 的第三处漏项】台账<b>读侧</b>的自愈。
+        //   1.0.126 只修生产端，而生产端在台账没过 TTL（6 小时）时整轮不跑，
+        //   装机判据因此是 v6ex=0 —— 修复"在包里"却从没执行过。这条在离线才钉得住：
+        //   它要的是一个"上一代写下的旧形状台账"，装机上要么已经被人工 Stale= 洗掉、
+        //   要么就要等 6 小时，都不能当单变量。
+        LedgerRepairShapes127();
+
         Console.WriteLine(_fail == 0 ? "ALL OFFLINE TESTS PASSED" : _fail + " FAIL");
         return _fail == 0 ? 0 : 1;
     }
@@ -1720,6 +1727,83 @@ internal static class Program
         Check("1.0.126 顶层 ipv6: 只动顶层那一行，dns 块里的同名 ipv6 字段各归各的（不重复、不误伤）",
               TopIpv6Lines(Arm1True).Count == 1 &&
               Arm1True.Contains("    ipv6: false"), string.Join(" | ", TopIpv6Lines(Arm1True)));
+    }
+
+    /// <summary>
+    /// ★【1.0.127】台账读侧自愈的判据。
+    /// 实物（Docs/67 §八）：1.0.126 装机后第一次 arm=1 拨号的判据行是
+    /// <c>routes arm=1 … v4ex=37 v6ex=0</c> —— 手工往 <c>node-exclusions.txt</c>
+    /// 补一行 <c>Stale=…</c> 逼一次全量重解析，才变回 <c>v6ex=3</c> 并把三条 <c>/128</c>
+    /// 装到物理 WLAN 网卡上。也就是说 1.0.126 的修复<b>在包里但一次都没跑</b>：
+    /// 缓存没过 TTL 时 <c>RefreshBlocking</c> 整个分支都被跳过，旧文件里
+    /// "v6 字面量键 = 空值" 那几行被原样读回、再原样写回。
+    /// 判据只有一条：<b>键本身是不是地址字面量</b>。是 ⇒ 键就是答案，不需要解析；
+    /// 不是（域名）⇒ 空值是"这一轮解析失败/没有 AAAA"的真实记录，不许凭空填。
+    /// </summary>
+    private static void LedgerRepairShapes127()
+    {
+        // ── ① 疤本身：装机实物那三条 v6 空值行 ────────────────────────────
+        List<string> repairedV6 = RouteInclusion.RepairLedgerEntry(
+            "2604:a00:101:2b:25::1", new List<string>());
+        Check("1.0.127 补漏: v6 字面量键的空值补成该地址（旧代码按族筛留下的疤，实物 3 条）",
+              repairedV6.Count == 1 && repairedV6[0] == "2604:a00:101:2b:25::1",
+              string.Join(",", repairedV6));
+
+        List<string> repairedV4 = RouteInclusion.RepairLedgerEntry(
+            "149.28.10.20", new List<string>());
+        Check("1.0.127 补漏: v4 字面量键的空值同样补 —— 疤不分族，只认『键是地址』",
+              repairedV4.SequenceEqual(new[] { "149.28.10.20" }), string.Join(",", repairedV4));
+
+        // ── ② 不许越界：域名键的空值是真实记录 ────────────────────────────
+        Check("1.0.127 补漏: ★ 域名键的空值保持为空（那是『没解析出来』，不是『没写进去』）",
+              RouteInclusion.RepairLedgerEntry("hk-a.example.com", new List<string>()).Count == 0);
+        Check("1.0.127 补漏: 带尾点的 FQDN 也不算地址（别把主机名读成 0.0.0.0 之类）",
+              RouteInclusion.RepairLedgerEntry("host.local.", new List<string>()).Count == 0);
+
+        // ── ③ 有值一律不动，且幂等（下一次连接不会把补出来的再改回去）────────
+        List<string> withValues = new() { "1.2.3.4", "2408:800:1234::1" };
+        Check("1.0.127 补漏: 非空值原样返回（一个地址都不多、一个都不删）",
+              ReferenceEquals(withValues, RouteInclusion.RepairLedgerEntry("1.2.3.4", withValues)) &&
+              withValues.SequenceEqual(new[] { "1.2.3.4", "2408:800:1234::1" }));
+        Check("1.0.127 补漏: 幂等 —— 补出来的形态再过一次不产生第二个值",
+              RouteInclusion.RepairLedgerEntry("2604:a00:101:2b:25::1", repairedV6)
+                  .SequenceEqual(repairedV6));
+
+        // ── ④ 规范形态：补出来的值必须和解析器写台账时的写法一致 ────────────
+        //    否则同一个节点在台账里留两行（大写键一行、小写值一行），下一次读又是空值。
+        List<string> canonical = RouteInclusion.RepairLedgerEntry(
+            "2604:A00:101:2B:25::1", new List<string>());
+        Check("1.0.127 补漏: 大小写/展开形态的键补成 IPAddress 的规范写法（与解析器同源，落盘不自愈失败）",
+              canonical.Count == 1 && canonical[0] == "2604:a00:101:2b:25::1",
+              string.Join(",", canonical));
+
+        // ── ⑤ 端到端：读台账 → 补漏 → 候选 → arm=1 的 v6 排除桶 ────────────
+        //    这一条才是装机判据 v6ex=0 → v6ex=3 的那条链，逐字照实物摆。
+        var ledger = new List<(string Host, List<string> Values)>
+        {
+            ("2604:a00:101:2b:25::1", new List<string>()),          // 疤：v6 字面量键空值
+            ("2a01:4:cafe::9", new List<string>()),                 // 疤：同上
+            ("149.28.10.20", new List<string> { "149.28.10.20" }),  // 正常：v4 已解析
+            ("hk-a.example.com", new List<string>()),               // 正常：域名解析失败
+        };
+        var chain = RouteInclusion.HostRouteCandidates(
+            ledger.Select(kv => RouteInclusion.RepairLedgerEntry(kv.Host, kv.Values))
+                  .SelectMany(x => x), 500);
+        var arm1 = RouteInclusion.Build(new RouteInclusion.Input(
+            new List<string> { "0.0.0.0/0" }, new List<string>(), false, 1, "fdfe:dcba:9876::/64",
+            new List<string>(), chain, true));
+        Check("1.0.127 端到端: 旧形状台账在 arm=1 下产出 2 条 v6 /128 + 1 条 v4 /32（v6ex 不再是 0）",
+              arm1.Ipv6Excludes.Contains("2604:a00:101:2b:25::1/128") &&
+              arm1.Ipv6Excludes.Contains("2a01:4:cafe::9/128") &&
+              arm1.Ipv4Excludes.Contains("149.28.10.20/32") &&
+              !arm1.Ipv6Excludes.Any(r => r.StartsWith("hk-a")), arm1.Describe());
+        var arm0 = RouteInclusion.Build(new RouteInclusion.Input(
+            new List<string> { "0.0.0.0/0" }, new List<string>(), false, 0, "fdfe:dcba:9876::/64",
+            new List<string>(), chain, true));
+        Check("1.0.127 端到端: 默认档 arm=0 逐字旧行为 —— v6 一条都不下发，且必须点名丢弃",
+              arm0.Ipv6Excludes.Count == 0 &&
+              arm0.Dropped.Any(d => d.Contains("节点排除 v6 且 arm=0") &&
+                                    d.Contains("2604:a00:101:2b:25::1/128")), arm0.Describe());
     }
 
     /// <summary>
