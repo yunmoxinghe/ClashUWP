@@ -492,6 +492,19 @@ namespace ClashUWP.Vpn
         internal static int Ipv6 = 0;
 
         /// <summary>
+        /// ★【1.0.126 · IPv6 界面出口】档位合法区间的<b>唯一定义处</b>。
+        ///
+        /// 【为什么抽出来】这个区间原本只存在于两处调用的实参里（插件侧 <c>Load()</c> 的
+        ///   <c>SettingsParse.Int(map, "ipv6", …, 0, 2)</c>）。界面出口一加就有第三处 ——
+        ///   写档位前要归一，而归一时的上下界若和读的时候不同，就会造出
+        ///   「写进去 3、读回来 0」这种"按钮点了没反应"。区间本身是这套把手的契约，
+        ///   不该靠三处实参逐字相同维系（口径同 <see cref="SettingsParse"/> 存在的理由）。
+        /// </summary>
+        internal const int Ipv6ArmMin = 0;
+        /// <summary>档位上界（含）。见 <see cref="Ipv6ArmMin"/>。</summary>
+        internal const int Ipv6ArmMax = 2;
+
+        /// <summary>
         /// 档 2 的 fake-ip v6 池（写进 <c>dns.fake-ip-range6</c>，同时作为 include 路由）。
         /// 默认 <c>fdfe:dcba:9876::/64</c>：与 mihomo 的 <c>tun.inet6-address</c>
         /// 默认段同前缀但取 /64（默认的 <c>::1/126</c> 只有 4 个地址，做池子太小）。
@@ -589,7 +602,7 @@ namespace ClashUWP.Vpn
                 FailFast = SettingsParse.Bool(map, "failFast", FailFast);
                 SessionReset = SettingsParse.Int(map, "sessionReset", SessionReset, 0, 2);
                 NetFollow = SettingsParse.Int(map, "netFollow", NetFollow, 0, 2);
-                Ipv6 = SettingsParse.Int(map, "ipv6", Ipv6, 0, 2);
+                Ipv6 = SettingsParse.Int(map, "ipv6", Ipv6, Ipv6ArmMin, Ipv6ArmMax);
                 Ipv6FakeRange = SettingsParse.String(map, "ipv6FakeRange", Ipv6FakeRange);
                 Ipv6ClientAddress = SettingsParse.String(map, "ipv6ClientAddress", Ipv6ClientAddress);
                 DnsConfigEnabled = SettingsParse.Bool(map, "dnsConfig", DnsConfigEnabled);

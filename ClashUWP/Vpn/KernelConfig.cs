@@ -105,8 +105,13 @@ namespace ClashUWP.Vpn
                 //   config.go:716 `parseIPV6(rawCfg)` 的注释原文就是 "must before DNS and Tun"，
                 //   而它的实现（:1680-1682）在开关关闭或本机无全局 v6 时会把
                 //   `tun.inet6-address` / `dns.fake-ip-range6` 整个清空。
-                if (ipv6Arm >= 2)
-                    EnsureTopLevelIpv6(lines);
+                // ★【1.0.126】档 1 也写（写 false），不再"不碰订阅原文"：
+                //   不碰的后果是同一个档 1 在不同机场下内核 v6 能力不同（订阅写 true 就是 true），
+                //   而且档 2 用过再降回 1 时磁盘上留着上一轮写的 true。
+                //   档 1 的语义本来就是"堵泄漏、内核不转发 v6"（桥侧 gvisor 栈在 arm<2
+                //   也没注册 v6，快照里 `v6栈=off`），写 false 只是让这个档与订阅无关。
+                if (ipv6Arm >= 1)
+                    EnsureTopLevelIpv6(lines, ipv6Arm >= 2);
                 EnsureDnsBlock(lines, ipv6Arm, ipv6FakeRange);
                 EnsureTunBlock(lines, ipv6Arm, ipv6FakeRange);
                 // ★【1.0.40 · DNS 可配】覆盖必须叠在 EnsureDnsBlock 之后：
@@ -243,19 +248,23 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
-        /// 顶层 <c>ipv6: true</c>。★【1.0.39 · G7】只在档 2 调：mihomo 的
-        /// <c>parseIPV6</c>（<c>config.go:716/:1679-1682</c>）在它关闭时会把
-        /// <c>tun.inet6-address</c> 与 <c>dns.fake-ip-range6</c> 清空 ——
-        /// 那是"配置写了却没生效"的静默失败形态。档 0/1 不碰订阅原文。
-        /// 已有键且是标量就改成 true；值为空（块形状）则不动，不拿 YAML 冒险。
+        /// 顶层 <c>ipv6: true/false</c>。★【1.0.39 · G7】mihomo 的 <c>parseIPV6</c>
+        /// （<c>config.go:716/:1679-1682</c>）在它关闭时会把 <c>tun.inet6-address</c> 与
+        /// <c>dns.fake-ip-range6</c> 清空 —— 所以"想开 v6"必须开这一项（档 2），
+        /// 而【1.0.126】起"档 1"也显式写 <c>false</c>：档 1 的语义是堵泄漏且内核不转发 v6，
+        /// 不碰订阅原文会让同一个档 1 在不同机场下内核 v6 能力不同，
+        /// 且 2 降回 1 时磁盘上留着上一轮的 true。
+        /// ★ 档 0 仍然一个字节都不碰（那是"与 1.0.69 逐字一致"的凭据）。
+        /// 已有键且是标量就改写；值为空（块形状）则不动，不拿 YAML 冒险。
         /// </summary>
-        private static void EnsureTopLevelIpv6(List<string> lines)
+        private static void EnsureTopLevelIpv6(List<string> lines, bool wantV6)
         {
+            string want = wantV6 ? "true" : "false";
             int at = FindTopLevelKey(lines, "ipv6");
             if (at >= 0)
             {
                 if (ValueOf(lines[at]).Length > 0)
-                    lines[at] = "ipv6: true";
+                    lines[at] = "ipv6: " + want;
                 return;
             }
 
@@ -269,7 +278,7 @@ namespace ClashUWP.Vpn
                 else
                     break;
             }
-            lines.Insert(insert, "ipv6: true");
+            lines.Insert(insert, "ipv6: " + want);
         }
 
         /// <summary>

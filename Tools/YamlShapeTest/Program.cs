@@ -107,6 +107,12 @@ internal static class Program
         //   下一拍又自己变回去（Docs/66 记了实物）。
         KernelAnswerShapes();
 
+        // ★【1.0.126 · IPv6 档 1/2 的两条真缺陷】候选清单的族别 + 顶层 ipv6 与订阅原文无关。
+        //   这两条装机读不回来（本机没有全局 IPv6，档 1/2 从未拨过），而失败模式是
+        //   "看起来一切正常"：档 1 抬上去后拨 v6 节点会自环，或同一个档 1 在不同机场
+        //   内核能力不一样。只有离线能钉。
+        Ipv6ArmFixShapes126();
+
         Console.WriteLine(_fail == 0 ? "ALL OFFLINE TESTS PASSED" : _fail + " FAIL");
         return _fail == 0 ? 0 : 1;
     }
@@ -1632,6 +1638,106 @@ internal static class Program
               !p1.Describe().Contains('\n') && p1.Describe().Contains("v6in=[2000::/3]") &&
               p1.Describe().Contains("v6ex="), p1.Describe());
     }
+
+    // ── ★【1.0.126 · IPv6 档 1/2 的两条真缺陷】─────────────────────────────
+    // 这两条都是<b>只在生产端可断言</b>的形状，装机上读不回来（本机没有全局 IPv6，
+    // 档 1/2 从未拨过），而它们的失败模式恰好是"看起来一切正常"：
+    //   ① 节点排除候选以前在生产端按 v4 筛 —— v6 节点地址被存成空列表，候选清单里
+    //      永远没有 v6，于是档 1 下发 2000::/3 之后<b>拨向 v6 节点的外层包正好落进自家
+    //      include、没有 /128 排除兜它</b>（自环黑洞）。消费端 RouteInclusion.Build 的
+    //      /128 判据 1.0.119 就写对了，所以这条错在只有生产端能钉。
+    //   ② 档 1 的内核 v6 形态以前取决于订阅原文：本档只保证"不写 true"，订阅自己写了
+    //      ipv6: true 就照样开 —— 同一个档 1 在不同机场下内核能力不同。
+    private static void Ipv6ArmFixShapes126()
+    {
+        // ── ① 候选清单：族别只决定前缀长度，不决定要不要产出 ──────────────
+        var cand = RouteInclusion.HostRouteCandidates(
+            new[] { "1.2.3.4", "2408:800:1234::1", "2408:800:1234::1", "5.6.7.8" }, 500);
+        Check("1.0.126 候选: v6 台账值必须产出 /128（旧实现按 v4 筛，v6 永远为空）",
+              cand.Contains("2408:800:1234::1/128"), string.Join(",", cand));
+        Check("1.0.126 候选: v4 仍是 /32，同一地址不重复产出",
+              cand.Contains("1.2.3.4/32") &&
+              cand.Count(x => x.Contains("2408")) == 1, string.Join(",", cand));
+        Check("1.0.126 候选: ★ 生产端不按档位筛（档 0 丢弃这件事只留给 Build 一处，且要点名）",
+              RouteInclusion.HostRouteCandidates(new[] { "fd00::1" }, 500)
+                  .SequenceEqual(new[] { "fd00::1/128" }));
+        Check("1.0.126 候选: 空串跳过（台账里解析不出地址时留的就是空值行）",
+              RouteInclusion.HostRouteCandidates(new[] { "", "1.1.1.1", "" }, 500)
+                  .SequenceEqual(new[] { "1.1.1.1/32" }));
+        Check("1.0.126 候选: 到 max 立刻收口（路由表条数上限不许被台账冲穿）",
+              RouteInclusion.HostRouteCandidates(
+                  Enumerable.Range(1, 900).Select(i => $"2408:800:{i:x}::1"), 3).Count == 3);
+        // 端到端（消费端 + 生产端同一条链）：v6 节点地址经过候选清单，最终在 arm=1 的
+        // exclude 桶里出现。以前这条链断在生产端，桶里永远是空的。
+        var viaCandidates = RouteInclusion.HostRouteCandidates(new[] { "2408:800:1234::1" }, 500);
+        var planFromCandidates = RouteInclusion.Build(new RouteInclusion.Input(
+            new List<string> { "0.0.0.0/0" }, new List<string>(), false, 1, "fdfe:dcba:9876::/64",
+            new List<string>(), viaCandidates, true));
+        Check("1.0.126 端到端: v6 节点地址 → 候选 → arm=1 的 v6 exclude 桶（自环黑洞那条链补齐）",
+              planFromCandidates.Ipv6Excludes.Contains("2408:800:1234::1/128") &&
+              planFromCandidates.Ipv6Includes.Contains("2000::/3"),
+              planFromCandidates.Describe());
+
+        // ── ② 档位区间的读写同一个契约（界面出口新加的第 3 个调用点）──────────
+        Check("1.0.126 区间: 0/1/2 三档读回原值；3 与空值一律回落 0（不许就近取一档）",
+              SettingsParse.Int(SettingsParse.Parse("ipv6=0"), "ipv6", 0,
+                                LocalSettings.Ipv6ArmMin, LocalSettings.Ipv6ArmMax) == 0 &&
+              SettingsParse.Int(SettingsParse.Parse("ipv6=1"), "ipv6", 0,
+                                LocalSettings.Ipv6ArmMin, LocalSettings.Ipv6ArmMax) == 1 &&
+              SettingsParse.Int(SettingsParse.Parse("ipv6=2"), "ipv6", 0,
+                                LocalSettings.Ipv6ArmMin, LocalSettings.Ipv6ArmMax) == 2 &&
+              SettingsParse.Int(SettingsParse.Parse("ipv6=3"), "ipv6", 0,
+                                LocalSettings.Ipv6ArmMin, LocalSettings.Ipv6ArmMax) == 0 &&
+              SettingsParse.Int(SettingsParse.Parse("ipv6="), "ipv6", 0,
+                                LocalSettings.Ipv6ArmMin, LocalSettings.Ipv6ArmMax) == 0);
+
+        // ── ③ 顶层内核 v6 开关与订阅原文无关 ────────────────────────────────
+        const string Pool6 = "fdfe:dcba:9876::/64";
+        const string Body = "proxy-groups:\n  - name: A\n    type: select\n    proxies:\n      - DIRECT\n";
+        string NoIpv6Key = "mode: rule\n" + Body;
+        string SubSaysTrue = "mode: rule\nipv6: true\n" + Body;
+
+        string Arm0Bare = KernelConfig.Transform(NoIpv6Key, null, null, 0, Pool6, out _, out _);
+        Check("1.0.126 顶层 ipv6: 档 0 逐字旧行为 —— 订阅没写就不补（默认档不许改内核形态）",
+              TopIpv6Value(Arm0Bare) == null, string.Join(" | ", TopIpv6Lines(Arm0Bare)));
+
+        string Arm0True = KernelConfig.Transform(SubSaysTrue, null, null, 0, Pool6, out _, out _);
+        Check("1.0.126 顶层 ipv6: 档 0 连订阅自己写了 true 也不碰（本批之前的行为，必须原样保持）",
+              TopIpv6Value(Arm0True) == "true", string.Join(" | ", TopIpv6Lines(Arm0True)));
+
+        string Arm1Bare = KernelConfig.Transform(NoIpv6Key, null, null, 1, Pool6, out _, out _);
+        Check("1.0.126 顶层 ipv6: 档 1 即使订阅没写，也显式补 false",
+              TopIpv6Value(Arm1Bare) == "false", string.Join(" | ", TopIpv6Lines(Arm1Bare)));
+
+        string Arm1True = KernelConfig.Transform(SubSaysTrue, null, null, 1, Pool6, out _, out _);
+        Check("1.0.126 顶层 ipv6: ★ 档 1 把订阅的 true 改成 false —— 同一个档位在所有机场一个形态",
+              TopIpv6Value(Arm1True) == "false", string.Join(" | ", TopIpv6Lines(Arm1True)));
+
+        string Arm2True = KernelConfig.Transform(SubSaysTrue, null, null, 2, Pool6, out _, out _);
+        Check("1.0.126 顶层 ipv6: 档 2 写 true（2 降回 1 不留上一轮的 true：由同一处改写保证）",
+              TopIpv6Value(Arm2True) == "true", string.Join(" | ", TopIpv6Lines(Arm2True)));
+
+        Check("1.0.126 顶层 ipv6: 只动顶层那一行，dns 块里的同名 ipv6 字段各归各的（不重复、不误伤）",
+              TopIpv6Lines(Arm1True).Count == 1 &&
+              Arm1True.Contains("    ipv6: false"), string.Join(" | ", TopIpv6Lines(Arm1True)));
+    }
+
+    /// <summary>
+    /// 顶层（第 0 列起笔）<c>ipv6:</c> 的值；文件里没有这个键返回 null。
+    /// ★ 缩进行一律不算 —— <c>dns:</c> 块里也有一个 <c>ipv6</c>，那是另一个字段（AAAA 解析开关）。
+    /// </summary>
+    private static string? TopIpv6Value(string yaml)
+    {
+        List<string> lines = TopIpv6Lines(yaml);
+        if (lines.Count == 0)
+            return null;
+        string line = lines[0];
+        int idx = line.IndexOf(':');
+        return idx < 0 ? null : line.Substring(idx + 1).Trim();
+    }
+
+    private static List<string> TopIpv6Lines(string yaml) =>
+        yaml.Replace("\r\n", "\n").Split('\n').Where(l => l.StartsWith("ipv6")).ToList();
 
     // ── 【当前批次】G4：活动连接强断 ─────────────────────────────────────
     // 这一组的三条都是"装机会静默失效"的形状：id 没读出来 → 按钮画得出来但无断可依；

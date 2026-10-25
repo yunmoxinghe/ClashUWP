@@ -274,6 +274,30 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
+        /// 把节点地址台账收成宿主路由<b>候选</b>清单（去重、按 <paramref name="max"/> 截断）。
+        /// ★【1.0.126】这一步只决定<b>前缀长度</b>（族别），不决定<b>要不要产出</b>：
+        ///   旧版在 <c>NodeRoutes</c> 里按族筛 —— v6 字面量与 AAAA 解析结果被存成<b>空列表</b>，
+        ///   于是候选清单里永远没有 v6，档 1/2 下发 <c>2000::/3</c> 之后
+        ///   v6 节点服务器的外层拨号包正好落进自家 include、没有排除路由兜它（自环黑洞）。
+        ///   "arm=0 不拿 v6 排除"这个决定只留给 <see cref="Build"/> 一处做（并且按名出声丢弃）。
+        /// </summary>
+        internal static List<string> HostRouteCandidates(IEnumerable<string> addresses, int max)
+        {
+            var list = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string ip in addresses)
+            {
+                if (ip.Length == 0)
+                    continue;
+                if (seen.Add(ip))
+                    list.Add(HostRoute(ip));
+                if (list.Count >= max)
+                    return list;
+            }
+            return list;
+        }
+
+        /// <summary>
         /// 单个 v6 地址是不是全局单播（<c>2000::/3</c>，即首字节高 3 位是 <c>001</c>）。
         /// 环回 <c>::1</c>、链路本地 <c>fe80::/10</c>（含废弃的 site-local <c>fec0::/10</c>）、
         /// ULA <c>fc00::/7</c>、组播 <c>ff00::/8</c>、未指定 <c>::</c> 都不满足这个位型，

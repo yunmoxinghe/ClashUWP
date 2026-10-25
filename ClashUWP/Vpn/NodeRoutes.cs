@@ -26,9 +26,16 @@ namespace ClashUWP.Vpn
     /// 【数据来源】
     ///   订阅渲染出的 <c>LocalState\config.yaml</c> 里的 <c>server:</c> 字段，
     ///   同时兼容流式（<c>- { server: 1.2.3.4, ... }</c>）与块式（<c>server: example.com</c>）写法。
-    ///   IPv4 字面量直接采纳；域名走 <see cref="Dns"/> 解析（必须在隧道起来<b>之前</b>做，
-    ///   此时解析走物理网卡，结果才可信）；IPv6 节点不处理 —— 本插件只下发 IPv4 路由，
-    ///   v6 出站天然走物理网卡，不构成自环。
+    ///   ★【1.0.126 订正】两个族都产候选（v4 字面量、v6 字面量、域名解析出的 v4/AAAA）；
+    ///     域名解析必须在隧道起来<b>之前</b>做，此时解析走物理网卡，结果才可信。
+    ///     旧注释写的是「IPv6 节点不处理 —— 本插件只下发 IPv4 路由，v6 出站天然走物理网卡，
+    ///     不构成自环」，那句话在 <c>ipv6=0</c> 下是对的，在档 1/2 下<b>正好反了</b>：
+    ///     档 1 往隧道里下发 <c>2000::/3</c>，v6 节点服务器的地址恰好落在这条 include 里，
+    ///     没有 /128 排除路由兜它 ⇒ 拨向该节点的外层包被自家隧道抓回 = 自环黑洞。
+    ///     实物：装机 <c>node-exclusions.txt</c> 里三条 v6 节点的 value 全为空
+    ///     （<c>2604:a00:101:2b:25::1=</c> 等），即"候选根本没产出来"。
+    ///     族别与档位该不该真正下发，只由 <see cref="RouteInclusion"/> 一处决定（arm=0 时
+    ///     它按名丢弃），本类不再自己按族筛 —— 两处各筛一套必然漂移。
     ///
     /// 【缓存】
     ///   解析结果写 <c>LocalState\node-exclusions.txt</c>（<c>host=ip,ip</c> + 时间戳）。
@@ -55,7 +62,8 @@ namespace ClashUWP.Vpn
         private static partial Regex ServerFieldRegex();
 
         /// <summary>
-        /// 取本次连接应下发的排除路由（CIDR 列表，全部是 <c>/32</c>）。
+        /// 取本次连接应下发的排除路由（CIDR 列表，前缀按<b>地址族</b>取：v4 是 <c>/32</c>、
+        /// v6 是 <c>/128</c>，见 <see cref="RouteInclusion.HostRoute"/>）。
         /// 任何异常都返回空列表或旧缓存，绝不抛 —— 调用方在平台回调里。
         /// </summary>
         internal static List<string> BuildExclusionCidrs(string configYaml)
@@ -82,21 +90,11 @@ namespace ClashUWP.Vpn
                 // 落盘（尽力而为，写失败不影响本次连接）
                 SaveCache(map, _staleReason);
 
-                var cidrs = new List<string>();
-                var seen = new HashSet<string>();
-                foreach (List<string> ips in map.Values)
-                {
-                    foreach (string ip in ips)
-                    {
-                        // ★ 前缀按地址族取：这批候选里可能出现 v6 节点地址，统一拼 /32
-                        //   对 v6 是错的（宿主路由在 v6 上是 /128），消费方见 RouteInclusion.Build。
-                        if (seen.Add(ip))
-                            cidrs.Add(RouteInclusion.HostRoute(ip));
-                        if (cidrs.Count >= MaxExclusionRoutes)
-                            return cidrs;
-                    }
-                }
-                return cidrs;
+                // 台账 → 候选：这一层只按<b>族别取前缀长度</b>，不再按族决定"要不要产出"
+                //   （旧代码在这里把 v6 整条筛掉，档 1/2 的自环就来自那里）。
+                //   去重与上限截断也搬进同一个纯函数，判据在夹具里钉（RouteInclusion.HostRouteCandidates）。
+                return RouteInclusion.HostRouteCandidates(
+                    map.Values.SelectMany(ips => ips), MaxExclusionRoutes);
             }
             catch
             {
@@ -228,12 +226,17 @@ namespace ClashUWP.Vpn
 
                 if (IPAddress.TryParse(host, out IPAddress? literal))
                 {
-                    if (literal.AddressFamily == AddressFamily.InterNetwork)
+                    // ★【1.0.126】v4/v6 字面量一律存进台账。旧代码把 v6 存成<b>空列表</b>
+                    //   （注释：「v4 隧道不捕获，留空占位」），后果不是"少一条用不上的路由"，
+                    //   而是下面的候选里<b>永远没有 v6</b> ⇒ 档 1/2 下发 2000::/3 之后，
+                    //   v6 节点服务器的拨号包正好被自家 include 抓走且无排除兜底（自环）。
+                    //   族别归哪个桶、arm=0 要不要丢，全部交给 RouteInclusion 一处判。
+                    if (literal.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6)
                     {
                         map[host] = new List<string> { literal.ToString() };
                         continue;
                     }
-                    // IPv6 节点：v4 隧道不捕获，留空占位避免每次重连再解析
+                    // 其他族（没有这种 server 字段值）：留空占位，避免每次重连再解析
                     map[host] = new List<string>();
                     continue;
                 }
@@ -262,12 +265,12 @@ namespace ClashUWP.Vpn
                         allOk = false;
                         break; // 超时说明本网段解析已经不通，继续也没意义
                     }
-                    List<string> v4 = task.Result
-                        .Where(a => a.AddressFamily == AddressFamily.InterNetwork)
+                    List<string> resolved = task.Result
+                        .Where(a => a.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6)
                         .Select(a => a.ToString())
                         .Distinct()
                         .ToList();
-                    map[host] = v4;
+                    map[host] = resolved;
                 }
                 catch
                 {
