@@ -635,7 +635,16 @@ namespace ClashUWP.Frontend
             return NavigationView(
                     content: body,
                     menuItems: MenuItems,
-                    paneDisplayMode: NavPaneDisplayMode.Left,
+                    // ★【1.0.125 · 从 Left 改回 Auto】这条写死成 Left 就是"默认窗口宽度下
+                    //   按钮点不着"的根因，实测数字在 Docs/66：772px 窗口里展开态的导航栏
+                    //   占掉 480/750，正文列只剩 268 ⇒「VPN 控制」那一排三枚按钮（不可换行的
+                    //   HStack）画成 174 / 10 / 零尺寸，鼠标点不到第二、三枚。
+                    //   Auto 才是框架自己的默认：窄窗口收成图标栏、够宽再展开（同一窗口下
+                    //   手动收起导航栏实测正文 676px ⇒ 三枚按钮 174/125/126 全点得着，
+                    //   这组数字就是"栏子挤的、不是按钮尺寸写死的"那条判据）。
+                    //   本包没有"任何时候都必须看见条目名"的硬要求，而把正文挤到点不着是
+                    //   每天都碰的代价。
+                    paneDisplayMode: NavPaneDisplayMode.Auto,
                     selectedIndex: page,
                     // 受控选择：只认落在四项里的 index。内置那条「设置」第五项
                     // （IsSettingsVisible 默认开着的那个）会报成越界值，本批直接关掉它 ——
@@ -797,16 +806,28 @@ namespace ClashUWP.Frontend
                 //     空态要给<b>下一步动作</b>，不许留白。
                 //   ★ 首轮轮询还没回来时（Error="(尚未查询)"）画"加载中"而不是"内核未运行" ——
                 //     任务书 §八场景 5：内核启动中/首轮未归,不能把"还没问到"谎报成"没有"。
+                //   ★【1.0.125】同一档判据再补一条：<b>查询超时</b>也是"没问到"，不是"没在跑"。
+                //     这一档在拆隧道的那几十秒必然出现（回环端口开着但内核正在收尾，不回话），
+                //     原先它会落到"内核未运行"那句里 —— 主页那一行同一时刻也说"未连接"，
+                //     两句合起来就是一次谎报（实物见 Docs/66）。
                 snap.Ok ? Empty()
                     : snap.Error == NotPolledError
                         ? TextBlock("正在查询内核与本地配置…").Foreground(Theme.SecondaryText)
-                        : TextBlock(snap.FromConfigFile
-                            ? "★ 内核未运行 —— 下面是本地订阅（config.yaml）解析出的配置视图：" +
-                              "无延迟数据、无活动连接。点节点会记为预设选择，" +
-                              "下次内核可达（连接或常驻重启）时自动回放生效；不改动内核、也不发起 VPN 连接。"
-                            : "★ 内核未运行，本地也没有可列出的节点定义 —— " +
-                              "先在「订阅」页拉取订阅（拉取不需要 VPN 连接）。")
-                            .Foreground(Theme.SecondaryText),
+                        : snap.QueryTimedOut
+                            ? TextBlock(snap.FromConfigFile
+                                ? "★ 内核这一轮没答（查询超时：正在启动，或正随隧道收尾）—— " +
+                                  "下面是本地订阅（config.yaml）解析出的配置视图，来自磁盘、" +
+                                  "不代表内核活着。约 3 秒后自动重试，内核答上来这一段自己消失。"
+                                : "★ 内核这一轮没答（查询超时：正在启动，或正随隧道收尾），" +
+                                  "本地也没有可列出的节点定义。约 3 秒后自动重试。")
+                                .Foreground(Theme.SecondaryText)
+                            : TextBlock(snap.FromConfigFile
+                                ? "★ 内核未运行 —— 下面是本地订阅（config.yaml）解析出的配置视图：" +
+                                  "无延迟数据、无活动连接。点节点会记为预设选择，" +
+                                  "下次内核可达（连接或常驻重启）时自动回放生效；不改动内核、也不发起 VPN 连接。"
+                                : "★ 内核未运行，本地也没有可列出的节点定义 —— " +
+                                  "先在「订阅」页拉取订阅（拉取不需要 VPN 连接）。")
+                                .Foreground(Theme.SecondaryText),
                 snap.ConfigNote.Length > 0
                     ? TextBlock(snap.ConfigNote).Foreground(Theme.SecondaryText) : Empty(),
 
@@ -1168,11 +1189,24 @@ namespace ClashUWP.Frontend
                 .FontWeight(new Windows.UI.Text.FontWeight(600));
         }
 
-        /// <summary>运行态三要素。没连上内核时显示"未连接"，不显示成空白或报错堆。</summary>
+        /// <summary>
+        /// 运行态三要素。
+        /// ★【1.0.125】不可用那一档<b>分三条</b>说，不许都写成"未连接"：
+        ///   首轮还没问（<see cref="NotPolledError"/>）、这一轮<b>没答</b>（超时）、
+        ///   确实没在跑（端口关着被瞬时拒绝）—— 只有第三条支持"未连接"这个断言。
+        ///   以前只有两档，拆隧道那几十秒界面上就凭空出现一句"内核：未连接
+        ///   （…TaskCanceledException…）"，下一拍又自己变回来（实物见 Docs/66）。
+        /// ★ 仍然<b>不</b>画成空白或报错堆：原始 <c>Error</c> 只在"确实没在跑"那一档带上，
+        ///   因为那一档它才是原因。
+        /// </summary>
         private static Element KernelStatusPanel(KernelView.Snapshot s)
         {
             if (!s.Ok)
-                return TextBlock($"内核：未连接（{s.Error}）");
+                return TextBlock("内核：" + (s.Error == NotPolledError
+                    ? "正在查询…"
+                    : s.QueryTimedOut
+                        ? "本轮没问到（查询超时，约 3 秒后自动重试）"
+                        : $"未连接（{s.Error}）"));
 
             return VStack(
                 TextBlock($"内核：已连接　mode={s.Mode}　log-level={s.LogLevel}　网卡={s.InterfaceName}"),

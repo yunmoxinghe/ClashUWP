@@ -101,6 +101,12 @@ internal static class Program
         //   要么代价是整机断网 ⇒ 只能在离线钉死。
         ConfigApplyLadderShapes();
 
+        // ★【1.0.125 · 读数诚实性】"内核这一轮没答"与"内核没在跑"的分档判据。
+        //   合成异常就能钉死 —— 它是纯类型判定，不需要真打一次回环。
+        //   这条错了的代价在界面上：拆隧道那几十秒会凭空冒出一句"内核：未连接"，
+        //   下一拍又自己变回去（Docs/66 记了实物）。
+        KernelAnswerShapes();
+
         Console.WriteLine(_fail == 0 ? "ALL OFFLINE TESTS PASSED" : _fail + " FAIL");
         return _fail == 0 ? 0 : 1;
     }
@@ -2155,5 +2161,42 @@ internal static class Program
                 }
         Check("阶梯: 每一格都给出非空理由，且理由里没有标签/尖括号（界面文案契约）",
               whyBad == 0, "不合格的格数=" + whyBad);
+    }
+
+    /// <summary>
+    /// ★【1.0.125 · 读数诚实性】<c>KernelView.IsNoAnswer</c> 的分档：
+    ///   "这一轮没答"（超时/取消）与"问到并被拒绝"必须是两档，界面据此措辞。
+    ///   【为什么这两档必须分开】回环端口<b>关着</b>是瞬时 <c>HttpRequestException</c>，
+    ///   那一句支持"内核未运行"；端口<b>开着而对面不回话</b>（内核正在启动、或正随隧道
+    ///   收尾）是 10 秒超时 ⇒ <c>TaskCanceledException</c>，那一句什么都不能支持。
+    ///   合成异常就够 —— 这条判据只认异常类型，不打网络。
+    /// </summary>
+    private static void KernelAnswerShapes()
+    {
+        Check("内核分档: HttpClient 超时（TaskCanceledException）= 这一轮没答",
+              KernelView.IsNoAnswer(new System.Threading.Tasks.TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout of 10 seconds elapsing")));
+
+        // .NET 5+ 的真实形状：外层 TaskCanceledException，内层才是 TimeoutException。
+        // UI 只看外层类型，所以这条必须和上一条同档（分档判据漏掉内层形状就是谎报）。
+        Check("内核分档: 内层 TimeoutException 的那个形状同档（.NET 超时原话）",
+              KernelView.IsNoAnswer(new System.Threading.Tasks.TaskCanceledException("canceled", new TimeoutException("the operation timed out"))));
+
+        Check("内核分档: 裸 TimeoutException 同档",
+              KernelView.IsNoAnswer(new TimeoutException("the operation timed out")));
+
+        Check("内核分档: 我们自己取消的（OperationCanceledException）也算没答，不算内核没跑",
+              KernelView.IsNoAnswer(new OperationCanceledException("poll stopped")));
+
+        Check("内核分档: 端口关着被拒绝（HttpRequestException）= 问到并确认不可达，不许归进\"没答\"",
+              !KernelView.IsNoAnswer(new System.Net.Http.HttpRequestException(
+                  "No connection could be made because the target machine actively refused it. (127.0.0.1:9090)")));
+
+        Check("内核分档: 内核答了但原文不是 JSON = 另一回事，不许冒充超时那一档",
+              !KernelView.IsNoAnswer(new System.Text.Json.JsonException("invalid JSON")));
+
+        // 默认档必须是"没答=否"：配置视图那条回路径如果默认成 true，
+        // 每个"端口关着"的正常空态都会改口说"本轮没问到"，判据就反过来骗人了。
+        Check("内核分档: Failed 快照的超时位默认 false（默认档不许自称超时）",
+              !KernelView.Snapshot.Failed("x").QueryTimedOut);
     }
 }

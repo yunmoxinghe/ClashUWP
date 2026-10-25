@@ -241,13 +241,29 @@ namespace ClashUWP.Backend.Mihomo
             // ★【1.0.119 · 实时流量】累计字节与内核 RSS（<c>GET /connections</c> 根级三字段）。
             //   默认 <c>default(Traffic)</c> = 三个 0 ⇒ "没有这个数"，配置视图/失败快照都走这里，
             //   UI 不许把 0 画成"流量 0 / 内存 0"（见 <see cref="Traffic"/> 那条）。
-            Traffic Totals = default)
+            Traffic Totals = default,
+            // ★【1.0.125 · 读数诚实性】本轮失败到底是<b>"问不到"</b>（超时/取消）还是
+            //   <b>"问到并被拒绝"</b>。UI 分档措辞的唯一依据就在这个布尔上 ——
+            //   不许再从 <see cref="Error"/> 那段人读文本里嗅异常名（文本一改判据就静默失效）。
+            bool QueryTimedOut = false)
         {
             internal static Snapshot Failed(string error) => new(
                 false, error, "", "", "",
                 System.Array.Empty<Group>(), System.Array.Empty<Conn>(),
                 System.Array.Empty<MihomoController.ProviderInfo>());
         }
+
+        /// <summary>
+        /// ★【1.0.125】这个异常说明的是<b>"这一轮没答"</b>，不是"内核没在跑"。
+        ///   两条路径的实物不同（同一处注释里记着另一条：回环端口<b>关着</b>是<b>瞬时拒绝</b>）：
+        ///   · 端口关着 ⇒ 立刻 <c>HttpRequestException</c> ⇒ 这一句支持"内核没在跑"；
+        ///   · 端口开着而对面不回话（内核正在启动、或正随隧道收尾）⇒ 10 s 超时
+        ///     ⇒ <c>TaskCanceledException</c>（内部常是 <c>TimeoutException</c>）⇒ 什么都不知道。
+        ///   把后者画成"未连接"是替内核撒一句谎 —— 拆隧道那几十秒界面上会先"断开"再"回来"，
+        ///   而用户正是照着这一行判断内核活着没有（实物见 Docs/66）。
+        /// </summary>
+        internal static bool IsNoAnswer(Exception ex) =>
+            ex is TaskCanceledException or OperationCanceledException or TimeoutException;
 
         /// <summary>
         /// 一次拉全：运行态三要素 + 可切换组 + 活动连接。
@@ -259,6 +275,8 @@ namespace ClashUWP.Backend.Mihomo
             var groups = new List<Group>();
             var conns = new List<Conn>();
             string error = "";
+            // ★【1.0.125】本轮是不是"没答"（见 <see cref="IsNoAnswer"/>）—— 与 error 一起决定 UI 的措辞档。
+            bool noAnswer = false;
 
             // ① 运行态三要素：GET /configs
             try
@@ -274,6 +292,7 @@ namespace ClashUWP.Backend.Mihomo
             catch (Exception ex)
             {
                 error = $"读 /configs 失败: {ex.GetType().Name}: {ex.Message}";
+                noAnswer = IsNoAnswer(ex);
             }
 
             // ② 可切换组：GET /proxies
@@ -290,6 +309,7 @@ namespace ClashUWP.Backend.Mihomo
                 catch (Exception ex)
                 {
                     error = $"读 /proxies 失败: {ex.GetType().Name}: {ex.Message}";
+                    noAnswer = IsNoAnswer(ex);
                 }
             }
 
@@ -312,6 +332,7 @@ namespace ClashUWP.Backend.Mihomo
                 catch (Exception ex)
                 {
                     error = $"读 /connections 失败: {ex.GetType().Name}: {ex.Message}";
+                    noAnswer = IsNoAnswer(ex);
                 }
             }
 
@@ -340,7 +361,7 @@ namespace ClashUWP.Backend.Mihomo
                 return new Snapshot(false, error, "", "", "", cv.Groups,
                     System.Array.Empty<Conn>(),
                     System.Array.Empty<MihomoController.ProviderInfo>(),
-                    cv.Found, cv.Found ? cv.Note : cv.Error);
+                    cv.Found, cv.Found ? cv.Note : cv.Error, QueryTimedOut: noAnswer);
             }
 
             return new Snapshot(true, error, mode, level, iface, groups, conns, providers,
