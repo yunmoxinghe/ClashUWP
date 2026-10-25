@@ -26,7 +26,7 @@ namespace ClashUWP.Vpn
     ///   所以探到的一定是<b>隧道</b>而不是物理网卡。连续两轮全失败才判死，抗抖动。
     ///   ★ 前提：<c>dnsInTunnel=1</c>。若 <c>dnsInTunnel=0</c> 且 <c>includeMode=narrow</c>，
     ///   这些 IP 走物理网卡，探它们量不到隧道 —— 这种组合下本判据<b>主动弃权</b>
-    ///   （写 <c>probe=弃权(...)</c> 明说），只留重拨保险丝和硬上限，绝不假装看得见。
+    ///   （写 <c>probe=弃权(...)</c> 明说），只留重拨保险丝，绝不假装看得见。
     ///   ★★ 这条判据单独用<b>不够</b>，见下面判据二（run 31 实测到的盲区）。
     ///
     /// 【判据二 · 整机口径的 fake-ip（1.0.17 新增，run 31 逼出来的）】
@@ -62,8 +62,8 @@ namespace ClashUWP.Vpn
     ///   数到 &gt;1 次就说明平台在自发重拨；允许自愈 1 次（实测 828 后平台立刻重拨，
     ///   第二段会话反而稳定），再多一次就是"97 s 一拆一拨"的风暴形状，立刻拆干净。
     ///
-    /// 【判据五 · 硬上限】无条件兜底 30 分钟。前几条都依赖判据本身可信，
-    ///   一旦探针有 bug，整机的网络会被长期占住 —— 到点必断，不依赖任何判断。
+    /// 【无固定时长上限】健康会话不因运行时间被拆。探针异常、异常重拨和整机物理
+    ///   网络兜底仍会触发收尾；不再使用无条件 30 分钟终止。
     ///
     /// 【触发之后做什么】只走 <see cref="GracefulTeardown"/>：平台级断开 →
     ///   <b>等会话确认收干净</b> → 才删 profile → 残留自检。
@@ -75,23 +75,12 @@ namespace ClashUWP.Vpn
     internal static class SessionWatchdog
     {
         private const int IntervalSeconds = 10;
-        private const int MaxConsecutiveFailures = 2;
-        private const int HardCapSeconds = 1800;
-        private const int MaxUnmanagedRedials = 1;
         private const int ProbeTimeoutMs = 3000;
         private const int DnsTimeoutMs = 4000;
         private const int ControllerTimeoutSeconds = 4;
 
         /// <summary>fake-ip 探针查的域名：境外、且订阅的 fake-ip 规则一定命中它。</summary>
         private const string FakeIpProbeName = "www.google.com";
-
-        /// <summary>
-        /// 判据二的<b>宽限期</b>（秒）：会话开始前 30 s 内不因 fake-ip 缺失判死。
-        /// 平台是在连接结果提交时才把 DNS 策略/路由装好的，头两轮完全可能量到"还没生效"，
-        /// 而误拆一条本来会好的隧道，代价是用户白掉线 + 一次实验作废。
-        /// 真故障的形状（run 31）出现在 t+234 s，30 s 宽限不影响抓它。
-        /// </summary>
-        private const int FakeIpSettleSeconds = 30;
 
         private static CancellationTokenSource? _cts;
         /// <summary>只允许一次触发的门闩（0=未触发，1=已触发）。</summary>
@@ -215,28 +204,9 @@ namespace ClashUWP.Vpn
                 await WriteSnapshotAsync(
                     $"last={DateTime.Now:yyyy-MM-dd HH:mm:ss} {round}\r\n");
 
-                if (unmanaged > MaxUnmanagedRedials)
-                {
-                    trip = $"{unmanaged} 次非本次发起的 connect（阈值 {MaxUnmanagedRedials}）→ 平台在自动重拨";
-                    break;
-                }
-                if (failures >= MaxConsecutiveFailures)
-                {
-                    trip = $"连续 {failures} 轮隧道内 DNS 不可达 → 隧道黑洞";
-                    break;
-                }
-                if (dnsFailures >= MaxConsecutiveFailures && alive > FakeIpSettleSeconds)
-                {
-                    // ★ 这条就是 run 31 里"整机已经没了、判据一却一路绿灯"的那道补眼。
-                    trip = $"连续 {dnsFailures} 轮系统解析不再返回 fake-ip（最后一轮 {fakeNote}）" +
-                           $"→ 隧道的 DNS 侧已断，宿主应用不再经隧道，判死";
-                    break;
-                }
-                if (alive > HardCapSeconds)
-                {
-                    trip = $"到达硬上限 {HardCapSeconds}s（无条件兜底）";
-                    break;
-                }
+                trip = SessionWatchdogPolicy.EvaluateTrip(
+                    alive, failures, dnsFailures, unmanaged, fakeNote);
+                if (trip != null) break;
             }
 
             if (trip == null) return;

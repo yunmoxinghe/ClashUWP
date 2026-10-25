@@ -187,8 +187,18 @@ namespace ClashUWP.Vpn
         /// ★【1.0.70 · G7】本次 IPv6 下发的实际形态（臂号 / 地址 / 路由 / 内核侧 env），写快照用。
         /// arm=0 时逐字说明"未下发"，与 1.0.69 的行为对齐 —— 这一列存在本身就是
         /// "这次连接到底动没动 v6"的唯一档案。
+        /// ★【1.0.119】arm=0 还要带 <see cref="RouteInclusion.LeakNote"/>：
+        ///   "没动 v6"在本机有全局 v6 的网络里等于"v6 全部绕过隧道"，
+        ///   这句话以前要靠读代码才知道，现在直接写在档案里。
         /// </summary>
         private string _ipv6Diag = "arm=0 未下发";
+
+        /// <summary>
+        /// ★【1.0.119 · G7】本次 <see cref="BuildRoutes"/> 算出的路由表摘要（四桶计数 + 剔除条数）。
+        /// 判据本体在 <see cref="RouteInclusion"/>；这一列进快照，是为了让"当时到底装了哪些路由"
+        /// 和 <c>_ipv6Diag</c> 一样能被事后读出来 —— 装错族别这类问题只在日志里有痕迹才查得动。
+        /// </summary>
+        private string _routePlanNote = "未构建";
 
         /// <summary>
         /// ★【1.0.35 · G9】本次连接的应用分流注入结果（<see cref="KernelConfig.Transform"/> 回来的那句）。
@@ -805,7 +815,16 @@ namespace ClashUWP.Vpn
                 }
                 else
                 {
-                    _ipv6Diag = "arm=0 未下发";
+                    // ★【1.0.119 · G7】arm=0 不再只写"未下发"：这一档在本机有全局 v6 时
+                    //   等价于"v6 全部绕过隧道"，这条缺口以前是藏着的。
+                    //   只如实播报，不偷偷抬档（抬档要拨号验证，见 LocalSettings.Ipv6 的口径）。
+                    RouteInclusion.V6Face face = NetworkFollow.InspectLocalV6Face(out string v6detail);
+                    _ipv6Diag = $"arm=0 未下发｜{RouteInclusion.LeakNote(0, face)}｜{v6detail}";
+                    if (face == RouteInclusion.V6Face.Global)
+                    {
+                        RollingLog.Warn("ipv6", $"泄漏面存在：{v6detail}；ipv6=0 ⇒ v6 出站不进隧道（要堵 settings.txt ipv6=1）");
+                        LogSession($"evt=v6leak face=global detail={v6detail}");
+                    }
                 }
 
                 // ★★ 先遣项目实测出的两条硬约束，两条都压在旧实现身上（docs/76）：
@@ -931,7 +950,7 @@ namespace ClashUWP.Vpn
                 //   失败不阻断连接 —— Encapsulate 会回落假内核 echo，方便单独定位问题。
                 StartMihomoBridge(channel, mihomoConfig, mihomoConfigPath);
 
-                // 步 8 · ★ 武装插件进程内的看门狗（判黑洞 / 数重拨 / 硬上限）。
+                // 步 8 · ★ 武装插件进程内的看门狗（判黑洞 / 数重拨；无固定时长上限）。
                 //   必须在 Start 成功之后：之前隧道还不存在，探什么都是误判。
                 //   放在桥之后：桥的 failFast 若已经决定放弃这次连接，看门狗不该再插一脚
                 //   —— 它第一件事就是检查开关，开关关着（或桥失败路径已断开）就不会动手。
@@ -2152,7 +2171,11 @@ namespace ClashUWP.Vpn
                 // ★【1.0.70 · G7】IPv6 三档的现场：臂号 / 接口地址 / v6 路由 / fake-ip v6 池。
                 //   arm=0 的"未下发"必须逐字可见 —— 它是"这次连接与 1.0.69 完全一致"的凭据。
                 $"Ipv6={_ipv6Diag}\r\n" +
-                $"NodeExclusions={(_nodeExclusions.Count)} switch={(LocalSettings.NodeExclusions ? "on" : "off")} /32\r\n" +
+                // ★【1.0.119 · G7】路由表四桶的实际形状（判据本体 RouteInclusion，离线单测钉住）。
+                //   v6 排除路由以前根本不存在，装错族别也只体现在"某个节点连不上"，
+                //   这一行把四桶计数 + 被剔除条数固化成会话档案，取证时不用猜。
+                $"Routes={_routePlanNote}\r\n" +
+                $"NodeExclusions={(_nodeExclusions.Count)} switch={(LocalSettings.NodeExclusions ? "on" : "off")} 宿主路由(v4/32·v6/128)\r\n" +
                 $"SelfSplitTunnel={_selfSplitFilterInfo}\r\n" +
                 // ★【1.0.35 · G9/G5】两行新证据。G9 最容易失败的形态是"名单存下了、
                 //   内核配置里却没有那几行"（rules 块缺失/行内写法/fakeIp 总闸关闭三种静默路径），
@@ -3325,7 +3348,7 @@ namespace ClashUWP.Vpn
             //   【为什么】28-A 实测隧道期间 <c>www.baidu.com</c> 恒为 <c>000</c>、
             //   断开立刻 <c>200/0.097 s</c> —— 域名解析出的<b>真</b>国内 IP 撞上
             //   <c>0.0.0.0/0</c> 进隧道，内核按 GEOIP,CN,DIRECT 想直连出去，出站又被
-            //   同一条默认路由抓回来（自环），TCP 直接超时。节点 IP 有 /32 排除，
+            //   同一条默认路由抓回来（自环），TCP 直接超时。节点 IP 有宿主路由排除，
             //   而"所有国内 IP"是不可能穷举排除的集合 —— 只能反过来收窄 include。
             //   fake-ip 形态下要进隧道的本来就只有两类目的地：
             //     ① 假 IP 池 <see cref="KernelConfig.FakeIpRoute"/>（域名流量的唯一形态）
@@ -3333,55 +3356,51 @@ namespace ClashUWP.Vpn
             //   其余（国内真 IP、局域网、联网探测）留在物理网卡上，DIRECT 才是真的 DIRECT。
             //   默认仍是 wide（0.0.0.0/0）：28-A 的头条判据是在 wide 下量到的，
             //   narrow 必须先做单变量 A/B，双向可切才允许换成默认。
-            IEnumerable<string> inclusion = LocalSettings.IncludeMode.Equals(
-                "narrow", StringComparison.OrdinalIgnoreCase)
-                ? NarrowInclusionRoutes()
-                : _config.IncludeRoutes;
-
-            foreach (string cidr in inclusion)
-            {
-                if (TryParseCidr(cidr, out string? address, out byte prefix))
-                    assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName(address), prefix));
-            }
-
-            // ★【1.0.70 · G7】v6 进隧道路由 —— arm 0 时清单为空，一个 VpnRoute 都不加，
-            //   行为与 1.0.69 逐字一致。路由与 <c>assignedClientIPv6list</c> 必须成对：
-            //   没有 v6 地址的接口装不上 v6 路由，只有地址没有路由则流量照旧从物理网卡旁路。
-            foreach (string cidr in Ipv6InclusionRoutes())
-            {
-                if (TryParseCidr(cidr, out string? address, out byte prefix))
-                    assignment.Ipv6InclusionRoutes.Add(new VpnRoute(new HostName(address), prefix));
-            }
-
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string cidr in _config.ExcludeRoutes)
-            {
-                if (TryParseCidr(cidr, out string? address, out byte prefix) && seen.Add(cidr))
-                    assignment.Ipv4ExclusionRoutes.Add(new VpnRoute(new HostName(address), prefix));
-            }
-
-            // ★ 节点服务器 IP 的 /32 排除 —— 安卓版 VpnService.protect() 在本平台的等价物。
-            //   安卓靠 OS 原语把内核每条出站 socket 顶到物理网卡；Windows VPN 插件没有
-            //   per-socket protect，只剩路由表这一层：更特定的路由优先，于是拨号包在路由
-            //   层面就不可能被自己的隧道抓回去。这条防线不依赖 BoundIface，换网卡也不失效。
             //
-            //   ⚠️ 但 2026-10-16 run 14 实测：这批 /32 被平台装到了
-            //   **Loopback Pseudo-Interface 1（ifIdx=1）**，而不是物理网卡 ——
-            //   节点 IP 的路由比隧道的 0.0.0.0/0 更特定，于是拨号包进环回，
-            //   run 13 内核原文就是 <c>connectex: unreachable host</c>。
-            //   <c>VpnRoute</c> 只有 Address/PrefixSize，没有 NextHop/Metric，
-            //   所以「给排除路由指网关」这条路在 API 层面不存在。
-            //   这里留 settings.txt 开关做单变量：nodeExclusions=0 时一条都不下发，
-            //   把「排除路由有害」和「ServerUris=127.0.0.1 导致装错接口」两个假设分开。
-            if (LocalSettings.NodeExclusions)
-            {
-                foreach (string cidr in _nodeExclusions)
-                {
-                    if (TryParseCidr(cidr, out string? address, out byte prefix) &&
-                        address!.IndexOf(':') < 0 && seen.Add(cidr))
-                        assignment.Ipv4ExclusionRoutes.Add(new VpnRoute(new HostName(address), prefix));
-                }
-            }
+            // ★【1.0.119 · G7】四个桶（v4/v6 × include/exclude）怎么分配、什么被剔掉，
+            //   整段判断搬到 <see cref="RouteInclusion"/> 并进了离线单测。搬走的直接原因是
+            //   两条族别错配：<b>v6 节点服务器的排除路由此前整条缺失</b>（旧循环只喂
+            //   <c>Ipv4ExclusionRoutes</c>，并把带冒号的地址一律跳过；而
+            //   <c>NodeRoutes</c> 又给 v6 拼了个 v4 的 <c>/32</c>）——
+            //   <c>ipv6=1</c> 下发 <c>2000::/3</c> 之后，拨向 v6 节点的外层包正好落进
+            //   自家 include，没有任何排除路由兜它，形态就是自环黑洞。
+            //   另一条：profile 里若带 v6 排除段，旧循环会把它塞进 <b>v4</b> 桶。
+            //
+            //   ★ 节点排除路由这条防线本身仍带着 2026-10-16 run 14 的旧伤：那批 /32 被平台
+            //     装到了 **Loopback Pseudo-Interface 1（ifIdx=1）**而不是物理网卡，于是拨号包
+            //     进环回（Docs/08 的定论：平台按"这个 transport socket 会走哪条路"决定
+            //     排除路由装在哪个接口）。所以 <c>nodeExclusions=0</c> 这个单变量开关保留，
+            //     摘掉时 v6 桶也一起空 —— 本次改动只纠正<b>族别与前缀长度</b>，不改这条开关语义。
+            RouteInclusion.Plan plan = RouteInclusion.Build(new RouteInclusion.Input(
+                _config.IncludeRoutes,
+                NarrowInclusionRoutes(),
+                LocalSettings.IncludeMode.Equals("narrow", StringComparison.OrdinalIgnoreCase),
+                LocalSettings.Ipv6,
+                _ipv6PoolEffective,
+                _config.ExcludeRoutes,
+                _nodeExclusions,
+                LocalSettings.NodeExclusions));
+            _routePlanNote = plan.Describe();
+
+            foreach (string cidr in plan.Ipv4Includes)
+                if (RouteInclusion.SplitCidr(cidr, out string? a, out int p, out _))
+                    assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName(a!), (byte)p));
+            foreach (string cidr in plan.Ipv6Includes)
+                if (RouteInclusion.SplitCidr(cidr, out string? a, out int p, out _))
+                    assignment.Ipv6InclusionRoutes.Add(new VpnRoute(new HostName(a!), (byte)p));
+            foreach (string cidr in plan.Ipv4Excludes)
+                if (RouteInclusion.SplitCidr(cidr, out string? a, out int p, out _))
+                    assignment.Ipv4ExclusionRoutes.Add(new VpnRoute(new HostName(a!), (byte)p));
+            foreach (string cidr in plan.Ipv6Excludes)
+                if (RouteInclusion.SplitCidr(cidr, out string? a, out int p, out _))
+                    assignment.Ipv6ExclusionRoutes.Add(new VpnRoute(new HostName(a!), (byte)p));
+
+            // 被剔掉的项必须出声：这些是"我看了但没照做"的决定，装完机只靠快照反推最费时间。
+            foreach (string d in plan.Dropped)
+                RollingLog.Warn("routes", d);
+            RollingLog.Info("routes",
+                $"arm={LocalSettings.Ipv6} nodeExcl开关={(LocalSettings.NodeExclusions ? 1 : 0)} {_routePlanNote} " +
+                $"剔除={plan.Dropped.Count}");
 
             // 防自环的第二道防线仍在桥侧（dialer.DefaultInterface → Windows IP_UNICAST_IF
             //   强制绑定物理网卡，等价于用户方案的「StreamSocket 绑网卡」）。
@@ -3394,28 +3413,17 @@ namespace ClashUWP.Vpn
         }
 
         /// <summary>
-        /// ★【1.0.70 · G7】v6 进隧道路由清单。arm 0 → 空（一条都不下发）。
+        /// ★【1.0.70 · G7】v6 进隧道路由清单 —— 判据本体在 <see cref="RouteInclusion.Ipv6IncludeRoutes"/>
+        /// （离线单测钉住三档形状与"绝不出现 <c>::/0</c>"）。这里只是把快照/诊断那几行接回同一份口径，
+        /// 保证<b>日志说的</b>和 <c>BuildRoutes</c><b>装出去的</b>是同一张表。
         ///
         /// 【为什么是 2000::/3 而不是 ::/0】先遣项目 docs/96 的四臂实测：
         ///   <c>::/0</c> 一旦下发，IPv6 就成为<b>真正的默认路由</b>，连 IPv4 的出站选择
         ///   都被它抢走（4/4 臂把 VPN 变成 v4 默认路由）；<c>2000::/3</c> 是全局单播的
         ///   覆盖段，能兜住全部公网 v6 地址而不碰 ::/0 的语义，3/3 臂通过。
-        ///
-        /// 【arm 2 为什么还要加池前缀】fake-ip v6 池默认 <c>fdfe:dcba:9876::/64</c> 是
-        ///   ULA（fc00::/7），不在 <c>2000::/3</c> 里；不单独下发，域名解析出的假 v6
-        ///   地址就会走物理网卡 —— fake-ip 在 v6 上等于白做。池前缀由
-        ///   <see cref="LocalSettings.TryNormalizeV6Prefix"/> 消毒过（只接受 ULA /48–/64）。
         /// </summary>
-        private List<string> Ipv6InclusionRoutes()
-        {
-            var list = new List<string>();
-            if (LocalSettings.Ipv6 < 1)
-                return list;
-            list.Add("2000::/3");
-            if (LocalSettings.Ipv6 >= 2)
-                list.Add(_ipv6PoolEffective);
-            return list;
-        }
+        private List<string> Ipv6InclusionRoutes() =>
+            RouteInclusion.Ipv6IncludeRoutes(LocalSettings.Ipv6, _ipv6PoolEffective);
 
         /// <summary>
         /// 窄 include 的目的地清单（配合 <see cref="BuildRoutes"/> 里的说明）：
@@ -3423,7 +3431,7 @@ namespace ClashUWP.Vpn
         /// DNS 那几条只在 <c>dnsInTunnel=1</c> 时才加 —— 不然隧道里没有 DNS 可去，
         /// 加了反而平白多抓两段直连 DNS 流量。
         /// </summary>
-        private IEnumerable<string> NarrowInclusionRoutes()
+        private List<string> NarrowInclusionRoutes()
         {
             // ★【1.0.40】池子可被 dns-config.txt: fake-ip-range 改，路由必须跟着走。
             //   只改 YAML 不改这里 = 新池的域名流量根本不进隧道（比黑洞更糟的"以为在代理其实直连"）。
@@ -3552,21 +3560,6 @@ namespace ClashUWP.Vpn
                 // 少一个优化远好过整条连接失败。
                 return null;
             }
-        }
-
-        private static bool TryParseCidr(string cidr, out string? address, out byte prefix)
-        {
-            address = null;
-            prefix = 0;
-
-            string[] parts = cidr.Split('/');
-            if (parts.Length != 2)
-                return false;
-            if (!byte.TryParse(parts[1], out prefix))
-                return false;
-
-            address = parts[0];
-            return true;
         }
     }
 }

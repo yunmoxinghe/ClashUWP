@@ -49,7 +49,7 @@ namespace ClashUWP.Vpn
     ///     ★ 这两组<b>尚未在本机直连下实测</b>，装机的验收判据之一就是读回它们的结果，
     ///       读不到的那一条下次订正（不凭记忆当已验）。
     ///   · OR 语义下多一个候选只会<b>减少</b>误杀，增加的是漏判风险，
-    ///     而漏判还有主健康哨兵（隧道黑洞判据）与 <c>hardCapSeconds</c> 无条件兜底接着。
+    ///     而漏判还有主健康哨兵（隧道黑洞与异常重拨判据）接着。
     /// </summary>
     internal static class PhysicalNetworkProbe
     {

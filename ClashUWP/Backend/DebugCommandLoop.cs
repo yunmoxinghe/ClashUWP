@@ -63,8 +63,8 @@ namespace ClashUWP.Backend
                     return await MihomoController.RunStatusAsync();
                 // ★ 三个会话动作一律走 VpnSession：武装/解除健康哨兵固定在
                 //   VpnSession 里做，不再靠这条回路自己记得。顺序与原来一致：
-                //   connect 先武装再连（即使连接卡死/异常，哨兵硬上限到点必断，
-                //   网络绝不会被长期占死），disconnect 先解除哨兵再断。
+                //   connect 先武装再连（拨号悬挂由非终态出口处理；Connected 后不再按固定
+                //   时长强拆），disconnect 先解除哨兵再断。
                 case var c when c == "connect" || c.StartsWith("connect "):
                     // ★ connect [订阅id]：不带参 = 连基础 profile；带参 = 连该订阅专属的系统 profile，
                     //   即「在快速设置里点那条订阅」的自动化等价物（同一平台路径，见 VpnSession.ConnectAsync）。

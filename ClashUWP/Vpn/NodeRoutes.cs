@@ -88,8 +88,10 @@ namespace ClashUWP.Vpn
                 {
                     foreach (string ip in ips)
                     {
+                        // ★ 前缀按地址族取：这批候选里可能出现 v6 节点地址，统一拼 /32
+                        //   对 v6 是错的（宿主路由在 v6 上是 /128），消费方见 RouteInclusion.Build。
                         if (seen.Add(ip))
-                            cidrs.Add(ip + "/32");
+                            cidrs.Add(RouteInclusion.HostRoute(ip));
                         if (cidrs.Count >= MaxExclusionRoutes)
                             return cidrs;
                     }
