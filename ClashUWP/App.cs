@@ -47,8 +47,11 @@ namespace ClashUWP
             // ★【1.0.53】协议激活订阅<b>不在这里做</b>（1.0.53/1.0.54 实测过两次都不行）：
             //   · 在 Main 里订阅 <c>CoreApplication.GetCurrentView().Activated</c>
             //     ⇒ <c>COMException: 找不到元素</c>（view 还没建，Main 太早）；
-            //   · 写 <c>protected override void OnActivated</c> ⇒ <b>一次都没被调用</b>
-            //     （Reactor 基类没接激活分发）。
+            //   · 写 <c>protected override void OnActivated</c> ⇒ 当时观察到"一次都没被调用"。
+            //     ★【1.0.123 装机订正】这句只在「当时那两次实验」里成立：热激活（前台进程已活着）
+            //     时它确实被调到，而且与下面 ① 那条自订 hook <b>各喂一遍</b>
+            //     ⇒ 同一次协议激活被处理两次（一手日志在 Docs/63 §七 第 5 条）。
+            //     成因（Reactor 何时接上分发）没查，也不影响本条结论：两条都在，去重归 HandleActivation。
             //   ⇒ 改到 <see cref="OnLaunched"/> 里、<c>base.OnLaunched()</c> 之后：
             //     那时 Reactor 已经建好 Window.Current 并 Activate，view 一定就位。
             //     而协议激活"冷启动"时平台<b>先</b>派发 Activated 再走 Launched 的可能性，
@@ -293,11 +296,18 @@ namespace ClashUWP
         /// <summary>
         /// ★【1.0.53】协议激活 —— 浏览器"一键导入 Clash 订阅"的落点。
         ///
-        /// 【★ 调用路径（1.0.53~1.0.54 实测后定稿）】
-        ///   ① <c>CoreApplicationView.Activated</c>（<see cref="OnLaunched"/> 里订阅）——
-        ///      <b>真正会触发的那条</b>。Reactor 基类没覆盖 OnActivated 也不订阅任何激活事件，
-        ///      所以协议事件在它那条启动路径上原本没有分发出口；
-        ///   ② 本 <c>OnActivated</c> override —— 万一将来 Reactor 补上分发，这条就是兜底。
+        /// 【★ 调用路径（1.0.53~1.0.54 定稿 → 1.0.123 装机订正）】
+        ///   ① <c>CoreApplicationView.Activated</c>（<see cref="OnLaunched"/> 里订阅）；
+        ///   ② 本 <c>OnActivated</c> override（Reactor 分发的那条）。
+        ///   ★★【1.0.123 实物】"只有 ① 会触发、② 是万一将来补上分发的兜底"这句是错的：
+        ///     <b>冷启动</b>只有 ②（① 要到 OnLaunched 里才装上，而补建 OnLaunched 正是 ② 触发的）；
+        ///     <b>热激活</b>（前台进程已活着）② 与 ① <b>两条都触发</b> ⇒ 同一次激活被喂两遍，
+        ///     日志里逐字可见两行 <c>session 用户发起断开</c>。取证链见 Docs/63 §七 第 5 条。
+        ///     两遍都是<b>真执行</b>（断开幂等才让后果看起来良性；若是"拉取并启用"那一支，
+        ///     就是同一订阅连发两次请求）。★【1.0.124】收口在 <see cref="HandleActivation"/>
+        ///     开头的 <see cref="IsSecondDelivery"/>：同一条 URI 在 2 s 内第二次到达就跳过，
+        ///     两条分发都保留当投递保险（少一条就回到"通知点了没反应"那一类无声失效）。
+        ///     装机判据：一次点击 = 一行 <c>通知激活动作</c> + 一行 <c>第二次到达，跳过</c>。
         ///   两条都汇到 <see cref="HandleActivation"/>，逻辑只有一份。
         ///
         /// 【触发形态】清单里注册了两条协议（见 Package.appxmanifest 的 Extensions）：
@@ -314,44 +324,25 @@ namespace ClashUWP
         ///   ⇒ 这里只做三件安全的事：解析 → 记日志 → 把 URL 填进 UI 的输入框。
         ///     <b>必须用户亲手点「拉取并启用」才真正发请求</b>。
         ///
-        /// ★【1.0.81 · 新增】Toast 通知激活 —— 点击状态通知时打开/激活主窗口。
-        ///   通知 XML 里 <c>launch="action=viewMainWindow"</c>，这里识别后调
-        ///   <see cref="ActivateMainWindow"/> 把窗口带到前台。
+        /// ★【1.0.122 订正】通知的点击<b>不</b>走这个 override：状态通知由插件宿主引发，
+        ///   落在 <c>…!VpnHost</c> 那个无头入口上，1.0.81 那段 <c>action=viewMainWindow</c>
+        ///   分支从头到尾没被执行过（装机取证链在 Docs/63 §一）。现在通知的正文与按钮都写
+        ///   <c>activationType='protocol'</c>，点击以 <c>clashuwp://open</c> /
+        ///   <c>clashuwp://disconnect?n=…</c> 的<b>协议激活</b>回来 —— 那正好是本应用唯一
+        ///   被装机证明会触发的分发（<c>CoreApplicationView.Activated</c>），
+        ///   所以处理逻辑放在 <see cref="HandleActivation"/> 里，不再留第二份。
         /// </summary>
         protected override void OnActivated(IActivatedEventArgs args)
         {
-            // ★【1.0.81】先检查是不是 Toast 激活（要在 HandleActivation 之前判断）
-            if (args is Windows.ApplicationModel.Activation.ToastNotificationActivatedEventArgs toastArgs)
-            {
-                string arguments = toastArgs.Argument ?? "";
-                RollingLog.Info("toast", $"Toast 激活 argument={arguments}");
-
-                if (arguments.Contains("action=viewMainWindow"))
-                {
-                    // 点击通知主体：打开/激活主窗口
-                    ActivateMainWindow();
-                    return;
-                }
-
-                if (arguments.Contains("action=disconnect"))
-                {
-                    // 点击"断开连接"按钮：触发断开逻辑
-                    RollingLog.Info("toast", "用户通过通知点击断开连接");
-                    TriggerDisconnectFromToast();
-                    return;
-                }
-
-                // 其它 toast 参数原样忽略
-                RollingLog.Info("toast", "未知 toast 激活参数，忽略");
-                return;
-            }
-
+            // ② 这条在冷启动是唯一会被触发的分发，热启动时与 ① 各喂一遍；
+            // 去重不在这里做（那样 ① 那条路就绕过了闸），统一收在 HandleActivation 开头。
             HandleActivation(args);
         }
 
         /// <summary>
         /// 激活事件的实际处理。★ <see cref="OnActivated"/> 与 <c>CoreApplication.Activated</c>
-        /// 两条路都汇到这里，保证逻辑只有一份。
+        /// 两条路都汇到这里，保证逻辑只有一份；★ 热激活时两条各进来一次，
+        /// 同一次激活的第二遍由 <see cref="IsSecondDelivery"/> 在这一处收掉。
         /// ★ 只处理协议激活，别的 kind（文件/分享/toast）原样忽略 —— 本项目不声明那些扩展。
         /// </summary>
         private void HandleActivation(object args)
@@ -437,6 +428,30 @@ namespace ClashUWP
             string raw = protocol.Uri?.AbsoluteUri ?? "";
             RollingLog.Info("protocol", $"收到激活 uri={raw}");
 
+            // ★【1.0.124】同一次激活会被喂两遍 —— 1.0.123 装机一手（Docs/63 §七 第 5 条）：
+            //   热激活时 <see cref="OnActivated"/> 与自订的 <c>CoreApplicationView.Activated</c>
+            //   各进来一次，一次点击落下两行 <c>session 用户发起断开</c>、一遍 <c>断开=Ok</c>
+            //   加一遍 <c>断开=NoConnection</c>。后果实测良性（断开幂等），但"有网络后果的动作
+            //   被执行两遍"不该留着 ⇒ 按 URI 收口成一次。
+            //   窗口取 2 s 而不是"只认同一对象"：两条入口递来的 args 是两个不同的投影实例，
+            //   比引用相等结构上永远不成立；而真连着点两下间隔得开 2 s，被吞掉的那次动作本来也幂等。
+            //   跳过照旧记一行 —— 装机数"用户动了几次"要按去重后的行数看（见 Docs/63 §六 第 4/5 行）。
+            if (IsSecondDelivery(raw))
+            {
+                RollingLog.Info("protocol", "同一次激活的第二次到达，跳过");
+                return;
+            }
+
+            // ★★【1.0.122】通知点击回来的也是协议激活，但它<b>不是</b>订阅导入。
+            //   必须在 TryParse 之前分流：TryParse 看见 clashuwp:// 这种它不认识的
+            //   scheme 会回"不认识的协议"，于是整条点击被记成一次解析失败、窗口也不动。
+            var act = SubscriptionProtocol.TryParseAppAction(raw);
+            if (act != null)
+            {
+                HandleAppAction(act.Value);
+                return;
+            }
+
             SubscriptionProtocol.Result r = SubscriptionProtocol.TryParse(raw);
             if (!r.Ok)
             {
@@ -449,6 +464,23 @@ namespace ClashUWP
             //   协议激活可能跑在与组件渲染不同的时机（甚至首次渲染之前）。
             System.Threading.Volatile.Write(ref PendingSubscriptionUrl, r.Url);
         }
+
+        /// <summary>
+        /// 同一次协议激活的第二次到达（两条入口各喂一遍，判据见 <see cref="HandleActivation"/>）。
+        /// 只在"同一个 URI 且 2 秒内"时算重复；两条入口都在主线程派发，不需要再加锁。
+        /// </summary>
+        private static bool IsSecondDelivery(string uri)
+        {
+            long now = Environment.TickCount64;
+            bool duplicate = uri == _lastActivationUri && now - _lastActivationTick < ActivationDedupeMs;
+            _lastActivationUri = uri;
+            _lastActivationTick = now;
+            return duplicate;
+        }
+
+        private static string _lastActivationUri = "";
+        private static long _lastActivationTick;
+        private const long ActivationDedupeMs = 2000;
 
         /// <summary>
         /// 最近一次协议激活带入的订阅 URL（空串 = 没有待处理的）。
@@ -497,20 +529,37 @@ namespace ClashUWP
         }
 
         /// <summary>
-        /// ★【1.0.81】从 Toast 按钮触发断开连接。
-        /// 通过 VpnSession.DisconnectAsync 发起断开。
+        /// ★【1.0.122】通知（正文或「断开连接」按钮）点击的动作分发。
+        /// 两条都把窗口带到前台 —— 正文点击的<b>全部</b>意义就是"唤起前台 UI"，
+        /// 按钮点击还得让断开这件事在前台进程里发生（插件宿主里没有断开的发起权）。
         /// </summary>
-        private static async void TriggerDisconnectFromToast()
+        private void HandleAppAction(SubscriptionProtocol.AppAction act)
         {
+            RollingLog.Info("toast", $"通知激活动作 action={act.Name} nonce={(act.Nonce.Length > 0 ? "有" : "无")}");
+            ActivateMainWindow();
+            if (act.IsDisconnect) _ = DisconnectFromActivationAsync(act.Nonce);
+        }
+
+        /// <summary>
+        /// 从通知按钮发起断开。
+        /// ★★ 先验 nonce 再动手：<c>clashuwp://</c> 是外部可触发的协议，
+        ///   任何网页里一个链接都能把这条动作送进来，而"断开 VPN"是有网络后果的动作。
+        ///   nonce 由插件宿主的 <see cref="StatusToast"/> 每次会话生成、写进
+        ///   <c>LocalState\toast-nonce.txt</c> 并嵌进行动按钮的 arguments，
+        ///   对不上就当伪造处理（<see cref="StatusToast.MatchesNonceAsync"/> 内部记 Why，
+        ///   ★ 默认必须是"不放行"—— 读不到文件也判不匹配）。
+        /// </summary>
+        private static async Task DisconnectFromActivationAsync(string nonce)
+        {
+            if (!await StatusToast.MatchesNonceAsync(nonce)) return;
             try
             {
-                // 调用 VpnSession.DisconnectAsync（后台线程，fire-and-forget）
                 var result = await ClashUWP.Backend.VpnSession.DisconnectAsync();
-                RollingLog.Info("toast", $"Toast 断开连接结果: {result}");
+                RollingLog.Info("toast", $"通知「断开连接」结果: {result}");
             }
             catch (Exception ex)
             {
-                RollingLog.Error("toast", "Toast 断开连接失败", ex);
+                RollingLog.Error("toast", "通知「断开连接」失败", ex);
             }
         }
     }

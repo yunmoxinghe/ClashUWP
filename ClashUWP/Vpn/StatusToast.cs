@@ -17,6 +17,12 @@ namespace ClashUWP.Vpn
     ///   （包在它这里转发，平台为了转发保活它）。前台 UWP 进程会被挂起/节流/关闭 ——
     ///   放前台就等于"app 一关，状态通知不再刷新"。理由与
     ///   <see cref="PhysicalNetworkWatchdog"/> 搬进插件那一次完全相同（见它的类注释）。
+    ///   ★【1.0.123-B 订正】"发通知这件事住在哪个进程"与"通知被登记在哪个入口名下"
+    ///     是两件事，此前把它们混成一件了：1.0.106 起插件宿主挂在自己那个无头入口
+    ///     <c>Application Id="VpnHost"</c>，于是无参 <c>CreateToastNotifier()</c>（官方：
+    ///     "绑定到<b>调用应用程序</b>"）把这条通知绑到了 <c>…!VpnHost</c> 名下 ——
+    ///     进程仍是对的（会话期间必活），归属却是错的（缺省前台激活唤起的正是那个没 UI 的入口）。
+    ///     现在发送器显式绑到带 UI 的 <c>!App</c>，见 <see cref="CreateSessionNotifier"/>。
     ///
     /// 【为什么是"静默常驻 toast + 原位 Update"这个形态】
     ///   Windows 给 UWP 包<b>没有</b>托盘：<c>Microsoft.UI.Windowing.TrayIcon</c> 明确不支持 UWP、
@@ -105,6 +111,14 @@ namespace ClashUWP.Vpn
         /// <summary>引导通知另用一条 tag：不覆盖常驻那条，也不被它覆盖。</summary>
         private const string TagGuide = "clash-guide";
 
+        /// <summary>
+        /// ★【1.0.122】"断开连接"那个按钮的凭据文件：本进程写、前台读。
+        /// 只有本包读得到 ⇒ 网页里那个 <c>clashuwp://disconnect</c> 链接猜不到这串，
+        /// 猜不到就不动手（理由见 <see cref="StatusXml"/> 那段与
+        /// <c>SubscriptionProtocol.TryParseAppAction</c>）。
+        /// </summary>
+        private const string NonceFile = "toast-nonce.txt";
+
         /// <summary>一拍 1 s，与安卓 <c>ticker(TimeUnit.SECONDS.toMillis(1))</c> 同频。</summary>
         private const int IntervalMs = 1000;
 
@@ -149,6 +163,13 @@ namespace ClashUWP.Vpn
         private static int _dismissCount;
         private static int _guideSentThisSession;
         private static bool _gaveUp;
+
+        /// <summary>★【1.0.122】本会话那条"断开连接"按钮的凭据（16 位十六进制）。
+        /// 每次 Start 换一个并落盘；<c>StatusXml()</c> 把它写进 <c>arguments</c>，
+        /// 前台激活时比对 <c>LocalState\toast-nonce.txt</c>。空串 = 落盘失败，
+        /// 那一支的代价只是"按钮点不动"（前台会拒绝并记一行日志），不是"谁都能断"。
+        /// </summary>
+        private static string _nonce = "";
 
         /// <summary>★【1.0.79】上一次静默补发的时刻（限流用，UTC；只在循环线程读写）。</summary>
         private static DateTime _lastReRaiseUtc = DateTime.MinValue;
@@ -210,7 +231,62 @@ namespace ClashUWP.Vpn
             _dismissWhy = "";
             Volatile.Write(ref _dismissPending, 0);
 
+            // ★【1.0.122】先换凭据再发通知：StatusXml() 里那一串 arguments 与
+            //   LocalState\toast-nonce.txt 必须是同一份。落盘用"发出去不管"的形式，
+            //   因为第一拍 Show 至少在 IntervalMs(1s) 之后 —— 前台真点击时文件早就在了。
+            //   ★ 落盘失败<b>不</b>退回"没有凭据也算通过"：那样等于把
+            //     "任何网页都能把用户的隧道断开"这条路重新打开，宁可按钮点不动。
+            _nonce = Guid.NewGuid().ToString("N").Substring(0, 16);
+            _ = SaveNonceAsync(_nonce);
+
             _ = Task.Run(() => LoopAsync(cts.Token, cts, plugin));
+        }
+
+        /// <summary>★【1.0.122】把本会话的凭据写进 <c>LocalState\toast-nonce.txt</c>。</summary>
+        private static async Task SaveNonceAsync(string nonce)
+        {
+            try
+            {
+                StorageFile target = await ApplicationData.Current.LocalFolder
+                    .CreateFileAsync(NonceFile, CreationCollisionOption.ReplaceExisting);
+                await FileIO.WriteTextAsync(target, nonce);
+                RollingLog.Info("toast", $"断开按钮凭据已落盘（{NonceFile}）");
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Warn("toast",
+                    $"断开按钮凭据写不出，前台会拒掉那一支 err={ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// ★【1.0.122】前台侧：核对通知里带回来的凭据是不是本会话那一份。
+        /// 读不到文件、为空、对不上 —— 一律 false（"不确定就不动手"是本仓一贯的口径）。
+        /// </summary>
+        internal static async Task<bool> MatchesNonceAsync(string nonce)
+        {
+            if (nonce.Length == 0)
+            {
+                RollingLog.Warn("toast", "激活参数里没有断开按钮的凭据，拒绝");
+                return false;
+            }
+            try
+            {
+                StorageFile file = await ApplicationData.Current.LocalFolder.GetFileAsync(NonceFile);
+                string saved = (await FileIO.ReadTextAsync(file)).Trim();
+                bool ok = saved.Length > 0 && saved == nonce;
+                if (!ok)
+                    RollingLog.Warn("toast",
+                        $"断开按钮凭据不匹配（通知里那串与本包记录的不同），拒绝 —— 这条激活不是本应用的通知发出来的");
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                // 从没发过通知（文件不存在）或读不出：不能当成"通过"。
+                RollingLog.Warn("toast",
+                    $"读断开按钮凭据失败，拒绝 err={ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
         }
 
         /// <summary>停（会话结束 / 用户断开时调）：撤掉常驻通知并停循环。</summary>
@@ -262,15 +338,81 @@ namespace ClashUWP.Vpn
             }
         }
 
+        /// <summary>
+        /// ★★【1.0.123-B · 用户口径「通知的路由入口是后台任务，把他接到前台去」】
+        /// 发送器不再绑在<b>本进程所属的无头入口</b>（<c>…!VpnHost</c>）上，而是显式绑到
+        /// 带 UI 的前台入口（<c>…!App</c>）。
+        ///
+        /// 【官方给的把手】<c>CreateToastNotifier(String applicationId)</c> 的重载表原文：
+        ///   「创建并初始化 ToastNotifier 的新实例，该实例绑定到指定的应用
+        ///   （<b>通常是同一包中的另一个应用</b>）」，注解「由 applicationId 标识的应用
+        ///   <b>必须属于与调用方相同的包</b>」，以及「无法把 Toast 通知发送到辅助磁贴，
+        ///   因此必须是<b>应用磁贴</b>的 ID」。
+        ///   对照无参重载那句「绑定到<b>调用应用程序</b>」—— 无参时绑的就是发起进程自己的
+        ///   身份，而插件宿主挂的是 <c>Application Id="VpnHost"</c>
+        ///   （<c>Package.appxmanifest:233</c>，1.0.106 臂 C 为了修"关窗 2 秒断流"才拆出去的，
+        ///   隔离性证据在 Docs/53 §五）。于是通知被登记在 <c>…!VpnHost</c> 名下，
+        ///   缺省 <c>foreground</c> 激活那句"launch <i>your</i> foreground app"里的
+        ///   "你的前台应用"= 无头宿主 ⇒ 点击拉起 <c>!VpnHost</c>，界面从没露过面
+        ///   （Docs/63 §一：wpndatabase 里那条归属 + 点击后新起的 pid 3316/4612）。
+        ///   ⇒ 绑到 <c>!App</c> 后，通知的身份、设置开关（<c>notifier.Setting</c>）、
+        ///     缺省前台激活三者一起搬到前台入口那一格。
+        ///
+        /// 【为什么绑的是 PFN!App 这个拼法】<c>PFN + "!" + Application/@Id</c> 是本仓
+        ///   <c>Tools\UwpBridge\Program.cs:732</c> 一直在用、且装机拉起过的那把尺子。
+        ///   ★【1.0.123 装机定论】当初三条候选逐个试（官方只写"必须是应用磁贴的 ID"，
+        ///   没有可抄的实物例证），实测<b>第一条就被平台接受</b>：
+        ///   <c>plugin.log</c> 里 <c>发送器=8B8CC4F4.ClashUWP_4tjvwvefxrz66!App</c>、
+        ///   <c>发送器绑不进</c> 零行 ⇒ 另两条候选按"不留假想需求"删了。
+        ///   ★ 家族名取 <c>Package.Current.Id.FamilyName</c> 而不是写死发布者哈希后缀：
+        ///   换一张签名证书就换家族（Docs/38 §十四 F5），写死等于把"重签 = 换家族"打进通知通道里。
+        ///
+        /// 【装机后三条风险全部闭合】① 候选被接受（上面那行）；② 绑 <c>!App</c> 后 <c>Update</c>
+        ///   仍命中同一 <c>Tag</c>+<c>Group</c>（Docs/64 §七 #9；注意点击会把那条通知摘掉，
+        ///   所以点击后第一次 <c>Update</c> 必然回 <c>NotificationNotFound</c> 并走节流补发，
+        ///   那是平台行为不是退化）；③ 前台 <c>Stop</c> 撤得下（Docs/64 §七 #10）。
+        ///   三条都不碰隧道：通知这件事失败只让通知没，不动网络（本类纪律）。
+        ///
+        /// 【退回无参重载 = 本改动之前的行为】不是"修好了"，只是不回归。
+        ///   点击落点由协议激活那两行兜住（<see cref="StatusXml"/>：<c>launch</c> 与按钮都
+        ///   <c>activationType='protocol'</c>，按 URI 归属路由，与发起方身份无关），
+        ///   本条是把"通知的身份归属"也搬正，两道各自成立。
+        /// </summary>
+        private static (ToastNotifier, string) CreateSessionNotifier()
+        {
+            string foregroundId;
+            try
+            {
+                foregroundId = Windows.ApplicationModel.Package.Current.Id.FamilyName + "!App";
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Warn("toast",
+                    $"读包家族名失败，退回本进程入口 err={ex.GetType().Name}: {ex.Message}");
+                return (ToastNotificationManager.CreateToastNotifier(), "缺省(调用方入口)");
+            }
+
+            try
+            {
+                return (ToastNotificationManager.CreateToastNotifier(foregroundId), foregroundId);
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Warn("toast",
+                    $"发送器绑不进 {foregroundId} err={ex.GetType().Name}: {ex.Message}");
+                return (ToastNotificationManager.CreateToastNotifier(), "缺省(调用方入口)");
+            }
+        }
+
         private static async Task LoopAsync(CancellationToken token, CancellationTokenSource own,
                                            ClashVpnPlugin plugin)
         {
             ToastNotifier notifier;
+            string notifierId;
             try
             {
-                // 无参重载 = "for the current app"。插件进程到底有没有包身份，
-                // 这一句成不成 + 下面读到的 Setting 就是判据（失败只让通知这件事没，不动隧道）。
-                notifier = ToastNotificationManager.CreateToastNotifier();
+                // ★【1.0.123-B】发送器改绑到带 UI 的前台入口（见 CreateSessionNotifier 那段）。
+                (notifier, notifierId) = CreateSessionNotifier();
                 lock (_gate)
                 {
                     // 建好之前这一刻都可能已经被 Stop/新一轮 Start 摘走（连接刚成就断是实测形态），
@@ -280,7 +422,7 @@ namespace ClashUWP.Vpn
                 }
                 RollingLog.Info("toast",
                     $"启动：每 {IntervalMs}ms 原位刷新 tag={TagStatus} setting={notifier.Setting} " +
-                    $"补发上限={MaxReRaise} 引导通知=每天一次");
+                    $"发送器={notifierId} 补发上限={MaxReRaise} 引导通知=每天一次");
             }
             catch (Exception ex)
             {
@@ -629,16 +771,43 @@ namespace ClashUWP.Vpn
         ///   三行文字才是与安卓 <c>contentTitle / contentText / subText</c> 一一对应的形态。
         ///   <c>&lt;audio silent='true'/&gt;</c> 是第二重保险：万一横幅因为别的原因出现，也不响。
         ///
-        /// ★【1.0.81 · 新增】点击通知打开主窗口且通知不消失：
-        ///   · <c>launch="action=viewMainWindow"</c> —— 点击通知主体时触发前台激活，
-        ///     App.OnActivated 会收到这个参数并打开/激活主窗口；
-        ///   · 按钮使用 <c>activationType="foreground"</c> 而非 <c>protocol</c>，
-        ///     这样点击后通知不会自动消失（官方：<c>PendingUpdate</c> 行为需要前台激活）；
-        ///   · "断开连接"按钮带 <c>hintAfterActivationBehavior="pendingUpdate"</c>，
-        ///     点击后保持通知可见，直到我们主动 Hide 或用户手动关闭。
+        /// ★★【1.0.122 · 点击落点换成协议激活，这一条是修 1.0.81 那个"点了没反应"】
+        ///   1.0.81 写的是 <c>launch='action=viewMainWindow'</c> + 按钮
+        ///   <c>activationType='foreground'</c> + <c>hintAfterActivationBehavior='pendingUpdate'</c>，
+        ///   装机实测（本机 1.0.121，取证链在 Docs/63 §一）是<b>整条不成立</b>：
+        ///     ① 这条通知由<b>插件宿主进程</b>引发，而 1.0.106 起插件宿主挂在自己那个
+        ///        无头入口上，于是 Windows 把通知登记到 <c>…!VpnHost</c> 的 AUMID
+        ///        （<c>%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db</c>
+        ///        里 <c>!App</c> 与 <c>!VpnHost</c> 两条 setting 记录都在，而引发这条 tag=clash-status
+        ///        的进程就是 VpnHost 那个 pid）；
+        ///     ② 官方对缺省的 <c>foreground</c> 的语义是 "<i>Your foreground app is launched</i>"
+        ///        —— "你的前台应用"= 这条通知所属的那个入口，也就是<b>无头宿主</b>，
+        ///          不是带 UI 的 <c>!App</c>；实测点击后 app.log 里出现的是<b>新起的进程</b>
+        ///          （pid=3316 / 4612）而界面从没露过面，约 17 秒后就被挂起
+        ///          —— 官方那句"没在 Current 窗口上调 Activate 且不可见 ⇒ 15 秒后终止"对得上；
+        ///     ③ <c>App.OnActivated</c> 这个 override 在本应用<b>一次都没被调过</b>
+        ///        （1.0.53~1.0.57 为协议激活实测五轮钉死的那条限制，对 toast 同样成立），
+        ///        所以 1.0.81 那段分支从一开始就是死代码：真会触发的分发只有
+        ///        <c>CoreApplicationView.Activated</c>，而它只认 <c>Kind==Protocol</c>。
+        ///   ⇒ 现在两行都写 <c>activationType='protocol'</c>：官方同一张表里它的语义是
+        ///     "<i>Launch a different app using protocol activation</i>"，按 <b>URI 归属</b>路由，
+        ///     而 <c>clashuwp</c> 只注册在带 UI 的 <c>&lt;Application Id="App"&gt;</c> 上
+        ///     ⇒ 点击必然回到前台，而且落在<b>已经装机验过的那条分发</b>（协议导入）上。
+        ///   ★ <c>hintAfterActivationBehavior='pendingUpdate'</c> <b>一并删掉</b>：官方
+        ///     「正在等待更新的应用通知」那一页写死了"在<b>后台</b>激活按钮上把
+        ///     afterActivationBehavior 设为 pendingUpdate —— 这仅适用于
+        ///     <c>activationType="background"</c> 的按钮"，1.0.81 那句"PendingUpdate 行为需要
+        ///     前台激活"是把它记反了。所以"点完通知还在不在"这件事不再交给平台承诺：
+        ///     装机那遍要读 plugin.log 里点击落到的 <c>Dismissed</c> 原因，按实物写清
+        ///     （判据行 Docs/63 §五 #3）。
+        ///   ★ 按钮参数带 <c>?n=&lt;nonce&gt;</c>：断开是动网络状态的动作，而协议是
+        ///     <b>外部可触发</b>的（任何网页一个链接都能唤起本进程，见
+        ///     <see cref="ClashUWP.Backend.SubscriptionProtocol"/> 顶部那条边界）。
+        ///     nonce 每次会话随机、由本进程写进 <c>LocalState\toast-nonce.txt</c>，
+        ///     前台比对不上就只记日志不动手 —— 网页猜不到这串。
         /// </summary>
         private static string StatusXml() =>
-            "<toast launch='action=viewMainWindow'>" +
+            "<toast launch='clashuwp://open' activationType='protocol'>" +
               "<visual>" +
                 "<binding template='ToastGeneric'>" +
                   $"<text>{{{KeyTitle}}}</text>" +
@@ -647,7 +816,7 @@ namespace ClashUWP.Vpn
                 "</binding>" +
               "</visual>" +
               "<actions>" +
-                "<action content='断开连接' activationType='foreground' arguments='action=disconnect' hintAfterActivationBehavior='pendingUpdate'/>" +
+                $"<action content='断开连接' activationType='protocol' arguments='clashuwp://disconnect?n={_nonce}'/>" +
               "</actions>" +
               "<audio silent='true'/>" +
             "</toast>";
