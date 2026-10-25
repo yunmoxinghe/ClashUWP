@@ -165,6 +165,25 @@ namespace ClashUWP.Backend
             finally { FlowGate.Release(); }
         }
 
+        /// <summary>
+        /// ★【1.0.126 · IPv6 界面出口】设置隧道对 IPv6 的处理档位（0/1/2，判据本体在
+        ///   <see cref="ClashUWP.Vpn.LocalSettings.Ipv6"/>）。
+        ///
+        /// 【为什么占闸】它当场改的是<b>热重载那一条路当轮就要读</b>的现值
+        ///   （<c>SubscriptionReload</c> 直接读 <c>LocalSettings.Ipv6</c> 来决定往内核配置里
+        ///   写不写顶层 <c>ipv6</c>），和"正在改写并下发配置"并发会得到半新半旧的形状；
+        ///   理由与 <see cref="SetSubscriptionAutoHoursAsync"/> 同一条。
+        /// 【为什么不顺带重连】改档要断开再连才换隧道地址与路由（见那个方法的生效边界），
+        ///   而"替用户拆掉一条在跑的隧道"不是设置项的权限 —— 界面上写清楚，动作交回用户。
+        /// </summary>
+        internal static async Task SetIpv6ArmAsync(int arm)
+        {
+            if (!await AcquireAsync("ipv6-arm"))
+                throw new InvalidOperationException("ProfileGate=忙（改 IPv6 档位本轮放弃）");
+            try { await AppSettings.SetIpv6ArmAsync(arm); }
+            finally { FlowGate.Release(); }
+        }
+
         /// <summary>跟账：隧道实际连的订阅与账本不一致时，以隧道为准修正账本。</summary>
         internal static Task<SubscriptionManager.Result> AdoptSubscriptionAsync(string connectedSub)
             => SubscriptionManager.AdoptAsync(connectedSub);

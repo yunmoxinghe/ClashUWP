@@ -144,6 +144,12 @@ namespace ClashUWP.Frontend
         //   所以不会出现"按钮亮了、环还在按旧档位跑"。
         private Action<int> _setSubAutoHours = _ => { };
 
+        // ---- IPv6 档位（★【1.0.126 · 界面出口】0=不动 1=堵泄漏 2=全链路）----
+        //   同 _setSubAutoHours 的口径：这份状态只是<b>画给按钮看的</b>，隧道用的是插件侧
+        //   每次 Connect 现读的 <c>LocalSettings.Ipv6</c>；<c>ProfileGate.SetIpv6ArmAsync</c>
+        //   把落盘与两份现值一起改掉，所以不会出现"按钮亮了、热重载还按旧档改写内核配置"。
+        private Action<int> _setIpv6Arm = _ => { };
+
         // ---- 应用分流（G9）----
         // ★ 状态里存的是<b>规范化后的名单行</b>（<c>kind|标识|去向</c>），不是 AppSplit 对象：
         //   每次增删都换一个<b>新的 List</b> 交给 UseState ——  Reactor 的 UseState 靠
@@ -196,6 +202,10 @@ namespace ClashUWP.Frontend
             // ★【1.0.119 · 订阅自动更新】初值先按"关"画，挂载时从 settings.txt 现读一次再纠正
             //   （纠正那一段的理由写在挂载效果里，别在这儿重复）。
             var (subAutoHours, setSubAutoHours) = UseState(0);
+            // ★【1.0.126 · IPv6 界面出口】同样先按"不动"画，挂载时随 AppSettings 现读纠正一次。
+            //   初值必须是<b>产品默认</b>那一档，不能是"还没读到"的第三态：这一档决定
+            //   隧道要不要下发 v6 路由，画错比画不出来更容易让人以为已经堵上了泄漏。
+            var (ipv6Arm, setIpv6Arm) = UseState(0);
 
             // ---- 应用分流（G9）状态 ----
             var (splitLines, setSplitLines) = UseState(new List<string>());
@@ -225,6 +235,7 @@ namespace ClashUWP.Frontend
             _setConnectedSub = setConnectedSub;
             _setTraffic = setTraffic;
             _setSubAutoHours = setSubAutoHours;
+            _setIpv6Arm = setIpv6Arm;
             _setSplitLines = setSplitLines;
             _setSplitNote = setSplitNote;
             _setSplitMsg = setSplitMsg;
@@ -614,8 +625,14 @@ namespace ClashUWP.Frontend
                     {
                         await AppSettings.LoadAsync();
                         _setSubAutoHours(AppSettings.SubAutoHours);
+                        // ★【1.0.126】IPv6 档位同一次现读一起纠正：这次 LoadAsync 已经把
+                        //   settings.txt 里的 ipv6 键读进 AppSettings.Ipv6Arm（区间与插件侧同一个常量），
+                        //   这里只负责把它喂给按钮。同一次读喂两个按钮，界面上就不可能出现
+                        //   "档位与文件各认一个"。
+                        _setIpv6Arm(AppSettings.Ipv6Arm);
                     }
-                    catch { /* 读不到就停在"关闭"那一档，界面上照样是那句"自动更新 关闭" */ }
+                    catch { /* 读不到就停在各自的产品默认档：自动更新画「关闭」、IPv6 画「0 不动」——
+                              这两档都是"什么都不改"，宁可少亮一枚按钮，不能亮在没读到的档位上 */ }
                 });
             }, Array.Empty<object>());
 
@@ -625,10 +642,11 @@ namespace ClashUWP.Frontend
             {
                 PageProxy => ProxyPage(snap, activeGroup, actionHint, sortMode, setSortMode),
                 PageSubscription => SubscriptionPage(subInfo, subProfiles, subActive, subUrl,
-                                                    actionHint, subAutoHours, setSubAutoHours),                PageSettings => SettingsPage(actionHint, logOpen, logText, kernelLog, snap,
+                                                    actionHint, subAutoHours, setSubAutoHours),
+                PageSettings => SettingsPage(actionHint, logOpen, logText, kernelLog, snap,
                         material, setMaterial,
                         splitLines, splitNote, splitMsg, probeText, splitKind, splitIdentity, splitTarget,
-                        dnsText, dnsMsg, dnsSnapshot),
+                        dnsText, dnsMsg, dnsSnapshot, ipv6Arm, setIpv6Arm),
                 _ => HomePage(vpnStatus, actionHint, snap, subActive, connectedSub, traffic),
             };
 
@@ -933,7 +951,7 @@ namespace ClashUWP.Frontend
                                      List<string> splitLines, string splitNote, string splitMsg,
                                      string probeText, string splitKind, string splitIdentity,
                                      string splitTarget, string dnsText, string dnsMsg,
-                                     string dnsSnapshot) =>
+                                     string dnsSnapshot, int ipv6Arm, Action<int> setIpv6Arm) =>
             Page(
                 Section("背景材质",
                     MaterialPicker(material, setMaterial),
@@ -969,6 +987,26 @@ namespace ClashUWP.Frontend
                               "后者只要列表非空就会把没匹配上的应用一起拦掉，实测整机断网（Docs/08 §5.2 run 19）。")
                         .Foreground(Theme.SecondaryText)),
 
+                // ★★【1.0.126 · IPv6 界面出口】这一档以前只能手改 settings.txt，界面上连
+                //   "现在是哪一档"都画不出来 —— 而它决定的是"IPv6 出站到底进不进隧道"，
+                //   也就是 Docs/05 §5 明记在案、一直没收口的那条泄漏面。
+                //   按钮排的三档文案与代价逐档写，不给"看起来都一样"的图标档。
+                Section("IPv6 通道",
+                    Ipv6Picker(ipv6Arm, setIpv6Arm),
+                    TextBlock(Ipv6ArmNote(ipv6Arm)).Foreground(Theme.SecondaryText),
+                    TextBlock("★ 生效时机：断开再连一次。隧道的 v6 地址和 2000::/3 这类路由是" +
+                              "连接时一次性交给平台的，内核桥的地址族也是启动时定死的；" +
+                              "点「订阅 → 重新加载配置」只会换内核配置那一半（要不要写顶层 ipv6）。")
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock("★ 0 档是唯一被装机验证过的形态；1 档至今没跑过拨号窗口，" +
+                              "2 档在本机（没有全局 IPv6）连内核侧的形状都造不出来 —— " +
+                              "mihomo 在识别不到全局 v6 时会把 tun 的 inet6-address 与假 IP v6 池整个清空。" +
+                              "抬档前请先看清这两句。")
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock("档位写在 settings.txt 的 ipv6 键里（0/1/2），插件每次连接现读；" +
+                              "改档不会自动拆你的隧道。")
+                        .Foreground(Theme.SecondaryText)),
+
                 Section("DNS 覆盖",
                     TextBlock("dns-config.txt：一行一条 key = value，# 开头是注释。空文件 = 内核配置一字不改。")
                         .Foreground(Theme.SecondaryText),
@@ -993,7 +1031,7 @@ namespace ClashUWP.Frontend
                               "nrpt-dns 是交给 Windows NRPT 的 DNS，需 settings.txt: dnsInTunnel=1。" +
                               "内核侧断开再连或热重载都生效；nrpt-dns 要断开再连才换。")
                         .Foreground(Theme.SecondaryText),
-                    TextBlock("★ fake-ip-range6 只在 settings.txt: ipv6=2 时生效（要配合 Docs/22 的 v6 档）。" +
+                    TextBlock("★ fake-ip-range6 只在 IPv6 通道 = 2 档时生效（上一节那排按钮，或 settings.txt: ipv6=2）。" +
                               "settings.txt 里写 dnsConfig=0 可整份关闭本功能。")
                         .Foreground(Theme.SecondaryText)),
 
@@ -1084,6 +1122,80 @@ namespace ClashUWP.Frontend
             {
                 set(before);
                 _setActionHint($"改档位失败，已退回 {SubscriptionAutoPolicy.Label(before)}：{ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// IPv6 档位按钮排（★【1.0.126 · 界面出口】）。
+        ///
+        /// 【为什么是整排三枚而不是开关/输入框】口径同 <see cref="SubAutoPicker"/>：
+        ///   这一档<b>不是布尔</b> —— 0/1/2 是三套不同的路由与内核形态，做成"开/关"
+        ///   必然有一档没出口；做成输入框会让用户写 3，然后读侧回落成 0，
+        ///   而回落掉的那一档恰恰是"堵泄漏"，界面显示的却是他刚按下去的样子。
+        /// 【"不动"必须排在第一个】它是默认档，也是唯一被装机验证过的形态。
+        /// 【按钮上写档位号】三档的<b>名字</b>在界面上容易记混（"堵泄漏"和"全链路"听着像都要开），
+        ///   而取证日志、settings.txt、Docs/22 的判据全用数字 —— 界面与台账同名才对得上。
+        /// </summary>
+        private Element Ipv6Picker(int current, Action<int> set)
+        {
+            var buttons = new List<Element>();
+            for (int arm = LocalSettings.Ipv6ArmMin; arm <= LocalSettings.Ipv6ArmMax; arm++)
+            {
+                int thisArm = arm;   // 闭包捕获当前值（同 SubAutoPicker 的理由）
+                buttons.Add(Button((current == thisArm ? "▶ " : "") +
+                                   $"{thisArm} {Ipv6ArmShort(thisArm)}",
+                    () => _ = SetIpv6ArmAsync(thisArm, set)));
+            }
+            return HStack(8, buttons.ToArray());
+        }
+
+        /// <summary>按钮上的短名（长代价在 <see cref="Ipv6ArmNote"/> 那一行）。</summary>
+        private static string Ipv6ArmShort(int arm) => arm switch
+        {
+            1 => "堵泄漏",
+            2 => "全链路",
+            _ => "不动",
+        };
+
+        /// <summary>
+        /// 当前档位的代价，逐档写。★ 三档<b>都说自己的坏处</b>：只说好处会诱导用户抬档，
+        ///   而 1/2 两档至今没有实机验证过的记录（判据见 <see cref="LocalSettings.Ipv6"/>）。
+        /// </summary>
+        private static string Ipv6ArmNote(int arm) => arm switch
+        {
+            1 => "档 1（堵泄漏）：隧道拿一个 ULA 的 v6 地址，并下发 2000::/3 —— 应用真去连 v6 地址时" +
+                 "包会进隧道；内核不解析 AAAA，普通应用拿不到 v6 记录，因此不会优先 v6。" +
+                 "代价：IPv6 节点的外层连接要靠 /128 宿主路由兜住（这一版才真正产出候选），" +
+                 "且这一档还没跑过拨号实测。",
+            2 => "档 2（全链路）：在 1 之上再开内核侧 IPv6（顶层 ipv6: true + 假 IP 的 v6 池），" +
+                 "v6 域名也走代理与规则。代价：能不能真出 v6 取决于节点与订阅；" +
+                 "而本机没有全局 IPv6 时 mihomo 会把隧道 v6 地址与 v6 假 IP 池整个清空 —— " +
+                 "在这种网络上这一档和 1 档在内核里长不出区别，形状验不了。",
+            _ => "档 0（不动）：IPv6 完全不进隧道，内核配置里 v6 相关的键按订阅原文。" +
+                 "代价：在有全局 IPv6 的网络上，v6 出站绕过代理与规则（已知泄漏）。" +
+                 "好处：这是默认档，也是唯一被装机验证过的形态。",
+        };
+
+        /// <summary>
+        /// 改 IPv6 档位：落盘 + 改两份现值 + 改按钮，三步<b>必须都成</b>
+        ///   （口径同 <see cref="SetSubAutoHoursAsync"/>，失败回滚到原档位）。
+        /// ★ 不顺带重连：拆掉一条在跑的隧道不是设置项的权限，界面上说清"要断开再连"。
+        /// </summary>
+        private async Task SetIpv6ArmAsync(int arm, Action<int> set)
+        {
+            int before = AppSettings.Ipv6Arm;
+            try
+            {
+                await ProfileGate.SetIpv6ArmAsync(arm);
+                set(AppSettings.Ipv6Arm);
+                _setActionHint($"IPv6 档位已设为 {AppSettings.Ipv6Arm} " +
+                               $"（{Ipv6ArmShort(AppSettings.Ipv6Arm)}）—— 下一次连接生效；" +
+                               "当前若有隧道在跑，要断开再连一次才换路由");
+            }
+            catch (Exception ex)
+            {
+                set(before);
+                _setActionHint($"改 IPv6 档位失败，已退回 {before}（{Ipv6ArmShort(before)}）：{ex.Message}");
             }
         }
 

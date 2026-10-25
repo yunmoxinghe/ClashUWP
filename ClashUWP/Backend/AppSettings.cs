@@ -83,6 +83,21 @@ namespace ClashUWP.Backend
         /// </summary>
         internal static int SubAutoHours = 0;
 
+        /// <summary>
+        /// ★【1.0.126 · IPv6 界面出口】隧道对 IPv6 的处理档位（0/1/2，判据本体在
+        ///   <see cref="ClashUWP.Vpn.LocalSettings.Ipv6"/>，那里写了三档各自的行为与代价）。
+        ///
+        /// 【为什么前台要再读一遍】这一档以前<b>只能手改 <c>settings.txt</c></b>，界面上
+        ///   连"现在是哪一档"都画不出来。加了按钮就必须现读：按钮亮在错误的档位上
+        ///   比不亮更糟（口径同 <see cref="SubAutoHours"/>）。
+        /// 【为什么这不叫两套真值表】夹紧用的是<b>同一个</b> <see cref="SettingsParse.Int"/>
+        ///   调用（0..2），插件侧照常在自己每次 Connect 时 <c>Load()</c> 现读 ——
+        ///   那份才是隧道真正用的读数；前台这份只决定界面画哪一枚亮。
+        ///   改档位走 <c>ProfileGate.SetIpv6ArmAsync</c>，它把两边一起改掉，
+        ///   避免出现"按钮亮了、热重载仍按旧档改写内核配置"。
+        /// </summary>
+        internal static int Ipv6Arm = 0;
+
         /// <summary>读到的是默认值还是 settings.txt —— 进日志用，免得又出现"以为切了其实没切"。</summary>
         internal static string Source = "默认值";
 
@@ -108,6 +123,7 @@ namespace ClashUWP.Backend
             bool autoProbe = false;
             bool panelMultiEntry = false;
             int subAutoHours = 0;
+            int ipv6Arm = 0;
             string source = "默认值";
             bool warnPanel = false;
 
@@ -118,7 +134,7 @@ namespace ClashUWP.Backend
                 if (file == null)
                 {
                     // 没文件是"全新装包后什么都没配"的正常状态，不打警告。
-                    Apply(false, false, 0, "默认值");
+                    Apply(false, false, 0, 0, "默认值");
                     Log();
                     return;
                 }
@@ -134,6 +150,10 @@ namespace ClashUWP.Backend
                 //   "6 小时还是 7 小时"这种业务档位不是它的职责。
                 subAutoHours = SubscriptionAutoPolicy.NormalizeHours(
                     SettingsParse.String(map, "subAutoHours", ""));
+                // ★【1.0.126】与插件侧逐字同一个夹紧调用（上下界也同一个常量），
+                //   认不出的一律 0=不动 v6。
+                ipv6Arm = SettingsParse.Int(map, Ipv6Key, 0,
+                                            LocalSettings.Ipv6ArmMin, LocalSettings.Ipv6ArmMax);
                 source = "settings.txt";
                 warnPanel = panelMultiEntry;
             }
@@ -144,7 +164,7 @@ namespace ClashUWP.Backend
                 RollingLog.Error("appsettings", "settings.txt", ex);
             }
 
-            Apply(autoProbe, panelMultiEntry, subAutoHours, source);
+            Apply(autoProbe, panelMultiEntry, subAutoHours, ipv6Arm, source);
 
             // ★【1.0.115】开启多条目时留一条显式警告：平台限制不会因为我们开了开关就消失。
             //   ★ 这条不能进 Apply：Apply 也用于"失败路径回默认"，那时 panelMultiEntry 是 false，
@@ -158,16 +178,66 @@ namespace ClashUWP.Backend
             Log();
         }
 
-        private static void Apply(bool probe, bool multiEntry, int hours, string src)
+        /// <summary>
+        /// ★【1.0.126】IPv6 档位在这份文件里的键。与插件侧 <c>LocalSettings.Load()</c> 读的
+        /// 名字必须<b>逐字相同</b> —— 改一边等于把另一边的把手删掉（写侧与读侧同名是这个把手的契约）。
+        /// </summary>
+        internal const string Ipv6Key = "ipv6";
+
+        /// <summary>
+        /// 界面传进来的档位归一：<b>区间外一律当 0（不动 v6）</b>，与读侧同一个回落纪律。
+        /// 上下界用 <see cref="LocalSettings.Ipv6ArmMin"/> / <see cref="LocalSettings.Ipv6ArmMax"/>：
+        /// 写和读若各持一份区间，就会出现"写得进去、读回来是另一档"。
+        /// </summary>
+        internal static int NormalizeIpv6Arm(int arm) =>
+            arm >= LocalSettings.Ipv6ArmMin && arm <= LocalSettings.Ipv6ArmMax ? arm : 0;
+
+        /// <summary>
+        /// ★【1.0.126 · IPv6 界面出口】改档位的<b>唯一写入口</b>：落盘，并把<b>两份</b>现值一起改掉。
+        ///
+        /// 【为什么要改两份】隧道权威读数是插件侧那份（每次 <c>Connect</c> 重新 <c>Load()</c> 现读），
+        ///   但<b>热重载</b>那一条路（<c>Backend\SubscriptionReload.cs:59-61</c>）是在前台进程里
+        ///   直接读 <see cref="LocalSettings.Ipv6"/> 来决定往内核配置里写不写顶层 <c>ipv6</c>。
+        ///   只改 <see cref="Ipv6Arm"/>（按钮那一份）会得到：用户点完按钮再点「重新加载配置」，
+        ///   配置仍按旧档改写 —— 正是本项目反复治的"界面与后台各认一个档位"。
+        /// 【为什么必须落盘】反过来只做内存赋值更糟：插件每次拨号都从文件重读，
+        ///   于是"这一次生效、下一次回旧档"，而界面上的按钮一直亮着新档位。
+        /// 【为什么当场改，不等下一次 <see cref="LoadAsync"/>】装配只跑一次，等它就等于本次进程不生效。
+        /// 【生效边界 ★ 界面上必须明说】隧道的 v6 地址与 include 路由是 <c>Connect</c> 时一次性的
+        ///   （<c>StartWithTrafficFilter</c>），常驻内核桥的 gvisor 栈地址族也是 <c>Start</c> 定死的
+        ///   （1.0.70 · G7）⇒ <b>改档要断开再连</b>；热重载只换内核配置那一半。
+        /// </summary>
+        internal static async Task SetIpv6ArmAsync(int arm)
+        {
+            int normalized = NormalizeIpv6Arm(arm);
+            try
+            {
+                // ★ 追加而不是重写整份文件：settings.txt 是 15 个把手共用的，重写必然冲掉别人的键。
+                //   同键多行时<b>后一行胜出</b>（SettingsParse.Parse 的循环就是覆盖赋值），
+                //   所以追加在语义上等价于更新（口径同 SubscriptionManager.AppendSettingAsync）。
+                await LocalState.AppendTextAsync("settings.txt", $"{Ipv6Key}={normalized}\n");
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"写 settings.txt 失败: {ex.Message}", ex);
+            }
+            Ipv6Arm = normalized;
+            LocalSettings.Ipv6 = normalized;
+            RollingLog.Info("appsettings",
+                $"ipv6 档位写入 settings.txt：{Ipv6Key}={normalized}（src={Source}）");
+        }
+
+        private static void Apply(bool probe, bool multiEntry, int hours, int ipv6, string src)
         {
             AutoProbe = probe;
             PanelMultiEntry = multiEntry;
             SubAutoHours = hours;
+            Ipv6Arm = ipv6;
             Source = src;
         }
 
         private static void Log() => RollingLog.Info("appsettings",
             $"src={Source} autoProbe={(AutoProbe ? 1 : 0)} panelMultiEntry={(PanelMultiEntry ? 1 : 0)} " +
-            $"subAutoHours={SubAutoHours}");
+            $"subAutoHours={SubAutoHours} ipv6={Ipv6Arm}");
     }
 }
