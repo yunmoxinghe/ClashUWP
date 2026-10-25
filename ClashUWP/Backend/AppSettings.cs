@@ -65,6 +65,24 @@ namespace ClashUWP.Backend
         /// </summary>
         internal static bool PanelMultiEntry = false;
 
+        /// <summary>
+        /// ★【1.0.119】订阅<b>定时自动更新</b>的间隔（小时）。<c>0</c>（默认）= 关闭。
+        ///
+        /// 【为什么默认关】开着的后果不是"多下一次 HTTP"：它走的是
+        ///   <c>FetchAsync(activate:true)</c> 那一整支 —— 写 <c>config.yaml</c>、
+        ///   <b>热重载内核</b>、并<b>写系统 VPN profile</b>。后两样分别会换掉在跑的隧道、
+        ///   和在会话期造出删不掉的僵尸条目（Docs/45 §七.3）。凡是有这种副作用的自动任务，
+        ///   默认值必须是"什么都不做"，由用户当场勾选。
+        ///
+        /// 【怎么打开】界面上订阅页那一排按钮（写 <c>subAutoHours=6</c> 之类），
+        ///   或直接往 <c>settings.txt</c> 写一行。认不出来的值一律当 0，
+        ///   <b>不"就近取一档"</b>（判据见 <see cref="SubscriptionAutoPolicy.NormalizeHours"/>）。
+        ///   执行环在 <see cref="SubscriptionAutoUpdater"/>，到点/退避的判据在
+        ///   <see cref="SubscriptionAutoPolicy"/>（★ 1.0.122 起<b>没有</b>"会话中不动手"那条护栏，
+        ///   连着 VPN 也照样更新；改掉的到底是什么由 1.0.123 的生效阶梯决定，见 Docs/64）。
+        /// </summary>
+        internal static int SubAutoHours = 0;
+
         /// <summary>读到的是默认值还是 settings.txt —— 进日志用，免得又出现"以为切了其实没切"。</summary>
         internal static string Source = "默认值";
 
@@ -74,13 +92,24 @@ namespace ClashUWP.Backend
         /// 读不到文件 / 解析失败<b>不是错误</b>：保持默认值（<see cref="AutoProbe"/>=false），
         /// 也就是"不自动拨"。这与插件侧 <c>LocalSettings.Load()</c> 的处理一致 ——
         /// 一个取证通道的缺失，绝不该变成一次意外的 VPN 连接。
-        /// ★ 每次调用都先恢复默认，避免上一次的值残留（同插件侧的理由）。
+        /// ★ 每次调用都从头算一遍，不残留上一次的值（同插件侧的理由）。
+        ///
+        /// ★★【1.0.119】整段判据<b>先在局部变量上算完，最后一次性落到静态字段</b>。
+        ///   旧写法是"开头先把三个字段清成默认，await 完文件再逐个填"，
+        ///   那时只有一个调用点所以看不出来；现在有三个
+        ///   （<c>Diagnostics.MaybeRunProbesAsync</c>、<c>Diagnostics.ArmAutoUpdaterAsync</c>、
+        ///   界面挂载时那一次），于是会出现：A 调用刚清完默认、正 await 文件，
+        ///   B 调用（或界面）在这一瞬读到 <c>SubAutoHours=0</c> ——
+        ///   按钮画成「关闭」而环按 6 小时跑，或反过来。这正是本项目反复治的
+        ///   "界面与后台各认一个值"，只是这次是时序造的。
         /// </summary>
         internal static async Task LoadAsync()
         {
-            AutoProbe = false;
-            PanelMultiEntry = false;
-            Source = "默认值";
+            bool autoProbe = false;
+            bool panelMultiEntry = false;
+            int subAutoHours = 0;
+            string source = "默认值";
+            bool warnPanel = false;
 
             try
             {
@@ -89,6 +118,7 @@ namespace ClashUWP.Backend
                 if (file == null)
                 {
                     // 没文件是"全新装包后什么都没配"的正常状态，不打警告。
+                    Apply(false, false, 0, "默认值");
                     Log();
                     return;
                 }
@@ -97,28 +127,47 @@ namespace ClashUWP.Backend
                 // ★ 解析走共享层唯一实现（<see cref="SettingsParse"/>），本类不再有第二套真值表。
                 Dictionary<string, string> map = SettingsParse.Parse(text);
 
-                AutoProbe = SettingsParse.Bool(map, "autoProbe", AutoProbe);
-                PanelMultiEntry = SettingsParse.Bool(map, "panelMultiEntry", PanelMultiEntry);
-                Source = "settings.txt";
-
-                // ★【1.0.115】开启多条目时留一条显式警告：平台限制不会因为我们开了开关就消失。
-                if (PanelMultiEntry)
-                    RollingLog.Warn("appsettings",
-                        "panelMultiEntry=1：订阅条目将出现在快速设置面板。" +
-                        "受 UWP VPN Plugin 平台限制，A 连着时点 B 会卡在「验证你的登录信息」" +
-                        "（请求不进插件，Docs/43+57），必须先手动断开 A 再连 B。");
+                autoProbe = SettingsParse.Bool(map, "autoProbe", false);
+                panelMultiEntry = SettingsParse.Bool(map, "panelMultiEntry", false);
+                // ★ 档位归一在 SubscriptionAutoPolicy 里（白名单外一律 0），
+                //   这里不写第二套：SettingsParse.Int 只管"是不是整数"，
+                //   "6 小时还是 7 小时"这种业务档位不是它的职责。
+                subAutoHours = SubscriptionAutoPolicy.NormalizeHours(
+                    SettingsParse.String(map, "subAutoHours", ""));
+                source = "settings.txt";
+                warnPanel = panelMultiEntry;
             }
             catch (Exception ex)
             {
                 // ★ 只进滚动日志，不写 debug-out：这条路是启动装配，没有命令方在读结果。
-                Source = $"默认值（读取失败 {ex.GetType().Name}）";
+                source = $"默认值（读取失败 {ex.GetType().Name}）";
                 RollingLog.Error("appsettings", "settings.txt", ex);
             }
+
+            Apply(autoProbe, panelMultiEntry, subAutoHours, source);
+
+            // ★【1.0.115】开启多条目时留一条显式警告：平台限制不会因为我们开了开关就消失。
+            //   ★ 这条不能进 Apply：Apply 也用于"失败路径回默认"，那时 panelMultiEntry 是 false，
+            //   判据写了反而像在说"你开了"。
+            if (warnPanel)
+                RollingLog.Warn("appsettings",
+                    "panelMultiEntry=1：订阅条目将出现在快速设置面板。" +
+                    "受 UWP VPN Plugin 平台限制，A 连着时点 B 会卡在「验证你的登录信息」" +
+                    "（请求不进插件，Docs/43+57），必须先手动断开 A 再连 B。");
 
             Log();
         }
 
+        private static void Apply(bool probe, bool multiEntry, int hours, string src)
+        {
+            AutoProbe = probe;
+            PanelMultiEntry = multiEntry;
+            SubAutoHours = hours;
+            Source = src;
+        }
+
         private static void Log() => RollingLog.Info("appsettings",
-            $"src={Source} autoProbe={(AutoProbe ? 1 : 0)} panelMultiEntry={(PanelMultiEntry ? 1 : 0)}");
+            $"src={Source} autoProbe={(AutoProbe ? 1 : 0)} panelMultiEntry={(PanelMultiEntry ? 1 : 0)} " +
+            $"subAutoHours={SubAutoHours}");
     }
 }

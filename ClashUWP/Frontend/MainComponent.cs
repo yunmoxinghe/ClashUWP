@@ -73,6 +73,13 @@ namespace ClashUWP.Frontend
         private const int PageSettings = 3;
 
         /// <summary>
+        /// "首轮轮询还没回来"这个状态的哨兵串（快照的 <c>Error</c> 位）。
+        /// ★ 建初值与空态判断共用这一个常量：两处各写一遍字面量，改一个字就变成
+        ///   "还没问到"被谎报成"内核未运行"（任务书 §八场景 5 要防的正是这个）。
+        /// </summary>
+        private const string NotPolledError = "(尚未查询)";
+
+        /// <summary>
         /// 侧边栏条目。★ 图标是<b>原始字形码</b>（框架把它直接塞进 <c>FontIcon.Glyph</c>，
         /// 见 <c>NavigationViewHandler.FillMenuGroup</c>），所以字形必须来自
         /// Segoe MDL2 Assets 的真表：这四个码位是从官方 WinUI-Gallery 的
@@ -97,6 +104,11 @@ namespace ClashUWP.Frontend
         // ---- 日志 ----
         private Action<string> _setLogText = _ => { };
         private Action<bool> _setLogOpen = _ => { };
+        // ★【1.0.119 · G4/G5】内核实时日志（<c>GET /logs</c>）单独一个槽：
+        //   它和 logs/app.log（<c>logText</c>）是两种来源 —— 一个是内核推的事件流、
+        //   一个是我们自己写的滚动文件。塞进同一个槽会出现"抓了内核日志就把
+        //   文件日志顶掉、界面上看不出顶掉的是谁"，与本项目的"来源必须可见"口径冲突。
+        private Action<string> _setKernelLog = _ => { };
 
         // ---- 选节点（G2 的 UI 化）----
         private Action<string> _setSelectedGroup = _ => { };
@@ -115,6 +127,22 @@ namespace ClashUWP.Frontend
 
         // ---- 隧道实际连接的订阅 id（★【1.0.86 · Docs/36 B 案】分歧必须看得见）----
         private Action<string> _setConnectedSub = _ => { };
+
+        // ---- 实时流量（★【1.0.119 · G6】累计字节差分出的速率）----
+        //   只存<b>一行文本</b>而不是速率数值：速率的算法与"未知"的三种形状全在
+        //   <see cref="TrafficRate"/>（纯函数、离线钉死），这里只负责画它。
+        private Action<string> _setTraffic = _ => { };
+        // ★ 上一条<b>累计值</b>与它的采样时刻 —— 差分要用。放在字段而不是 UseState：
+        //   它是轮询循环自己的私有账本，<b>不参与渲染</b>（画出去的是上面那一行文本）。
+        //   口径同 _subUrl 那条"渲染之外的代码只读字段"的纪律。
+        private long _prevUp, _prevDown;
+        private DateTime _prevTrafficAt = DateTime.MinValue;
+
+        // ---- 订阅自动更新档位（★【1.0.119】小时数，0=关）----
+        //   ★ 这份状态只是<b>画给按钮看的</b>；执行环读的是 <c>AppSettings.SubAutoHours</c>。
+        //   两者由 <c>SetSubscriptionAutoHoursAsync</c> 一起改（落盘 + 改现值），
+        //   所以不会出现"按钮亮了、环还在按旧档位跑"。
+        private Action<int> _setSubAutoHours = _ => { };
 
         // ---- 应用分流（G9）----
         // ★ 状态里存的是<b>规范化后的名单行</b>（<c>kind|标识|去向</c>），不是 AppSplit 对象：
@@ -150,15 +178,24 @@ namespace ClashUWP.Frontend
 
             var (vpnStatus, setVpnStatus) = UseState("未连接");
             var (actionHint, setActionHint) = UseState("");
-            var (snap, setSnap) = UseState(KernelView.Snapshot.Failed("(尚未查询)"));
+            var (snap, setSnap) = UseState(KernelView.Snapshot.Failed(NotPolledError));
             var (logText, setLogText) = UseState("");
             var (logOpen, setLogOpen) = UseState(false);
+            var (kernelLog, setKernelLog) = UseState("");
             var (selectedGroup, setSelectedGroup) = UseState("");
             var (subInfo, setSubInfo) = UseState(SubscriptionView.Info.Missing());
             var (subUrl, setSubUrl) = UseState("");
             var (subProfiles, setSubProfiles) = UseState(new List<SubscriptionManager.Profile>());
             var (subActive, setSubActive) = UseState(new SubscriptionManager.ActiveInfo("", ""));
             var (connectedSub, setConnectedSub) = UseState("");
+            var (traffic, setTraffic) = UseState("速率 首次采样…");
+            // ★【1.0.119 · 代理页排序】默认原序 = 作者顺序，理由全在 NodeSort 的类注释里；
+            //   这一档和材质那三档一样<b>故意不落盘</b>（settings.txt 是插件的把手文件，
+            //   为一个观感开关引入 read-modify-write 不值当）。
+            var (sortMode, setSortMode) = UseState(NodeSort.Mode.Original);
+            // ★【1.0.119 · 订阅自动更新】初值先按"关"画，挂载时从 settings.txt 现读一次再纠正
+            //   （纠正那一段的理由写在挂载效果里，别在这儿重复）。
+            var (subAutoHours, setSubAutoHours) = UseState(0);
 
             // ---- 应用分流（G9）状态 ----
             var (splitLines, setSplitLines) = UseState(new List<string>());
@@ -179,12 +216,15 @@ namespace ClashUWP.Frontend
             _setSnap = setSnap;
             _setLogText = setLogText;
             _setLogOpen = setLogOpen;
+            _setKernelLog = setKernelLog;
             _setSelectedGroup = setSelectedGroup;
             _setSubInfo = setSubInfo;
             _setSubUrl = setSubUrl;
             _setSubProfiles = setSubProfiles;
             _setSubActive = setSubActive;
             _setConnectedSub = setConnectedSub;
+            _setTraffic = setTraffic;
+            _setSubAutoHours = setSubAutoHours;
             _setSplitLines = setSplitLines;
             _setSplitNote = setSplitNote;
             _setSplitMsg = setSplitMsg;
@@ -258,9 +298,46 @@ namespace ClashUWP.Frontend
                             var s = await KernelView.LoadAsync();
                             _setSnap(s);
 
-                            // ★【1.0.81 · Q4】内核刚起来（边沿触发，每轮只回放一次）→
-                            //   回放上次记下的节点选择，弥补 home 只读导致的跨重启不持久。
-                            string replayMsg = await MihomoController.ReplaySelectionsAsync();
+                            // ★【1.0.119 · G6】实时流量：内核给的是累计字节，速率靠<b>相邻两轮差分</b>。
+                            //   判据（首样/计数器回退/间隔非正 ⇒ "未知"而不是 0）全在
+                            //   <see cref="TrafficRate"/> 里，离线已逐条钉住；这里只做两件事：
+                            //   把本轮累计值存成下一条、把差出来的那一行交给界面。
+                            // ★★ 内核不可达（配置视图）时<b>不能只是"不动这条"</b>。
+                            //   第一版就是<b>不动这条</b>、让界面保留上一行，理由是"断开时也想知道刚才多少" ——
+                            //   那正是 1.0.79/1.0.80 已经栽过的形状：<b>状态文本悄悄停在最后一次
+                            //   成功的读数上</b>，界面看着还在跑，实际早就读不出来了
+                            //   （memory「Sentinel silent death」）。流量这一行没有任何理由例外：
+                            //   "↑512B/s" 挂在一条已经断掉的隧道上，比挂一个「读不到」危险得多。
+                            //   ⇒ 现在显式改成读不到，并把差分账本<b>清成"还没有上一条"</b>：
+                            //     重连后的第一拍因此报「首次采样」，而不是拿"断开前那次读数"
+                            //     与"重连后这次"跨一段不可达窗口相减 —— 那段窗口里内核可能已经
+                            //     重启过，计数器回退会被算成一次突发（判据 2 兜得住，但那是运气，
+                            //     不是设计；窗口长度本身也是未知的，速率的分母就不成立）。
+                            if (s.Ok)
+                            {
+                                DateTime nowT = DateTime.Now;
+                                var rate = TrafficRate.Between(_prevUp, _prevDown, _prevTrafficAt,
+                                    s.Totals.Upload, s.Totals.Download, nowT);
+                                _prevUp = s.Totals.Upload;
+                                _prevDown = s.Totals.Download;
+                                _prevTrafficAt = nowT;
+                                _setTraffic($"{rate.Describe()}　" +
+                                            TrafficRate.DescribeTotals(s.Totals.Upload,
+                                                s.Totals.Download, s.Totals.Memory));
+                            }
+                            else
+                            {
+                                _prevTrafficAt = DateTime.MinValue;
+                                _setTraffic("速率 读不到（内核不可达）　" +
+                                            "重连后第一拍是「首次采样」，不拿断开前的读数跨窗口做差");
+                            }
+
+                            // ★【1.0.81 · Q4 / 1.0.119 重写】把本轮快照交给回放：
+                            //   判据是"内核现值 vs selection.txt 台账有漂移"，不再靠可达边沿
+                            //   （旧那只 bool 闩在读台账前就置位，且复位只挂在下面这个 catch 上，
+                            //   而内核不可达是 Ok=false 不抛 ⇒ 闩一置上就再也不回放）。
+                            //   内核重启/快速重连落在两次轮询之间也追得上；无漂移时一个 PUT 都不发。
+                            string replayMsg = await MihomoController.ReplaySelectionsAsync(s);
                             if (replayMsg.Length > 0)
                                 RollingLog.Info("selection-replay", replayMsg);
                             // ★ 同时刷新 VPN 连接状态：系统快速设置发起的连接绕过了我们的
@@ -430,7 +507,9 @@ namespace ClashUWP.Frontend
                         }
                         catch (Exception ex)
                         {
-                            // ★【1.0.81 · Q4】内核掉线 → 复位回放边沿，下次起来再回放一次。
+                            // ★【1.0.81 · Q4 / 1.0.119】轮询异常 → 复位回放状态（冷却与汇总基线），
+                            //   下次内核可达是新的一轮。注意这条<b>不是</b>回放的常规复位入口：
+                            //   内核不可达时 LoadAsync 返回 Ok=false 而不抛，复位走的是那里。
                             MihomoController.MarkKernelUnreachable();
 
                             // ★ 一次失败不该停掉轮询（这句老注释的语义没变），但"失败"本身
@@ -524,6 +603,19 @@ namespace ClashUWP.Frontend
                                        string.Join(" / ", StrList(dv.Parsed.Rejected)));
                     }
                     catch { _setDnsSnapshot("(读取 dns-config.txt 失败)"); }
+
+                    // ★【1.0.119 · 订阅自动更新】档位也从 settings.txt 现读一次再进状态：
+                    //   AppSettings 的那个静态字段由启动装配填，而装配是 fire-and-forget，
+                    //   第一帧渲染时它可能还没回来 —— 按钮亮在错误的档位上比不亮更糟
+                    //   （用户会以为"我设过 6 小时"，实际环读的是 0）。
+                    //   这里不等装配、自己读，是因为这条判据错了不会碰网络，
+                    //   而装配那条链的失败模式（settings.txt 读失败）默认是"关"，正好一致。
+                    try
+                    {
+                        await AppSettings.LoadAsync();
+                        _setSubAutoHours(AppSettings.SubAutoHours);
+                    }
+                    catch { /* 读不到就停在"关闭"那一档，界面上照样是那句"自动更新 关闭" */ }
                 });
             }, Array.Empty<object>());
 
@@ -531,12 +623,13 @@ namespace ClashUWP.Frontend
             //   （轮询挂在挂载时的那次渲染上，切页只换 content 子树。）
             Element body = page switch
             {
-                PageProxy => ProxyPage(snap, activeGroup, actionHint),
-                PageSubscription => SubscriptionPage(subInfo, subProfiles, subActive, subUrl, actionHint),
-                PageSettings => SettingsPage(actionHint, logOpen, logText, material, setMaterial,
+                PageProxy => ProxyPage(snap, activeGroup, actionHint, sortMode, setSortMode),
+                PageSubscription => SubscriptionPage(subInfo, subProfiles, subActive, subUrl,
+                                                    actionHint, subAutoHours, setSubAutoHours),                PageSettings => SettingsPage(actionHint, logOpen, logText, kernelLog, snap,
+                        material, setMaterial,
                         splitLines, splitNote, splitMsg, probeText, splitKind, splitIdentity, splitTarget,
                         dnsText, dnsMsg, dnsSnapshot),
-                _ => HomePage(vpnStatus, actionHint, snap, subActive, connectedSub),
+                _ => HomePage(vpnStatus, actionHint, snap, subActive, connectedSub, traffic),
             };
 
             return NavigationView(
@@ -614,7 +707,7 @@ namespace ClashUWP.Frontend
         /// ★ 这三块共用 3 秒轮询那份快照，切到别的页轮询照跑（见 <c>Render</c> 里的挂载 effect）。
         /// </summary>
         private Element HomePage(string vpnStatus, string actionHint, KernelView.Snapshot snap,
-            SubscriptionManager.ActiveInfo subActive, string connectedSub) =>
+            SubscriptionManager.ActiveInfo subActive, string connectedSub, string traffic) =>
             Page(
                 Section("VPN 控制",
                     TextBlock($"当前状态：{vpnStatus}"),
@@ -658,6 +751,25 @@ namespace ClashUWP.Frontend
 
                 Section("内核运行态", KernelStatusPanel(snap)),
 
+                // ★【1.0.119 · G6】实时流量。CMFA 功能对比里那条 P0 缺口（Docs/26）的补法：
+                //   <b>不引入 WebSocket</b>，直接把 3 秒轮询<b>已经在打</b>的
+                //   <c>GET /connections</c> 根级三字段读出来、按相邻两轮差分成速率。
+                //   代价如实写在界面上（"3 秒平均"那句），不假装是每秒瞬时值。
+                Section("实时流量",
+                    TextBlock(traffic),
+                    // ★【1.0.119】内核不可达时上面那一行<b>已经</b>被改成「读不到（内核不可达）」，
+                    //   这一句是补它的原因与下一步，不是靠它来打补丁 ——
+                    //   轮询里那条注释记着"为什么不保留上一行"（1.0.79/1.0.80 那个形状）。
+                    snap.Ok ? Empty()
+                        : TextBlock("连上内核后这一行恢复速率；重连后的第一拍会是「首次采样」，" +
+                                    "因为断开前的那次读数不能跨一段不可达窗口做差。")
+                            .Foreground(Theme.SecondaryText),
+                    TextBlock("速率是相邻两次轮询（约 3 秒）之间的「平均」值，不是每秒瞬时；" +
+                              "累计与内存来自内核原话（downloadTotal / uploadTotal / memory）。" +
+                              "「—」是读不出，不是 0 —— 首次采样、内核重启把计数器清零、" +
+                              "都会画成「—」而不是假尖峰或假 0。")
+                        .Foreground(Theme.SecondaryText)),
+
                 Section("活动连接", ConnectionList(snap)));
 
         /// <summary>
@@ -665,11 +777,38 @@ namespace ClashUWP.Frontend
         /// ★【1.0.75】把 <c>actionHint</c> 也画上：这一页以前<b>不显示任何返回文本</b>，
         ///   所以"点节点没反应"其实是后端在报错（组名拆错了），界面却一言不发。
         ///   现在每次点选的结果（含失败原因、自动组的说明）都落在页顶。
+        /// ★【1.0.119 · 代理页排序】<c>sortMode</c>/<c>setSortMode</c> 是成员区那一排的
+        ///   视角选择（原序/延迟/名称）。判据不在这里 —— 全在 <see cref="NodeSort"/>，
+        ///   本函数只负责把模式送进去、把"多少条未测"那句摘要画出来。
         /// </summary>
         private Element ProxyPage(KernelView.Snapshot snap, string activeGroup,
-                                  string actionHint) =>
+                                  string actionHint, NodeSort.Mode sortMode,
+                                  Action<NodeSort.Mode> setSortMode) =>
             Page(
                 actionHint.Length > 0 ? TextBlock(actionHint).Foreground(Theme.SecondaryText) : Empty(),
+
+                // ★★【1.0.118 · 节点浏览与 VPN 解耦】来源横幅。这一页的数据有两种身份，
+                //   界面必须当场说清是哪一种（任务书 §五的硬要求）：
+                //   · Ok —— 内核实时（REST 可达；含"断开后内核常驻"这一档，照旧全功能）；
+                //   · !Ok && FromConfigFile —— config.yaml 的<b>配置视图</b>：组与节点是
+                //     磁盘原文的定义，没有延迟、没有实时现值；点节点走"预设 + 回放"，
+                //     不是当场改内核；
+                //   · !Ok && !FromConfigFile —— 磁盘上也没有可列出的定义（没拉过订阅），
+                //     空态要给<b>下一步动作</b>，不许留白。
+                //   ★ 首轮轮询还没回来时（Error="(尚未查询)"）画"加载中"而不是"内核未运行" ——
+                //     任务书 §八场景 5：内核启动中/首轮未归,不能把"还没问到"谎报成"没有"。
+                snap.Ok ? Empty()
+                    : snap.Error == NotPolledError
+                        ? TextBlock("正在查询内核与本地配置…").Foreground(Theme.SecondaryText)
+                        : TextBlock(snap.FromConfigFile
+                            ? "★ 内核未运行 —— 下面是本地订阅（config.yaml）解析出的配置视图：" +
+                              "无延迟数据、无活动连接。点节点会记为预设选择，" +
+                              "下次内核可达（连接或常驻重启）时自动回放生效；不改动内核、也不发起 VPN 连接。"
+                            : "★ 内核未运行，本地也没有可列出的节点定义 —— " +
+                              "先在「订阅」页拉取订阅（拉取不需要 VPN 连接）。")
+                            .Foreground(Theme.SecondaryText),
+                snap.ConfigNote.Length > 0
+                    ? TextBlock(snap.ConfigNote).Foreground(Theme.SecondaryText) : Empty(),
 
                 Section("模式",
                     HStack(8,
@@ -688,19 +827,23 @@ namespace ClashUWP.Frontend
                 //   于是"我现在看的到底是哪个组"全靠上面那排按钮里的 ▶ 猜。
                 //   没连上内核（一个组都没有）时退回"节点"，不给空标题。
                 Section(activeGroup.Length > 0 ? activeGroup : "节点",
-                    MemberList(snap, activeGroup)),
+                    MemberList(snap, activeGroup, sortMode, setSortMode)),
 
                 // ★【1.0.81 · M7/Q10】订阅源（提供方）状态面板：让 provider 级
                 //   「刷没刷到、拉了多少节点、流量剩多少」可见（此前只能看到被提升到
                 //   /proxies 的节点），对齐官方 GET /providers/proxies 能力。
                 Section("订阅源（提供方）", ProviderPanel(snap)));
 
-        /// <summary>订阅页：元信息 + 已存 profile + 拉取/更新/热重载。</summary>
+        /// <summary>
+        /// 订阅页：元信息 + 已存 profile + 拉取/更新/热重载 + <b>自动更新档位</b>（1.0.119）。
+        /// </summary>
         private Element SubscriptionPage(SubscriptionView.Info info,
                                          List<SubscriptionManager.Profile> profiles,
                                          SubscriptionManager.ActiveInfo active,
                                          string subUrl,
-                                         string actionHint) =>
+                                         string actionHint,
+                                         int subAutoHours,
+                                         Action<int> setSubAutoHours) =>
             Page(
                 Section("当前生效", SubscriptionPanel(info, profiles, active)),
 
@@ -720,7 +863,39 @@ namespace ClashUWP.Frontend
                     HStack(8,
                         Button("更新当前订阅", () => _ = UpdateSubscriptionAsync()),
                         Button("重新加载配置", () => _ = ReloadConfigAsync()),
-                        Button("刷新列表", () => _ = RefreshSubscriptionsAsync()))));
+                        Button("刷新列表", () => _ = RefreshSubscriptionsAsync()))),
+
+                // ★【1.0.119 · 订阅定时自动更新】判据整段在 SubscriptionAutoPolicy（离线夹具钉着），
+                //   这一节只画档位、画"下次"、画"为什么这一拍没跑"。
+                //   ★ "下次"在这里<b>现算</b>，不读执行环那个字段：环每 5 分钟才拍一次，
+                //   刚改完档位若显示上一次的 null，用户看到的是"开了但下次—"，
+                //   而这句恰恰是这一节里唯一能证明"它真的认了你这个档位"的东西。
+                Section("自动更新订阅",
+                    SubAutoPicker(subAutoHours, setSubAutoHours),
+                    TextBlock(SubscriptionAutoPolicy.StatusLine(
+                                  subAutoHours,
+                                  SubAutoNextDue(subAutoHours, profiles, active),
+                                  SubscriptionAutoUpdater.FailStreak))
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock($"最近一次检查：{SubscriptionAutoUpdater.LastNote}")
+                        .Foreground(Theme.SecondaryText),
+                    TextBlock("★【1.0.123】到点就拉，连着 VPN 也照样更新（口径同 Clash Verge）：" +
+                              "先写正文 + 原地热重载内核，这一步不拆隧道；" +
+                              "只有「隧道还记着、内核却不认这份配置」才自己断开重拨一次补上" +
+                              "（重载发不出去、或核心重载后失联）；" +
+                              "内核明确拒收、会话状态读不出、或台上本来没连接 —— 这三种都绝不动隧道。" +
+                              "系统 profile 那条路另有更里层的闸：会话期间不写存储、断开后自动补；" +
+                              "且只在本应用开着、没被挂起的时候检查 —— 没有后台任务，应用关了不会自己更新。")
+                        .Foreground(Theme.SecondaryText),
+                    subAutoHours > 0
+                        ? TextBlock("★ 已开启：到点会重写生效配置并热重载内核。" +
+                                    "订阅里换了节点、改了规则都会直接进到正在跑的隧道里（不断流），" +
+                                    "没连的时候就在下一次连接生效。" +
+                                    "唯一会自己动隧道的形状：正在跑的隧道已经不认这份新配置了 —— " +
+                                    "那一刻流量本来就不通，所以拆掉重拨一次（这几秒会没网），" +
+                                    "一轮更新只拨一次，失败会退避并写在上面那行。")
+                              .Foreground(Theme.Accent)
+                        : Empty()));
 
         /// <summary>
         /// 设置页：背景材质 + <b>应用分流</b>（G9）+ 取证/调试入口 + 日志。
@@ -732,6 +907,7 @@ namespace ClashUWP.Frontend
         ///   没有第二种读者会被写坏 —— 与上面那条纪律不冲突，别把它当成"把手已经进界面"。
         /// </summary>
         private Element SettingsPage(string actionHint, bool logOpen, string logText,
+                                     string kernelLog, KernelView.Snapshot snap,
                                      int material, Action<int> setMaterial,
                                      List<string> splitLines, string splitNote, string splitMsg,
                                      string probeText, string splitKind, string splitIdentity,
@@ -766,7 +942,7 @@ namespace ClashUWP.Frontend
                               "名单为空时内核配置一字不改。")
                         .Foreground(Theme.SecondaryText),
                     TextBlock("★ 生效时机两条都行：断开再连一次，或点「订阅 → 重新加载配置」热重载。" +
-                              "名单在<b>每次连接</b>和<b>每次热重载</b>时各重读一次，不需要重建 profile。")
+                              "名单在「每次连接」和「每次热重载」时各重读一次，不需要重建 profile。")
                         .Foreground(Theme.SecondaryText),
                     TextBlock("走的是内核规则层（PROCESS-NAME / PROCESS-PATH），不是平台的 traffic filter：" +
                               "后者只要列表非空就会把没匹配上的应用一起拦掉，实测整机断网（Docs/08 §5.2 run 19）。")
@@ -809,7 +985,96 @@ namespace ClashUWP.Frontend
 
                 Section("应用日志",
                     Button(logOpen ? "收起日志" : "查看日志", () => _ = ToggleLogAsync(logOpen)),
-                    logOpen ? LogPanel(logText) : Empty()));
+                    logOpen ? LogPanel(logText) : Empty()),
+
+                // ★★【1.0.119 · G4/G5】内核实时日志进界面。
+                //   在此之前 <c>GET /logs</c> 只挂在 debug-cmd（写文件的 <c>logs</c> 命令）上，
+                //   界面上<b>没有任何入口</b> —— 于是"这次拨号失败内核到底报了什么"
+                //   只有愿意开命令行、知道去读 LocalState 的人才看得见，而那一层
+                //   恰恰是本项目反复出静默失效的地方（Docs/08 的 run 14、Docs/12 §6）。
+                //   等级、抬升与恢复的判据全在 <c>MihomoController.RunLogStreamAsync</c>，
+                //   这里只负责"点一下、12 秒、把原文画出来"。
+                Section("内核实时日志",
+                    HStack(8,
+                        Button(kernelLog.Length == 0 ? "抓取 12 秒" : "重新抓取 12 秒",
+                            () => _ = FetchKernelLogAsync(snap))),
+                    TextBlock($"当前内核日志等级：{(snap.LogLevel.Length == 0 ? "(读不到)" : snap.LogLevel)}　" +
+                              "抓取时若不是 debug 会临时抬到 debug，结束后恢复这一档；" +
+                              "拨号失败原文（dial / bind）在 mihomo 里是 Debug 级，info 档下 /logs 一条都不推。")
+                        .Foreground(Theme.SecondaryText),
+                    LogPanel(kernelLog)));
+
+        /// <summary>
+        /// 界面上那句"下次"的现算：<b>生效那一份</b>订阅文件的写入时刻 + 档位（+ 退避）。
+        /// ★ 用 <c>Profile.FetchedAt</c>（就是 <c>subscriptions/{id}.yaml</c> 的 mtime），
+        ///   不另开时间戳文件 —— 口径必须和执行环那一支逐字相同，否则界面说的"下次"
+        ///   和环真正动手的时刻是两件事（同 <see cref="SubscriptionAutoUpdater"/> 类注释的理由）。
+        /// </summary>
+        private static DateTime? SubAutoNextDue(int hours,
+                                                List<SubscriptionManager.Profile> profiles,
+                                                SubscriptionManager.ActiveInfo active)
+        {
+            if (!SubscriptionAutoPolicy.IsOn(hours)) return null;
+            foreach (var p in profiles)
+                if (p.Id == active.Id)
+                    return SubscriptionAutoPolicy.NextDueAt(p.FetchedAt, hours,
+                                                            SubscriptionAutoUpdater.FailStreak);
+            return null;   // 生效那份的文件不在清单里：没有"上次"，不猜一个下次
+        }
+
+        /// <summary>
+        /// 订阅自动更新的档位按钮（★【1.0.119】）。
+        ///
+        /// 【为什么画整排而不是一个下拉】档位在白名单里，<b>画出来就是可选项全集</b>：
+        ///   下拉/输入框会让用户写一个 1、7、1000 这种环不认的数，然后
+        ///   <c>NormalizeHours</c> 判成「关」—— 按钮亮着、实际不跑，正是最坏的那种谎。
+        /// 【"关闭"必须排在第一个且永远画得出来】默认值必须是"什么都不改"那一档。
+        /// </summary>
+        private Element SubAutoPicker(int current, Action<int> set)
+        {
+            var buttons = new List<Element>();
+            foreach (int h in SubscriptionAutoPolicy.IntervalHours)
+            {
+                int hours = h;   // 闭包捕获当前值：直接捕获循环变量在旧 C# 里会全部指向最后一档
+                string label = hours == 0 ? "关闭" : $"{hours}h";
+                buttons.Add(Button((current == hours ? "▶ " : "") + label,
+                    () => _ = SetSubAutoHoursAsync(hours, set)));
+            }
+            return HStack(8, buttons.ToArray());
+        }
+
+        /// <summary>
+        /// 改档位：落盘 + 改执行环读的现值 + 改按钮。三步<b>必须都成</b>，
+        /// 少任何一步都会得到"界面与后台各认一个档位"。失败时回滚按钮到原档位，
+        /// 而不是让它停在用户刚点的那一档上 —— 点了没写成的按钮亮着，
+        /// 比不亮危险得多（用户会以为已经开了）。
+        /// </summary>
+        private async Task SetSubAutoHoursAsync(int hours, Action<int> set)
+        {
+            int before = AppSettings.SubAutoHours;
+            try
+            {
+                await ProfileGate.SetSubscriptionAutoHoursAsync(hours);
+                set(AppSettings.SubAutoHours);
+                _setActionHint($"自动更新档位已设为 {SubscriptionAutoPolicy.Label(AppSettings.SubAutoHours)}" +
+                               "（连着 VPN 也照常更新，更新当前生效那一份）");
+            }
+            catch (Exception ex)
+            {
+                set(before);
+                _setActionHint($"改档位失败，已退回 {SubscriptionAutoPolicy.Label(before)}：{ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 排序视角的其中一枚按钮（▶ 打在当前那一档上）。
+        /// ★ 单独成函数是因为三档必须<b>形态一致</b>：以前这种"三枚按钮"在两处
+        ///   各抄一遍，抄漏一枚的结果是"某一档看起来永远选不中"。
+        /// </summary>
+        private static Element SortModeButton(string label, NodeSort.Mode thisMode,
+                                              NodeSort.Mode current,
+                                              Action<NodeSort.Mode> set) =>
+            Button((current == thisMode ? "▶ " : "") + label, () => set(thisMode));
 
         /// <summary>
         /// 材质三档。★ <b>故意不落盘</b>：做成"改一次记一次"要往 <c>settings.txt</c> 里加键，
@@ -959,8 +1224,13 @@ namespace ClashUWP.Frontend
         /// ★ 组名/节点名<b>原样透传</b>（中文、带 emoji、带前导空格）——任何 trim / 规范化
         ///   都会让内核找不到那个组（<c>KernelView.Find</c> 同为 Ordinal）。
         /// ★ 延迟只在测过的时候显示（CMFA：<c>delay in 0..Short.MAX_VALUE</c> 才画胶囊）。
+        /// ★【1.0.119 · 排序】页头下面那一排是<b>视角</b>选择，默认「原序」；
+        ///   它换的是<b>真节点的先后</b>，组行与内置策略行<b>不动位置</b>，
+        ///   所以「📺 动画疯 第一个成员是 🔰 选择节点」这种作者排布在三种视角下都还在。
+        ///   分档与判据全在 <see cref="NodeSort"/>（离线夹具钉着），这里只画。
         /// </summary>
-        private Element MemberList(KernelView.Snapshot s, string groupName)
+        private Element MemberList(KernelView.Snapshot s, string groupName,
+                                   NodeSort.Mode sortMode, Action<NodeSort.Mode> setSortMode)
         {
             if (s.Groups.Count == 0) return Empty();
 
@@ -974,21 +1244,46 @@ namespace ClashUWP.Frontend
             //   ★ 测速按钮放页头而不是每个节点一行：安卓就是这个位置
             //     （<c>ProxyActivity</c> 右上角 ⚡ = <c>healthCheck(当前组)</c>，
             //     一次拨完这组所有成员），且自动组的赢家本来就是测速决定的，逐点没意义。
+            // ★【1.0.118】内核未运行（配置视图）时"现值"标注预设身份、⚡ 换成明示文案：
+            //   测速只能由内核发起，本应用<b>绝不</b>为了测速去拨 VPN（任务书 §4.4 与
+            //   "永不占死整机网络"的收工纪律同一条）。
+            string nowShown = parent.Now.Length == 0 ? "（未选）"
+                : s.FromConfigFile ? parent.Now + "（预设，内核可达时回放生效）" : parent.Now;
             items.Add(HStack(8,
-                TextBlock($"{parent.Type}　现值 {(parent.Now.Length > 0 ? parent.Now : "（未选）")}" +
+                TextBlock($"{parent.Type}　现值 {nowShown}" +
                           $"　真节点 {parent.RealNodeCount} / 成员 {parent.Members.Count}")
                     .Foreground(Theme.SecondaryText),
-                Button("测速", () => _ = HealthCheckAsync(parent.Name))));
+                s.Ok ? Button("测速", () => _ = HealthCheckAsync(parent.Name))
+                     : TextBlock("内核未运行：无法测速（测速不会为此发起 VPN 连接）")
+                           .Foreground(Theme.SecondaryText)));
             if (!parent.IsUserSelectable)
                 items.Add(TextBlock(
                     $"（该组类型由内核测速/故障转移自己选，和安卓版一样不可手选；" +
                     "下面列的是它的候选，▶ 只是当前赢家。）")
                     .Foreground(Theme.SecondaryText));
 
-            // ── 正文：一列混排，顺序 = 内核给的 all 原序（= 订阅原序） ────
-            //   ★ 不重排、不分块：安卓的 Default 排序就是订阅里的原序，重排会让
-            //     "📺 动画疯 第一个成员是 🔰 选择节点"这种作者有意为之的顺序丢掉。
-            foreach (var m in parent.Members)
+            // ── 排序视角（★【1.0.119】默认原序；判据见 NodeSort）──────────
+            //   只在组确实有成员时画，空组不给一排点了没反应的按钮。
+            if (parent.Members.Count > 0)
+            {
+                items.Add(HStack(8,
+                    SortModeButton("原序", NodeSort.Mode.Original, sortMode, setSortMode),
+                    SortModeButton("延迟", NodeSort.Mode.Delay, sortMode, setSortMode),
+                    SortModeButton("名称", NodeSort.Mode.Name, sortMode, setSortMode),
+                    TextBlock(NodeSort.DelaySummary(parent.Members))
+                        .Foreground(Theme.SecondaryText)));
+                // ★ 这句只在真的排了序时出现：原序是默认，不需要解释；
+                //   一旦切走，必须当场说明"组行没跟着动"，否则用户会以为
+                //   ■ 那几行也参与了排序，回头找作者顺序找不到了。
+                if (sortMode != NodeSort.Mode.Original)
+                    items.Add(TextBlock("（■ 组行与 ◇ 内置策略不参与排序，仍留在原位）")
+                        .Foreground(Theme.SecondaryText));
+            }
+
+            // ── 正文：一列混排，顺序 = 所选视角下的成员表（默认 = 内核原序） ──
+            //   ★ 默认那条纪律没变：不重排、不分块，安卓的 Default 排序就是订阅原序。
+            //     重排只在用户主动选了「延迟/名称」时发生，而且组/内置的位置不动。
+            foreach (var m in NodeSort.Order(parent.Members, sortMode))
             {
                 bool isNow = string.Equals(m.Name, parent.Now, StringComparison.Ordinal);
                 string mark = isNow ? "▶ " : "　 ";
@@ -1155,7 +1450,12 @@ namespace ClashUWP.Frontend
             //   顶层条目并附该字段）。补进副标题，让用户分清单子是订阅直给还是某提供方动态拉来。
             string src = (!m.IsGroup && !m.IsBuiltin && m.ProviderName.Length > 0)
                 ? $" · {m.ProviderName}" : "";
-            string body = kind + src;
+            // ★【1.0.118 · 配置视图】server:port 只在本地 config.yaml 解析时填得出来
+            //   （REST 的 /proxies 不返回这两个字段）。有就拼上——任务书 §4.1 要的
+            //   "详情字段（name/type/server/port）"在离线这一侧补齐。
+            string addr = (!m.IsGroup && !m.IsBuiltin && m.Server.Length > 0)
+                ? $" · {m.Server}:{m.Port}" : "";
+            string body = kind + src + addr;
 
             // 延迟三档：<b>没测过不写</b>（KernelView 顶部口径）、<b>0 写"不通"</b>、>0 写毫秒。
             // ★【1.0.93】0 必须单列：官方在测速失败时往 history 写的就是 <c>Delay=0</c>
@@ -1288,20 +1588,89 @@ namespace ClashUWP.Frontend
             return list;
         }
 
-        /// <summary>活动连接：目标 / 链路 / 上下行。</summary>
-        private static Element ConnectionList(KernelView.Snapshot s)
+        /// <summary>
+        /// 活动连接：协议 / 目标 / 链路 / 上下行 + <b>逐条强断</b>。
+        /// ★【1.0.119 · G4】这一版加了「断开」「全部断开」两个动作。在此之前这一块<b>只能看</b>，
+        ///   强断只存在于 debug-cmd（<c>connections kill</c> / <c>kill-all</c>），
+        ///   而界面上这一列的 <c>id</c> 早在解析时被丢掉（见 <see cref="KernelView.Conn"/>），
+        ///   所以"给它加个按钮"不是加个 UI —— 是把后端那条断链补齐。
+        /// ★ 上下行从裸字节改成 <see cref="FormatBytes"/>：以前一行写
+        ///   <c>↑1048576 ↓2097152</c>，人要心算才看得出"这条还在长"，
+        ///   而"还在长"正是"该不该断它"的判据。
+        /// ★ 只显示前 30 条，条数不说谎（<c>…（另有 N 条未列出）</c>）：
+        ///   这条列表在真机上是几十上百条的量，全画出来这一页没法用，
+        ///   但"没画出来"必须写成数字，不能省略号糊过去。
+        /// </summary>
+        private Element ConnectionList(KernelView.Snapshot s)
         {
             if (!s.Ok) return TextBlock("(内核未连接)");
-            if (s.Connections.Count == 0) return TextBlock("(当前没有活动连接)");
 
-            var items = new List<Element>();
+            var items = new List<Element>
+            {
+                HStack(8,
+                    Button("全部断开", () => _ = CloseAllConnsAsync()),
+                    Button("刷新", () => _ = RefreshNowAsync()),
+                    TextBlock($"共 {s.Connections.Count} 条").Foreground(Theme.SecondaryText))
+            };
+            if (s.Connections.Count == 0)
+            {
+                items.Add(TextBlock("(当前没有活动连接)"));
+                return VStack(items.ToArray());
+            }
+
             int shown = 0;
             foreach (var c in s.Connections)
             {
-                if (shown++ >= 30) { items.Add(TextBlock("…（更多）")); break; }
-                items.Add(TextBlock($"{c.Target}　{c.Chain}　↑{c.Upload} ↓{c.Download}"));
+                if (shown++ >= 30)
+                {
+                    items.Add(TextBlock($"…（另有 {s.Connections.Count - 30} 条未列出）")
+                        .Foreground(Theme.SecondaryText));
+                    break;
+                }
+                items.Add(HStack(8,
+                    TextBlock($"{(c.Network.Length > 0 ? c.Network.ToUpperInvariant() + " " : "")}" +
+                              $"{c.Target}　{c.Chain}　↑{FormatBytes(c.Upload)} ↓{FormatBytes(c.Download)}"),
+                    // ★ id 为空时按钮禁用而不是画一个"点了必失败"的按钮：
+                    //   列表是 3 秒前的，强断要的是<b>现在</b>还在的那条。
+                    Button("断开", () => _ = CloseConnAsync(c.Id)).IsEnabled(c.Id.Length > 0)));
             }
             return VStack(items.ToArray());
+        }
+
+        /// <summary>
+        /// 强断一条连接，随后<b>立刻</b>把快照读回来。
+        /// ★ 为什么必须自己 reload：内核回 204 只代表"已受理"，界面上那条还在，
+        ///   等 3 秒轮询把它抹掉会让用户以为按钮没生效 —— 本项目的老账：静默等于没修。
+        /// ★ 结果一律进 <c>actionHint</c>（动作回话），不碰 <c>vpnStatus</c>（读数槽），
+        ///   分工是 1.0.96 那条钉死的。
+        /// </summary>
+        private async Task CloseConnAsync(string id)
+        {
+            try
+            {
+                string result = await MihomoController.CloseConnectionAsync(id);
+                _setActionHint(result);
+                _setSnap(await KernelView.LoadAsync());
+            }
+            catch (Exception ex)
+            {
+                _setActionHint($"断开失败: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>清空所有活动连接（<c>DELETE /connections</c>），同样立刻 reload。</summary>
+        private async Task CloseAllConnsAsync()
+        {
+            try
+            {
+                string result = await MihomoController.CloseAllConnectionsAsync();
+                _setActionHint(result);
+                _setSnap(await KernelView.LoadAsync());
+            }
+            catch (Exception ex)
+            {
+                _setActionHint($"清空失败: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         /// <summary>日志：整块放进 ScrollViewer 里，可以滚。</summary>
@@ -1528,6 +1897,19 @@ namespace ClashUWP.Frontend
         {
             try
             {
+                // ★【1.0.118 · 任务书 §4.2 情形 B】先判内核可达性，再决定走哪条切换路：
+                //   · 可达（含"断开后内核常驻"的情形 A）→ 原实时路径 PUT+回读，行为一字不改；
+                //   · 不可达 → 写预设台账 selection.txt（与实时成功后记的是<b>同一个</b>台账），
+                //     内核下次可达由 ReplaySelectionsAsync 回放生效。
+                //   ★ 不是 UI-only：不改按钮状态骗人，落的是磁盘台账；
+                //   ★ 不借道起内核：内核归插件生命周期管，前台不擅自拨 VPN。
+                var s0 = await KernelView.LoadAsync();
+                if (!s0.Ok)
+                {
+                    _setActionHint(ConfigNodeView.RecordPreset(s0.Groups, group, member));
+                    _setSnap(await KernelView.LoadAsync());   // 重载配置视图，"现值（预设）"跟着更新
+                    return;
+                }
                 string result = await MihomoController.SelectAsync(group, member);
                 _setActionHint(result);
                 _setSnap(await KernelView.LoadAsync());
@@ -1558,6 +1940,16 @@ namespace ClashUWP.Frontend
         {
             try
             {
+                // ★【1.0.118 · 任务书 §4.4】测速走内核 REST，内核不可达时这里先判、直接给出
+                //   "核心不可用"这一档，不进"测速中"（那是"已在跑"的口径）。
+                //   ★ 这句话同时是纪律：测速绝不为了出数去拨 VPN。
+                var s0 = await KernelView.LoadAsync();
+                if (!s0.Ok)
+                {
+                    _setActionHint("内核未运行：无法测速（测速走内核 REST，不会为此发起 VPN 连接）");
+                    _setSnap(s0);   // 顺带把快照刷成配置视图，页面与提示口径一致
+                    return;
+                }
                 _setActionHint($"测速中：{group}（要拨完这组所有成员，最慢决定这一轮的成败）");
                 string result = await MihomoController.TriggerGroupHealthCheckAsync(group);
                 _setActionHint(result);
@@ -1591,6 +1983,26 @@ namespace ClashUWP.Frontend
             {
                 _setLogText($"读日志失败: {ex.GetType().Name}: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// 抓 12 秒内核实时日志并画进「内核实时日志」那块。
+        /// ★ 内核不可达时<b>当场拒绝并说明</b>，不发起 VPN 连接 —— 口径同 1.0.118 的测速按钮：
+        ///   <c>/logs</c> 走的是回环 REST，隧道不是它的前提；把它和"先连上 VPN"绑起来
+        ///   是假的依赖，而"点了按钮给我拨出一条隧道"是本项目明令禁止的动作。
+        /// ★ 等级怎么抬、抬完恢复成哪一档，后端已经决定（未知等级回退 <c>info</c>，
+        ///   不会把用户的 <c>warning</c> 悄悄改成 <c>info</c>），这里不重复判。
+        /// </summary>
+        private async Task FetchKernelLogAsync(KernelView.Snapshot snap)
+        {
+            if (!snap.Ok)
+            {
+                _setActionHint("内核未运行：抓不了实时日志（这条路只读内核 REST，不会为此发起 VPN 连接）");
+                return;
+            }
+            await RunAsync(_setKernelLog,
+                "正在抓取 12 秒内核日志…（期间不刷新这一块，等它自己回来）",
+                () => MihomoController.RunLogStreamAsync(12, snap.LogLevel));
         }
 
         /// <summary>

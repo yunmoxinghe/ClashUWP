@@ -982,6 +982,55 @@ namespace ClashUWP.Backend
         }
 
         /// <summary>
+        /// ★【1.0.123】<see cref="ClashUWP.Backend.SessionPresence"/> 的<b>纯读</b>实现：只扫一遍清单，
+        /// 不发断开、不修中毒条目、不删建（那些动作各有自己的门与账，见
+        /// <see cref="TearDownSessionForSwitchAsync"/>；本方法被"更新生效阶梯"调用，
+        /// 它一旦顺手发断开，"自动处理"就变成了第二次未授权的网络动作）。
+        ///
+        /// 【清单本身读不出来时】回 <see cref="SessionPresence.Unreadable"/>：这就是"读不出"的字面情形，
+        /// 阶梯据此不动隧道并如实报"未能确认已应用"。不向上抛是为了不把一次成功的落盘
+        /// 伪装成拉取失败（正文已经写完了）。
+        /// 【为什么共用现成的尺子】会话态的判定走 <see cref="IsActiveSessionStatus"/>
+        ///   （<c>Connected ∪ Connecting</c>，官方 sample 那把），探测条目按
+        ///   <see cref="FindActiveSessionAsync"/> 的同一条规则排除 ⇒ 全项目对"有没有会话"
+        ///   仍然只有一个词表，阶梯不另立判据。
+        /// </summary>
+        internal static async Task<SessionPresence> ReadSessionPresenceAsync()
+        {
+            IReadOnlyList<IVpnProfile> profiles;
+            try
+            {
+                profiles = await ProfileStore.GetProfilesAsync();
+            }
+            catch (Exception ex)
+            {
+                RollingLog.Warn("sub-apply",
+                    $"读会话状态：profile 清单本身读不出（{ex.GetType().Name}）⇒ 按不可知处理，不动隧道");
+                return SessionPresence.Unreadable;
+            }
+
+            bool anyUnreadable = false;
+            foreach (IVpnProfile p in profiles)
+            {
+                if (p is not VpnPlugInProfile pp || !IsOurs(pp)) continue;
+                if (pp.ProfileName is "ClashUWP-Probe" or "ClashUWP-Dataface") continue;
+                string st = StatusOf(pp);
+                if (IsActiveSessionStatus(st))
+                {
+                    RollingLog.Info("sub-apply",
+                        $"读会话状态：[{pp.ProfileName}] 状态={st} ⇒ 会话活着");
+                    return SessionPresence.LiveSession;
+                }
+                if (st == StatusUnreadable) anyUnreadable = true;
+            }
+
+            string verdict = anyUnreadable
+                ? "有条目读数坏掉 ⇒ 不可知" : "全部读得出来且都不是会话态 ⇒ 无会话";
+            RollingLog.Info("sub-apply", $"读会话状态：{verdict}");
+            return anyUnreadable ? SessionPresence.Unreadable : SessionPresence.NoSession;
+        }
+
+        /// <summary>
         /// ★【1.0.92 · Docs/44】官方"活动会话"的两个态（sample :92-93）。
         ///   写成一处具名判据，是为了让所有读"当前会话在哪"的调用点共用<b>同一个</b>词表。
         /// ★【1.0.93 · 删 hook 批】原先共用它的两个拒绝点（按钮路径 <c>SerializeBehindActiveSessionAsync</c>

@@ -97,15 +97,136 @@ namespace ClashUWP.Backend.Mihomo
         ///   现在把 <c>MihomoController.ReadProxiesTable</c> 的 <c>ByName</c> 带下来，
         ///   UI 才能照安卓那样给每行一条副标题（组显示 <c>Selector(现值)</c>、
         ///   节点显示协议类型），并且只对真节点显示延迟。
+        /// ★【1.0.118 · 配置视图】<see cref="Server"/> / <see cref="Port"/> 只在
+        ///   <c>ConfigNodeView</c>（内核未运行时读 config.yaml 的"配置视图"）里填 ——
+        ///   REST <c>/proxies</c> 不回这两个字段。内核实时路径恒为空串，UI 据此
+        ///   "有值才画"，两条来源共用同一个 Member 模型，不分叉出第二套数据。
         /// </summary>
         internal sealed record Member(string Name, long DelayMs, string Type,
                                      bool IsGroup, bool IsBuiltin, string Now,
-                                     string ProviderName);
+                                     string ProviderName,
+                                     string Server = "", string Port = "");
 
-        /// <summary>一条活动连接。</summary>
-        internal sealed record Conn(string Target, string Chain, long Upload, long Download);
+        /// <summary>
+        /// 一条活动连接。
+        /// ★【1.0.119 · G4】多了 <see cref="Id"/> —— 强断单个连接要靠它
+        ///   （<c>DELETE /connections/{id}</c>）。这一列以前<b>在解析时被丢掉</b>：
+        ///   内核原文里有 <c>id</c>，旧记录只留 <c>Target/Chain/Upload/Download</c>，
+        ///   于是界面即使画出"断开"按钮也无从可断。
+        ///   <c>Target</c> 在 metadata 缺失时仍会退化成 <c>id</c>（1.0.75 那条修复的口径），
+        ///   但那只是显示兜底，<b>不能</b>拿它当 <see cref="Id"/> 用。
+        /// ★【1.0.119】<see cref="Network"/>（<c>tcp</c>/<c>udp</c>）也一并读出来：
+        ///   强断一条 UDP 与强断一条 TCP 的观感不同（UDP 会立刻被应用重头发起来），
+        ///   界面不显示协议就没法解释"断开了又冒出来一条"。
+        /// </summary>
+        internal sealed record Conn(string Id, string Target, string Chain,
+                                    long Upload, long Download, string Network);
+
+        /// <summary>
+        /// 把 <c>GET /connections</c> 的原文解析成 <see cref="Conn"/> 列表。
+        /// ★【1.0.119 · 为什么单独成函数】这一层以前嵌在 <c>LoadAsync</c> 里，
+        ///   于是"id 到底读没读""metadata 是对象还是字符串""端口是数字还是字符串"
+        ///   这几条只能等装机后从界面上看一眼。抽成纯函数后
+        ///   <c>Tools/YamlShapeTest</c> 能拿内核原文的样例 JSON 逐条钉住
+        ///   （1.0.75 那次"metadata 被当字符串读、界面全是 UUID"的静默失效，
+        ///   离线一条断言就能拦住）。
+        /// 内核原文里 <c>connections</c> 不是数组（旧内核/错误响应）时返回空表，不抛。
+        /// ★ 根元素<b>本身</b>不是对象时也一样返回空表：
+        ///   <see cref="System.Text.Json.JsonElement.TryGetProperty(string, out System.Text.Json.JsonElement)"/>
+        ///   对数组/字符串根<b>是抛</b> <c>InvalidOperationException</c> 而不是返回 false ——
+        ///   这条不是想象出来的 —— 夹具里那句"不是数组→空表，不抛"第一次跑就抛在这，
+        ///   根元素是数组时 <c>TryGetProperty</c> 直接炸（<c>Tools/YamlShapeTest</c> 的 G4 组）。
+        /// </summary>
+        internal static List<Conn> ParseConnections(System.Text.Json.JsonElement root)
+        {
+            var list = new List<Conn>();
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Object)
+                return list;
+            if (!root.TryGetProperty("connections", out var arr) ||
+                arr.ValueKind != System.Text.Json.JsonValueKind.Array)
+                return list;
+            foreach (var c in arr.EnumerateArray())
+            {
+                if (c.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    continue;
+                list.Add(new Conn(
+                    GetStr(c, "id"),
+                    ReadChainLabel(c),
+                    ReadChainText(c),
+                    ReadJsonInt(c, "upload", 0),
+                    ReadJsonInt(c, "download", 0),
+                    ReadNetwork(c)));
+            }
+            return list;
+        }
+
+        /// <summary><c>metadata.network</c>（<c>tcp</c>/<c>udp</c>）；读不到给空串，不猜。</summary>
+        private static string ReadNetwork(System.Text.Json.JsonElement c)
+        {
+            if (c.TryGetProperty("metadata", out var md) &&
+                md.ValueKind == System.Text.Json.JsonValueKind.Object)
+                return GetStr(md, "network");
+            return "";
+        }
+
+        /// <summary>
+        /// 内核的累计流量与常驻内存（<c>GET /connections</c> 响应的<b>根级</b>字段）。
+        ///
+        /// 【口径来源 —— 逐字读的官方源码，不是猜的】
+        ///   <c>mihomo v1.19.32 / tunnel/statistic/manager.go:124</c>：
+        ///   <code>
+        ///   type Snapshot struct {
+        ///       DownloadTotal int64 `json:"downloadTotal"`
+        ///       UploadTotal   int64 `json:"uploadTotal"`
+        ///       Connections   []*TrackerInfo `json:"connections"`
+        ///       Memory        uint64 `json:"memory"`
+        ///   }
+        ///   </code>
+        ///   <c>Manager.Snapshot()</c>（同文件 <c>:84</c>）填的是 <c>downloadTotal.Load()</c> ——
+        ///   ★ <b>是累计字节，不是速率</b>。速率在 Go 侧叫 blip（<c>:117 handle()</c> 里
+        ///   每秒 <c>Blip.Store(Temp.Swap(0))</c>），<b>不在这个响应里</b>，
+        ///   只经 <c>/traffic</c> 与 <c>/connections</c> 的 WebSocket 升级推送
+        ///   （<c>hub/route/server.go:371</c>、<c>hub/route/connections.go:25</c>）。
+        ///
+        /// 【所以速率怎么来】<b>两次轮询差分</b>：<c>(cur - prev) / (now - prevAt)</c>。
+        ///   这条路线的依据就是上面那段源码 —— 累计量单调增、且由内核自己维护，
+        ///   我们不需要新开通道，只需要 3 秒轮询<b>已经打过</b>的那一个请求
+        ///   （<c>/connections</c> 本来就在打，这一版只是把以前<b>丢掉的根级三个字段读出来</b>）。
+        ///   差分的判据（计数器变小 = <c>ResetStatistic</c>/内核重启、间隔非正、首个样本）
+        ///   在 <c>TrafficRate</c> 里，是纯函数、离线钉死。
+        ///
+        /// 【<see cref="Memory"/> 是白拿的】同一个响应里的 <c>memory</c> 是内核 RSS
+        ///   （<c>manager.go:80 updateMemory()</c> 走 <c>memory.GetMemoryInfo(pid)</c>）。
+        ///   Docs/60 那条内存实测一直在手工量，这一版起界面上常驻可见。
+        ///   读不到给 <c>0</c>，UI 必须按"0 = 没有这个数"处理，不许画成"内存 0 B"。
+        /// </summary>
+        internal readonly record struct Traffic(long Upload, long Download, long Memory);
+
+        /// <summary>
+        /// 从 <c>GET /connections</c> 的根元素读出累计流量与内存。
+        /// 纯函数（原文进、数据出）⇒ <c>Tools/YamlShapeTest</c> 直接钉字段名。
+        /// 根不是对象、或键缺失/类型不对 ⇒ 对应值为 <c>0</c>，不抛、不猜。
+        /// </summary>
+        internal static Traffic ParseTraffic(System.Text.Json.JsonElement root)
+        {
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Object)
+                return new Traffic(0, 0, 0);
+            return new Traffic(
+                ReadJsonInt(root, "uploadTotal", 0),
+                ReadJsonInt(root, "downloadTotal", 0),
+                ReadJsonInt(root, "memory", 0));
+        }
 
         /// <summary>内核运行态总览。</summary>
+        /// <remarks>
+        /// ★【1.0.118 · 节点浏览与 VPN 解耦】<see cref="FromConfigFile"/> 为真时，
+        ///   <see cref="Groups"/> 里的数据来自<b>本地 config.yaml 的解析</b>（配置视图），
+        ///   不是内核实时 —— <see cref="Ok"/> 照旧为 false（内核确实不可达），
+        ///   <b>不许</b>有实现把"组列出来了"当成"内核起来了"。UI 必须按这两个字段
+        ///   分来源画（横幅文案见 <c>MainComponent.ProxyPage</c>）。
+        ///   之所以把配置视图折进同一个 Snapshot 而不是新开一路状态：3 秒轮询、
+        ///   选择、测速判定的<b>唯一观察者</b>就是这份快照，分两处就会各说各话。
+        /// </remarks>
         internal sealed record Snapshot(
             bool Ok,
             string Error,
@@ -114,7 +235,13 @@ namespace ClashUWP.Backend.Mihomo
             string InterfaceName,
             IReadOnlyList<Group> Groups,
             IReadOnlyList<Conn> Connections,
-            IReadOnlyList<MihomoController.ProviderInfo> Providers)
+            IReadOnlyList<MihomoController.ProviderInfo> Providers,
+            bool FromConfigFile = false,
+            string ConfigNote = "",
+            // ★【1.0.119 · 实时流量】累计字节与内核 RSS（<c>GET /connections</c> 根级三字段）。
+            //   默认 <c>default(Traffic)</c> = 三个 0 ⇒ "没有这个数"，配置视图/失败快照都走这里，
+            //   UI 不许把 0 画成"流量 0 / 内存 0"（见 <see cref="Traffic"/> 那条）。
+            Traffic Totals = default)
         {
             internal static Snapshot Failed(string error) => new(
                 false, error, "", "", "",
@@ -167,6 +294,11 @@ namespace ClashUWP.Backend.Mihomo
             }
 
             // ③ 活动连接：GET /connections
+            //   ★【1.0.119】这一路<b>顺手</b>把根级的累计流量/内存也读出来（<see cref="ParseTraffic"/>）：
+            //   请求本来就在打，以前只取 <c>connections</c> 数组、把三个根字段丢了。
+            //   速率由 <c>TrafficRate</c> 在 UI 侧按两次采样差分算 —— 本层不做时间算术，
+            //   因为"上一次采到的值"是界面那一条 3 秒循环的状态，不是内核响应的一部分。
+            var totals = new Traffic();
             if (error.Length == 0)
             {
                 try
@@ -174,18 +306,8 @@ namespace ClashUWP.Backend.Mihomo
                     using var http = MihomoController.NewLoopbackClient(10);
                     string json = await http.GetStringAsync("http://127.0.0.1:9090/connections");
                     using var doc = System.Text.Json.JsonDocument.Parse(json);
-                    if (doc.RootElement.TryGetProperty("connections", out var arr) &&
-                        arr.ValueKind == System.Text.Json.JsonValueKind.Array)
-                    {
-                        foreach (var c in arr.EnumerateArray())
-                        {
-                            conns.Add(new Conn(
-                                ReadChainLabel(c),
-                                ReadChainText(c),
-                                ReadNum(c, "upload"),
-                                ReadNum(c, "download")));
-                        }
-                    }
+                    conns.AddRange(ParseConnections(doc.RootElement));
+                    totals = ParseTraffic(doc.RootElement);
                 }
                 catch (Exception ex)
                 {
@@ -207,7 +329,22 @@ namespace ClashUWP.Backend.Mihomo
                     $"读 /providers/proxies 失败（补充信息，忽略）: {ex.GetType().Name}");
             }
 
-            return new Snapshot(error.Length == 0, error, mode, level, iface, groups, conns, providers);
+            // ★【1.0.118 · 节点浏览与 VPN 解耦】内核不可达时落回"配置视图"：
+            //   读 config.yaml 里的组/节点定义交给 UI（Ok 仍为 false，FromConfigFile=true
+            //   标住来源 —— 不谎称内核在跑）。回环端口关着是瞬时拒绝，这一路的代价
+            //   只是读一次文件、行式解析一遍；活动连接与提供方在配置视图里没有，
+            //   给空列表（提供方名字由 ConfigNote 一句"需内核运行"代答）。
+            if (error.Length > 0)
+            {
+                var cv = await ConfigNodeView.LoadAsync();
+                return new Snapshot(false, error, "", "", "", cv.Groups,
+                    System.Array.Empty<Conn>(),
+                    System.Array.Empty<MihomoController.ProviderInfo>(),
+                    cv.Found, cv.Found ? cv.Note : cv.Error);
+            }
+
+            return new Snapshot(true, error, mode, level, iface, groups, conns, providers,
+                false, "", totals);
         }
 
         /// <summary>
@@ -287,13 +424,17 @@ namespace ClashUWP.Backend.Mihomo
                     string port = GetStr(md, "destinationPort");
                     if (port.Length == 0)
                     {
-                        long p = ReadNum(md, "destinationPort");
+                        long p = ReadJsonInt(md, "destinationPort", 0);
                         port = p > 0 ? p.ToString() : "";
                     }
                     return port.Length > 0 ? $"{host}:{port}" : host;
                 }
             }
-            return GetStr(c, "id");
+            // ★【1.0.119】兜底从 <c>GetStr(c,"id")</c> 改成明说"目标未知"：
+            //   这一列以前就是"界面每个连接显示成 UUID"（Docs/26 那条）的第二个来源 ——
+            //   主路径修好之后，metadata 真缺的那几条仍然会被 UUID 顶上去。
+            //   id 现在有自己的一列（强断要用），不该再冒充目标。
+            return "(目标未知)";
         }
 
         private static string GetStr(System.Text.Json.JsonElement e, string name)
@@ -302,10 +443,24 @@ namespace ClashUWP.Backend.Mihomo
             return v.ValueKind == System.Text.Json.JsonValueKind.String ? v.GetString() ?? "" : "";
         }
 
-        private static long ReadNum(System.Text.Json.JsonElement e, string name)
+        /// <summary>
+        /// 读一个整数字段，缺/类型不对给 <paramref name="whenMissing"/>。
+        /// ★【1.0.119】数字也可能是<b>字符串</b>（老 Clash 的 downloadTraffic 那一族）。
+        ///   只认 Number 的那种原文下"↑0 ↓0"会一直显示成 0 —— 读不出来和读出来是 0，
+        ///   在界面上长得一模一样。解析按不变文化（订阅里的数字串不该受系统区域影响）。
+        /// ★ 这一份是全仓唯一的"数字或字符串"读数；<c>MihomoController.ReadNumber</c>
+        ///   只是它的 -1 包装（两份实现迟早漂，读出来的 0 与"没读到"就是这么混起来的）。
+        /// </summary>
+        internal static long ReadJsonInt(System.Text.Json.JsonElement e, string name, long whenMissing)
         {
-            if (!e.TryGetProperty(name, out var v)) return 0;
-            return v.ValueKind == System.Text.Json.JsonValueKind.Number ? v.GetInt64() : 0;
+            if (!e.TryGetProperty(name, out var v)) return whenMissing;
+            if (v.ValueKind == System.Text.Json.JsonValueKind.Number && v.TryGetInt64(out long n))
+                return n;
+            if (v.ValueKind == System.Text.Json.JsonValueKind.String &&
+                long.TryParse(v.GetString(), System.Globalization.NumberStyles.Integer,
+                              System.Globalization.CultureInfo.InvariantCulture, out long s))
+                return s;
+            return whenMissing;
         }
     }
 }

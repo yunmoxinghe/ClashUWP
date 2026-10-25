@@ -332,7 +332,73 @@ namespace ClashUWP.Backend.Mihomo
         }
 
         /// <summary>
-        /// 抓 <c>GET /logs</c> 事件流若干秒（debug logs 命令）。
+        /// mihomo 认的 <c>log-level</c> 五个值（<c>config/config.go</c> 的枚举；入参须已转小写）。
+        /// ★ 这条串会被拼进 <c>PATCH /configs</c> 的 JSON 体，所以<b>只走白名单</b>：
+        ///   任意字符串直接进 JSON 就是注入面 —— 一个 <c>"</c> 就能改掉别的字段
+        ///   （本项目对"界面/文件/内核回话来的字符串拼进请求"的口径同
+        ///   <see cref="ConnectionDeleteUri"/>）。不在名单里一律按 <c>info</c> 恢复。
+        /// </summary>
+        internal static bool IsKnownLogLevel(string level) =>
+            level is "silent" or "error" or "warning" or "info" or "debug";
+
+        /// <summary>
+        /// 【1.0.119 · 抽成纯函数】抓一次日志流对等级的<b>全部</b>决定：要不要抬到 debug、
+        /// 抬完恢复成哪一档。输入是"内核当前等级"（可以是空串 = 不知道）。
+        ///
+        /// 【为什么要单独出来】旧实现把这三行写在 <c>RunLogStreamAsync</c> 开头，而那个函数
+        ///   要挂住回环流 12 秒 —— 离线夹具进不去，于是"看个日志把用户的 warning 改成 info"
+        ///   这种错只能装机才发现，而它一旦犯就是<b>静默改掉内核状态</b>。
+        ///   抽出来之后 <c>Tools/YamlShapeTest</c> 能把五档 + 空串 + 大小写 + 脏值全钉住。
+        /// 【三条判据】
+        ///   ① 已经认识的值 → 恢复<b>回它自己</b>（不是硬编码 <c>info</c>）；
+        ///   ② 不认识/空串 → 恢复 <c>info</c>，★ 绝不把脏值原样拼进 PATCH 的 JSON 体
+        ///     （<see cref="IsKnownLogLevel"/> 那条白名单在这里生效）；
+        ///   ③ 当前已是 <c>debug</c> → 不抬（省一次 PATCH，也避免"抬完恢复失败留下 debug"
+        ///     之外再多一个中间态）。
+        /// </summary>
+        internal static (bool Elevate, string Restore) LogStreamLevelPlan(string currentLevel)
+        {
+            string lvl = currentLevel.Trim().ToLowerInvariant();
+            return (lvl != "debug", IsKnownLogLevel(lvl) ? lvl : "info");
+        }
+
+        /// <summary>
+        /// 只读内核当前的 <c>log-level</c>（<c>GET /configs</c>）。
+        /// ★ 读不到一律给<b>空串</b>而不是猜一个 <c>info</c>：空串在
+        ///   <see cref="LogStreamLevelPlan"/> 里就是"确实不知道"，会让它走保守档；
+        ///   猜成 <c>info</c> 则会在内核其实是 <c>warning</c> 时把恢复目标写错。
+        /// ★ 抛异常不记 —— 这条只是抓日志前的顺手一问，真正的失败会在紧接着的
+        ///   <c>GET /logs</c> 上原样暴露出来，两处各记一遍反而淹没判据。
+        ///   但"请求成了、正文里没有 log-level"这一支 <c>GET /logs</c> 永远不会替我们说，
+        ///   所以它必须自己留一行（否则恢复目标凭什么选了保守档，日志里查不到）。
+        /// </summary>
+        internal static async Task<string> GetLogLevelAsync(System.Net.Http.HttpClient http)
+        {
+            try
+            {
+                string json = await http.GetStringAsync("http://127.0.0.1:9090/configs");
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                {
+                    ClashUWP.Vpn.RollingLog.Warn("mihomo-loglevel",
+                        "GET /configs 正文不是对象，读不到当前 log-level（恢复走保守档）");
+                    return "";
+                }
+                if (doc.RootElement.TryGetProperty("log-level", out var ll) &&
+                    ll.ValueKind == System.Text.Json.JsonValueKind.String)
+                    return ll.GetString() ?? "";
+                ClashUWP.Vpn.RollingLog.Warn("mihomo-loglevel",
+                    "GET /configs 回包里不带 log-level 字段（恢复走保守档）");
+                return "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        /// <summary>
+        /// 抓 <c>GET /logs</c> 事件流若干秒（debug logs 命令、以及【1.0.119】界面的"内核日志"按钮）。
         ///
         /// 【为什么要】/logs 是<b>只推新事件</b>的流式接口，没有快照语义，
         /// 桌面侧也连不进容器（见 RunControllerProbeAsync 注释），所以只能
@@ -341,24 +407,48 @@ namespace ClashUWP.Backend.Mihomo
         ///   「can not find controller interface by name …」→ 绑卡名字口径问题，改 C# 即可；
         ///   「bind4: …」/setsockopt 被拒 → AppContainer 不让绑网卡，Go 侧也救不了；
         ///   只有 url-test/healthcheck 噪音 → 说明拨号根本没发起，问题在上游（DNS/路由/规则）。
+        ///
+        /// ★【1.0.119】<paramref name="currentLevel"/> = 抓之前内核<b>正在用</b>的 log-level
+        ///   （从 <c>GET /configs</c> 读，界面传 <c>Snapshot.LogLevel</c>）。两个作用：
+        ///   ① 已经是 <c>debug</c> 就<b>不抬、也不恢复</b> —— 旧实现无条件 PATCH 一次再
+        ///     无条件恢复成 <c>info</c>，等于"看个日志把用户的 warning 档改成了 info"；
+        ///   ② 恢复时回到<b>它原来的值</b>，而不是硬编码 <c>info</c>。
+        ///   传空串 = 调用方不知道 ⇒ <b>自己读一次</b> <c>GET /configs</c>（debug-cmd 那条路走这里）。
+        ///   读不到才退回旧口径（抬 debug、恢复 info），并在回话里说明等级未知。
+        ///   ★ 这一条不能省：调用方是 debug-cmd 时如果直接交空串给计划函数，
+        ///     看一次日志就会把用户的 <c>warning</c> 永久改成 <c>info</c> ——
+        ///     而这正是界面那个新按钮要被做出来之前，唯一在跑的入口。
         /// </summary>
-        internal static async Task<string> RunLogStreamAsync(int seconds)
+        internal static async Task<string> RunLogStreamAsync(int seconds, string currentLevel = "")
         {
             var sb = new StringBuilder();
             int n = 0;
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(seconds));
             using var http = NewLoopbackClient(seconds + 15);
             bool levelUp = false;
+            // ★ 调用方没给等级就自己读一次（读失败保持空串 = "确实不知道"）。
+            string levelHint = currentLevel.Trim();
+            if (levelHint.Length == 0)
+                levelHint = await GetLogLevelAsync(http);
+            (bool needElevate, string restoreLevel) = LogStreamLevelPlan(levelHint);
             try
             {
                 // ★ 先把日志等级抬到 debug 再挂流：拨号失败原文（dial … error / bind4: …）
                 //   在 mihomo 里是 Debug 级，log-level: info 下 /logs 一条都不会推
                 //   —— 实测 12 s 抓到 0 行（measure-11.log）。PATCH 是逐字段生效
                 //   （hub/route/configs.go patchConfigs：LogLevel 只调 log.SetLevel），
-                //   不会把 interface-name 之类的别的状态冲掉，finally 再恢复 info。
-                string lvlPatch = await PatchConfigsAsync(http, "{\"log-level\":\"debug\"}");
-                levelUp = lvlPatch.StartsWith("2");
-                sb.Append($"\n(抬 debug={lvlPatch})");
+                //   不会把 interface-name 之类的别的状态冲掉，finally 再恢复。
+                if (needElevate)
+                {
+                    string lvlPatch = await PatchConfigsAsync(http, "{\"log-level\":\"debug\"}");
+                    levelUp = lvlPatch.StartsWith("2");
+                    sb.Append($"\n(原等级={(levelHint.Length == 0 ? "(读不到)" : levelHint)}，" +
+                              $"抬 debug={lvlPatch}，结束后恢复 {restoreLevel})");
+                }
+                else
+                {
+                    sb.Append("\n(内核本已是 debug，不改等级)");
+                }
 
                 using var req = new System.Net.Http.HttpRequestMessage(
                     System.Net.Http.HttpMethod.Get, "http://127.0.0.1:9090/logs");
@@ -415,13 +505,14 @@ namespace ClashUWP.Backend.Mihomo
             {
                 if (levelUp)
                 {
-                    try { await PatchConfigsAsync(http, "{\"log-level\":\"info\"}"); }
+                    try { await PatchConfigsAsync(http, $"{{\"log-level\":\"{restoreLevel}\"}}"); }
                     catch (Exception ex)
                     {
                         // 恢复不了就留着 debug —— 但要在日志里留一句：
                         // 内核长期 debug 级会自己刷出大量事件，下次看日志的人得知道
                         // 这不是我们的本意。
-                        ClashUWP.Vpn.RollingLog.Warn("mihomo-logs", "log-level 未能恢复 info：" + ex.Message);
+                        ClashUWP.Vpn.RollingLog.Warn("mihomo-logs",
+                            $"log-level 未能恢复 {restoreLevel}：" + ex.Message);
                     }
                 }
             }
@@ -1329,21 +1420,38 @@ namespace ClashUWP.Backend.Mihomo
             System.Net.Http.HttpClient http,
             System.Collections.Generic.List<ProxyGroup> groups,
             string group, string node, bool fromDebugText)
+            => (await SelectCoreResultAsync(http, groups, group, node, fromDebugText)).Message;
+
+        /// <summary>
+        /// ★【1.0.119】<see cref="SelectCoreAsync"/> 的成败原先只写在返回的<b>文本</b>里
+        ///   （"PUT -&gt; 502"、"⚠ 现值与请求不一致"），调用方想判成败只能去匹配字符串。
+        ///   回放这条调用方必须判，所以把成败收成显式字段；文本原样保留，两条入口
+        ///   （UI/命令行/回放）走的还是同一份校验与同一种成功判据。
+        /// 【成功判据】HTTP 成功<b>且</b>回读 <c>now</c> 与请求的节点名逐字相同 ——
+        ///   204 不等于选上了，只有回读这一格能证明（下面那段注释的原话）。
+        /// </summary>
+        private readonly record struct SelectOutcome(bool Success, string Message);
+
+        private static async Task<SelectOutcome> SelectCoreResultAsync(
+            System.Net.Http.HttpClient http,
+            System.Collections.Generic.List<ProxyGroup> groups,
+            string group, string node, bool fromDebugText)
         {
             if (node.Length == 0)
-                return fromDebugText
+                return new SelectOutcome(false, fromDebugText
                     ? $"节点名为空。现有组：{string.Join(" | ", GroupNames(groups))}"
                     : "select 需要参数：select <组名> <节点名>（只有一个组时可只写节点名）。" +
-                      "先用 groups 命令看确切的组名与节点名。";
+                      "先用 groups 命令看确切的组名与节点名。");
 
             if (groups.Count == 0)
-                return "内核里没有可切换的代理组（先 groups / conf 确认订阅真的加载了）";
+                return new SelectOutcome(false,
+                    "内核里没有可切换的代理组（先 groups / conf 确认订阅真的加载了）");
 
             if (group.Length == 0)
             {
                 if (groups.Count > 1)
-                    return $"有 {groups.Count} 个组，必须指名：select <组名> <节点名>。组名：" +
-                           string.Join(" | ", GroupNames(groups));
+                    return new SelectOutcome(false, $"有 {groups.Count} 个组，必须指名：select <组名> <节点名>。组名：" +
+                           string.Join(" | ", GroupNames(groups)));
                 group = groups[0].Name;
             }
 
@@ -1357,9 +1465,10 @@ namespace ClashUWP.Backend.Mihomo
                 bool builtin = false;
                 foreach (string b in BuiltinProxyNames)
                     if (string.Equals(b, group, System.StringComparison.Ordinal)) { builtin = true; break; }
-                return $"找不到组 “{group}”（区分大小写，原样抄 groups 的输出）" +
+                return new SelectOutcome(false,
+                    $"找不到组 “{group}”（区分大小写，原样抄 groups 的输出）" +
                        (builtin ? "：它是内核的内置策略，不是可切换的代理组。" : "") +
-                       "现有组：" + string.Join(" | ", GroupNames(groups));
+                       "现有组：" + string.Join(" | ", GroupNames(groups)));
             }
 
             bool ok = false;
@@ -1369,9 +1478,10 @@ namespace ClashUWP.Backend.Mihomo
             {
                 // 前 12 个成员原样回显，够抄了；全量给会把 debug-out.txt 撑爆。
                 int n = target.Members.Count < 12 ? target.Members.Count : 12;
-                return $"组 “{group}” 里没有节点 “{node}”（区分大小写、空格与 emoji 都算）。" +
+                return new SelectOutcome(false,
+                    $"组 “{group}” 里没有节点 “{node}”（区分大小写、空格与 emoji 都算）。" +
                        $"前 {n} 个成员：{string.Join(" | ", target.Members.GetRange(0, n))}" +
-                       (target.Members.Count > n ? " …（全量见 groups）" : "");
+                       (target.Members.Count > n ? " …（全量见 groups）" : ""));
             }
 
             // 组名进 URL 一律 percent-encode。实测 PUT 吃原始 UTF-8（中文组名直接拼
@@ -1412,7 +1522,8 @@ namespace ClashUWP.Backend.Mihomo
                        "但测速/故障转移可能把它改回赢家 —— 不是 select 没成功。";
 
             if (!resp.IsSuccessStatusCode)
-                return $"PUT /proxies/{group} -> {(int)resp.StatusCode} {respBody}；现值 now={now}" + groupNote;
+                return new SelectOutcome(false,
+                    $"PUT /proxies/{group} -> {(int)resp.StatusCode} {respBody}；现值 now={now}" + groupNote);
 
             // ★【1.0.81 · Q4】手动组（Selector / relay）选择成功 → 客户端记下，
             //   供内核重启后由 ReplaySelectionsAsync 回放（home 只读，内核自己的
@@ -1421,92 +1532,161 @@ namespace ClashUWP.Backend.Mihomo
             if (target.Type is "Selector" or "select" or "Relay" or "relay")
                 SelectionStore.Record(group, node);
 
-            string verdict = string.Equals(now, node, System.StringComparison.Ordinal)
-                ? "★ 已选中" : "⚠ 现值与请求不一致，别当成功";
-            return $"PUT /proxies/{group} -> {(int)resp.StatusCode}；now={now}（{verdict}）" +
+            // ★【1.0.119】成败看回读，不看状态码：now 与请求逐字相同才算选中。
+            //   不一致时返回 Success=false —— 回放这条路据此隔窗重试，实时那路的文案
+            //   也照旧把"别当成功"说给用户听。
+            bool nowMatches = string.Equals(now, node, System.StringComparison.Ordinal);
+            string verdict = nowMatches ? "★ 已选中" : "⚠ 现值与请求不一致，别当成功";
+            return new SelectOutcome(nowMatches,
+                $"PUT /proxies/{group} -> {(int)resp.StatusCode}；now={now}（{verdict}）" +
                    $"\n※ 选择已记入客户端持久化（LocalState/selection.txt），内核重启后会自动回放；" +
                    $"若内核 home 日后迁到可写 LocalState（G10），这份客户端记录即作废、以内核为准。" +
-                   groupNote;
+                   groupNote);
         }
 
         /// <summary>
-        /// ★【1.0.81 · Q4】内核每次（重新）起来后，回放客户端记下的组选择。
+        /// ★【1.0.81 · Q4 / 1.0.119 重写】把客户端台账（<c>LocalState/selection.txt</c>）
+        /// 里的选择回到内核上。内核重启后手动组的 <c>now</c> 会退回配置默认值
+        /// （home 只读，内核自己的 <c>cache.db</c> 跨重启不保留），这一段就是补那一段记忆。
         ///
-        /// 由 UI 轮询在 <c>KernelView.LoadAsync()</c> 成功（即内核当前可达）后调用；
-        /// 用 <see cref="_kernelWasReachable"/> 做<b>边沿触发</b>：内核从不可达 → 可达时
-        /// 只回放一次，避免每 3 秒轮询都打一遍 <c>PUT</c>。内核掉线后由
-        /// <see cref="MarkKernelUnreachable"/> 复位，下次起来再回放。
+        /// 【★ 触发判据从"可达边沿"改成"现值漂移"，因为边沿那版是坏的】
+        ///   ① 旧实现用一只 bool 闩 <c>_kernelWasReachable</c>，而且<b>在读台账之前就置位</b>：
+        ///      "内核起来（那一刻台账还空）→ 用户在这次会话里点选"这个顺序下，
+        ///      后写进台账的每一条都再也没有回放周期 —— 记是记了，永远不放。
+        ///   ② 复位只挂在 UI 轮询的 <c>catch</c> 上，可内核不可达时
+        ///      <c>KernelView.LoadAsync</c> 是<b>返回 <c>Ok=false</c> 而不抛</b>
+        ///      （1.0.118 起还带回退的配置视图），catch 那条路压根不走 ⇒ 闩一旦置上就再也不回放。
+        ///   ③ 现在的判据不需要"看见掉线"：每轮拿<b>本轮快照</b>的组表现值跟台账比，
+        ///      有差就放。掉线发生在两次 3 秒轮询之间（VPN 快速重连、订阅切换）也追得上；
+        ///      没有差时一个 PUT 都不发，也不碰网络（台账文件读一次，几毫秒）。
         ///
-        /// 回放规则：只针对<b>手动组</b>（Selector / relay）；自动组（url-test /
-        /// fallback / load-balance）由内核自管，跳过；组或节点已不存在（订阅变了）
-        /// 也跳过。回放失败不抛（不连累轮询），下个可达周期会重试（本次未清边沿标志）。
+        /// 【逐条处置】判据抽到 <see cref="SelectionReplayPolicy"/>（离线夹具逐字编译同一份）：
+        ///   手动组（Selector / relay）才回放；自动组由内核自管；组或节点已不在内核表
+        ///   （订阅变了）跳过且<b>不删台账</b>。
+        /// 【★ 成败看回读】PUT 的成败来自 <see cref="SelectCoreResultAsync"/> 的显式字段
+        ///   （状态码成功<b>且</b>回读 <c>now</c> 与请求逐字相同），不再像旧实现那样把返回文本
+        ///   丢掉、失败也计入 applied。
+        /// 【失败怎么退】有失败项时不清漂移，但也不每 3 秒重试：同一版台账按
+        ///   <see cref="ReplayRetryCooldownSeconds"/> 隔窗再试；<b>全成功</b>或内核不可达时
+        ///   冷却自动清零 —— 否则"回放成功 → 60 秒内内核又重启一次"会被冷却吞掉，
+        ///   而那正是这条机制要服务的场景。
+        /// 【不刷屏】这条挂在 3 秒轮询上，汇总文本逐字重复时不再回出来（热路径禁重复行）。
         /// </summary>
-        private static bool _kernelWasReachable = false;
+        private const int ReplayRetryCooldownSeconds = 60;
 
-        internal static async Task<string> ReplaySelectionsAsync()
+        private static string _replayTriedSnapshot = "";
+        private static DateTime _replayTriedAt = DateTime.MinValue;
+        private static string _replayLastSummary = "";
+
+        internal static async Task<string> ReplaySelectionsAsync(KernelView.Snapshot snap)
         {
-            if (_kernelWasReachable)
-                return "";                 // 本轮内核已回放过，跳过
-            _kernelWasReachable = true;    // 先置位：即便后面失败也不重复刷
+            if (!snap.Ok)
+            {
+                // 内核不可达（含"只有配置视图"那一档）：清冷却与文案基线。
+                // 这一轮不放也不该放 —— 配置视图里的 now 是配置文件写的，不是内核现值。
+                ResetReplayState();
+                return "";
+            }
 
             var saved = SelectionStore.LoadAll();
-            if (saved.Count == 0)
-                return "";
+            if (saved.Count == 0) return "";
 
+            var plan = SelectionReplayPolicy.Plan(
+                saved, SelectionReplayPolicy.StatesFromKernelGroups(snap.Groups));
+
+            int already = 0, skipped = 0;
+            var toPut = new System.Collections.Generic.List<SelectionReplayPolicy.Item>();
+            foreach (var it in plan)
+            {
+                switch (it.Decision)
+                {
+                    case SelectionReplayPolicy.Kind.Put: toPut.Add(it); break;
+                    case SelectionReplayPolicy.Kind.AlreadySelected: already++; break;
+                    default: skipped++; break;      // 组/节点已不在内核表、非手动组
+                }
+            }
+            if (toPut.Count == 0) return "";         // 无漂移：连 GET 都不必多打一次
+
+            string snapshot = SelectionReplayPolicy.Snapshot(saved);
+            if (string.Equals(snapshot, _replayTriedSnapshot, StringComparison.Ordinal) &&
+                (DateTime.Now - _replayTriedAt).TotalSeconds < ReplayRetryCooldownSeconds)
+                return "";                            // 同一版台账刚试过且没成，隔窗再试
+
+            _replayTriedSnapshot = snapshot;
+            _replayTriedAt = DateTime.Now;
+
+            int applied = 0, failed = 0;
+            var notes = new System.Collections.Generic.List<string>();
             try
             {
+                // ★ 执行前重取一次组表：本轮快照最多可能已经隔了几秒（订阅这时可能刚刷新），
+                //   PUT 的校验要对着内核<b>当下</b>的表做，判据用快照、落子用新表。
                 using var http = NewLoopbackClient(10);
                 var groups = await FetchGroupsAsync(http);
-
-                int applied = 0, skipped = 0;
-                foreach (var kv in saved)
+                foreach (var it in toPut)
                 {
-                    ProxyGroup? g = null;
-                    foreach (var x in groups)
-                        if (string.Equals(x.Name, kv.Key, StringComparison.Ordinal)) { g = x; break; }
-                    if (g == null)
-                    {
-                        skipped++;
-                        continue;
-                    }
-                    // 自动组内核自管，回放无意义（且下一轮就被改回），跳过。
-                    if (g.Type is "URLTest" or "url-test" or "Fallback" or "fallback" or
-                        "LoadBalance" or "load-balance")
-                    {
-                        skipped++;
-                        continue;
-                    }
-                    bool member = false;
-                    foreach (var m in g.Members)
-                        if (string.Equals(m, kv.Value, StringComparison.Ordinal)) { member = true; break; }
-                    if (!member)
-                    {
-                        skipped++;          // 节点已不在该组（订阅变化）→ 跳过，不删除记录
-                        continue;
-                    }
-                    if (string.Equals(g.Now, kv.Value, StringComparison.Ordinal))
-                    {
-                        applied++;         // 内核当前就选着它，无需再打 PUT
-                        continue;
-                    }
-                    await SelectCoreAsync(http, groups, kv.Key, kv.Value, fromDebugText: false);
-                    applied++;
+                    SelectOutcome o = await SelectCoreResultAsync(
+                        http, groups, it.Group, it.Node, fromDebugText: false);
+                    if (o.Success) { applied++; continue; }
+                    failed++;
+                    if (notes.Count < 3) notes.Add(SingleLine(o.Message, 160));
                 }
-
-                return saved.Count == 0 ? "" :
-                    $"已回放上次节点选择 {applied} 项，跳过 {skipped} 项（组/节点已不存在或非手动组）";
             }
             catch (Exception ex)
             {
-                return $"回放节点选择失败: {ex.GetType().Name}（将在下次内核可达时重试）";
+                failed++;
+                notes.Add($"回放整体异常 {ex.GetType().Name}");
             }
+
+            string tail = $"（内核本就选中 {already} 项、跳过 {skipped} 项：非手动组或组/节点已不在内核表）";
+            if (failed == 0)
+            {
+                // 全成功 ⇒ 不留冷却、也不留文案基线：这一版台账已经落定，下次同一版再漂移
+                // （内核又重启了一次）应当<b>立刻</b>回放并再记一行，而不是被 60 秒冷却吞掉。
+                ResetReplayState();
+                return $"已回放节点选择 {applied} 项{tail}";
+            }
+            return EmitReplaySummary(
+                $"节点选择回放成功 {applied} / 失败 {failed} 项{tail}，" +
+                $"{ReplayRetryCooldownSeconds}s 后随下次轮询重试；失败原因：{string.Join("、", notes)}");
         }
 
         /// <summary>
-        /// 内核掉线时复位回放边沿（UI 轮询的 catch 分支调用）。
-        /// 下次内核可达时 ReplaySelectionsAsync 会再回放一次。
+        /// 失败汇总只在文本<b>变化</b>时回出来（调用方把它写进滚动日志）—— 这条挂在
+        /// 3 秒轮询 + 60 秒冷却上，逐字重复的行是刷屏；全成功那一路不走这里。
         /// </summary>
-        internal static void MarkKernelUnreachable() => _kernelWasReachable = false;
+        private static string EmitReplaySummary(string summary)
+        {
+            if (string.Equals(summary, _replayLastSummary, StringComparison.Ordinal)) return "";
+            _replayLastSummary = summary;
+            return summary;
+        }
+
+        /// <summary>内核不可达 / 掉线时复位回放状态：下次可达是新的一轮，冷却不清零会吃掉它。</summary>
+        private static void ResetReplayState()
+        {
+            _replayTriedSnapshot = "";
+            _replayTriedAt = DateTime.MinValue;
+            _replayLastSummary = "";
+        }
+
+        /// <summary>
+        /// 多行压成一行并截断 —— 滚动日志的行格式是看门狗的<b>机器契约</b>，禁内嵌换行；
+        /// 而 <see cref="SelectCoreResultAsync"/> 的文本里带 "\n※ ..." 这类续行。
+        /// </summary>
+        private static string SingleLine(string s, int max)
+        {
+            string flat = s.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ')
+                           .Replace('\t', ' ');
+            return flat.Length <= max ? flat : flat.Substring(0, max) + "…";
+        }
+
+        /// <summary>
+        /// 内核掉线时复位回放状态（UI 轮询的 catch 分支调用）。
+        /// 与 <see cref="ReplaySelectionsAsync"/> 里的 <c>!snap.Ok</c> 那一路同一件事 ——
+        /// 那条是常态（内核不可达不抛异常），这一条留给真正的轮询异常。
+        /// </summary>
+        internal static void MarkKernelUnreachable() => ResetReplayState();
 
         /// <summary>组名列表（报错时把候选原样回出来，供照抄）。</summary>
         private static System.Collections.Generic.IEnumerable<string> GroupNames(
@@ -1573,26 +1753,19 @@ namespace ClashUWP.Backend.Mihomo
             {
                 using var http = NewLoopbackClient(10);
 
-                // kill-all: 清空所有连接
+                // ★【1.0.119】两个 kill 分支改走与 UI 按钮<b>同一份实现</b>
+                //   （CloseConnectionAsync / CloseAllConnectionsAsync）。
+                //   以前这里自己拼 URL、自己判状态码，与界面那一路是两套代码；
+                //   转义、"204 只算受理"这两条口径就只能修一处。
                 if (action == "kill-all")
-                {
-                    var req = new HttpRequestMessage(HttpMethod.Delete, "http://127.0.0.1:9090/connections");
-                    using var resp = await http.SendAsync(req);
-                    string status = resp.IsSuccessStatusCode ? "204" : $"{(int)resp.StatusCode}";
-                    return $"清空所有连接 → {status}";
-                }
+                    return await CloseAllConnectionsAsync();
 
-                // kill <id>: 强断单个连接
                 if (action.StartsWith("kill ", StringComparison.OrdinalIgnoreCase))
                 {
                     string id = action.Substring(5).Trim();
                     if (string.IsNullOrEmpty(id))
                         return "kill 需要参数：kill <connection-id>（先用 connections 命令看 ID）";
-
-                    var req = new HttpRequestMessage(HttpMethod.Delete, $"http://127.0.0.1:9090/connections/{id}");
-                    using var resp = await http.SendAsync(req);
-                    string status = resp.IsSuccessStatusCode ? "204" : $"{(int)resp.StatusCode}";
-                    return $"删除连接 {id} → {status}";
+                    return await CloseConnectionAsync(id);
                 }
 
                 // 默认：列出所有连接
@@ -1675,18 +1848,102 @@ namespace ClashUWP.Backend.Mihomo
             }
         }
 
-        /// <summary>读一个数字字段；不存在或类型不对给 -1（数字可能是 Number 也可能是字符串）。</summary>
-        private static long ReadNumber(System.Text.Json.JsonElement e, string name)
+        /// <summary>读一个数字字段；不存在或类型不对给 -1（数字可能是 Number 也可能是字符串）。
+        /// 取值口径共用 <see cref="KernelView.ReadJsonInt"/>，这里只固定"缺 = -1"这一档。</summary>
+        private static long ReadNumber(System.Text.Json.JsonElement e, string name) =>
+            KernelView.ReadJsonInt(e, name, -1);
+
+        /// <summary>
+        /// ★【1.0.119 · G4】强断单个连接的 URI。<b>纯函数</b>，离线单测钉住转义。
+        ///
+        /// 【为什么必须转义】id 是<b>内核回话里的字符串</b>，旧实现直接拼进 URL
+        ///   （<c>$".../connections/{id}"</c>）。内核原文里 id 是 UUID，正常情况没事；
+        ///   但这一路现在多了两个新来源：调试命令文件的原文（<c>connections kill &lt;行&gt;</c>）
+        ///   与界面按钮（值来自上一次 <c>GET /connections</c>）。带 <c>/</c>、<c>?</c>、<c>#</c>
+        ///   的值会把 DELETE 打到<b>别的路径</b>上 —— <c>?</c> 之后还能塞查询参数。
+        ///   <c>Uri.EscapeDataString</c> 把这三类字符全压成 <c>%XX</c>，路径段只剩一个。
+        /// </summary>
+        internal static string ConnectionDeleteUri(string id) =>
+            "http://127.0.0.1:9090/connections/" + Uri.EscapeDataString(id);
+
+        /// <summary>
+        /// ★【1.0.119 · G4】强断一条活动连接（UI 的行内按钮走这里）。
+        ///
+        /// 【官方口径】<c>DELETE /connections/{id}</c>（先遣 <c>hub/route/connections.go</c>，
+        ///   本项目记录在 Docs/20 的端点表）：命中则 <c>c.Close()</c>，<b>恒 204</b>；
+        ///   id 不存在时内核不区分，也是 204 ⇒ "204" 只证明"请求被接住"，
+        ///   <b>不证明</b>那条连接真的没了。所以这里把"再读一次列表还剩几条"一起回出去
+        ///   （<see cref="CountConnectionsAsync"/>），别把 204 当成"断开成功"。
+        /// </summary>
+        internal static async Task<string> CloseConnectionAsync(string id)
         {
-            if (!e.TryGetProperty(name, out var v))
-                return -1;
-            if (v.ValueKind == System.Text.Json.JsonValueKind.Number && v.TryGetInt64(out long n))
-                return n;
-            if (v.ValueKind == System.Text.Json.JsonValueKind.String &&
-                long.TryParse(v.GetString(), out long s))
-                return s;
-            return -1;
+            if (string.IsNullOrEmpty(id))
+                return "断开失败：连接 id 为空（列表可能已经过时，先点刷新）";
+            try
+            {
+                using var http = NewLoopbackClient(10);
+                var req = new HttpRequestMessage(HttpMethod.Delete, ConnectionDeleteUri(id));
+                using var resp = await http.SendAsync(req);
+                int code = (int)resp.StatusCode;
+                string verdict = code == 204 ? "204 已受理" : $"{code} {resp.ReasonPhrase}";
+                if (code != 204)
+                    return $"断开连接 {Short(id)} → {verdict}";
+                string rest = await CountConnectionsAsync(http);
+                return $"已请求断开 {Short(id)}（{verdict}）；{rest}";
+            }
+            catch (Exception ex)
+            {
+                ClashUWP.Vpn.RollingLog.Error("mihomo-connections", ex);
+                return $"断开失败: {ex.GetType().Name}: {ex.Message}";
+            }
         }
+
+        /// <summary>
+        /// ★【1.0.119 · G4】清空所有连接。<c>DELETE /connections</c>（无 id）= 内核
+        ///   <c>closeAllConnections</c> 逐个 <c>Close()</c>，同样恒 204。
+        /// </summary>
+        internal static async Task<string> CloseAllConnectionsAsync()
+        {
+            try
+            {
+                using var http = NewLoopbackClient(10);
+                var req = new HttpRequestMessage(HttpMethod.Delete, "http://127.0.0.1:9090/connections");
+                using var resp = await http.SendAsync(req);
+                int code = (int)resp.StatusCode;
+                string rest = code == 204 ? await CountConnectionsAsync(http) : "";
+                return code == 204
+                    ? $"已请求清空所有连接（204 已受理）；{rest}"
+                    : $"清空连接 → {code} {resp.ReasonPhrase}";
+            }
+            catch (Exception ex)
+            {
+                ClashUWP.Vpn.RollingLog.Error("mihomo-connections", ex);
+                return $"清空失败: {ex.GetType().Name}: {ex.Message}";
+            }
+        }
+
+        /// <summary>
+        /// 数一下内核现在还剩几条活动连接（<c>GET /connections</c>）。
+        /// 读失败不抛，回一句"复核失败"—— 复核是<b>加分项</b>，不能把已经受理的断开
+        /// 报成失败（那会让人以为 204 也没生效）。
+        /// </summary>
+        private static async Task<string> CountConnectionsAsync(System.Net.Http.HttpClient http)
+        {
+            try
+            {
+                string json = await http.GetStringAsync("http://127.0.0.1:9090/connections");
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                var list = KernelView.ParseConnections(doc.RootElement);
+                return $"现剩 {list.Count} 条";
+            }
+            catch (Exception ex)
+            {
+                return $"复核剩余条数失败={ex.GetType().Name}（不影响上面的受理结果）";
+            }
+        }
+
+        /// <summary>日志/界面用的短 id：UUID 前 8 位足够对上，长串会刷爆一行。</summary>
+        private static string Short(string id) => id.Length <= 8 ? id : id[..8];
 
         /// <summary>
         /// ★ 诊断内核启动状态：检查 REST API、读取插件日志、探测端口监听。

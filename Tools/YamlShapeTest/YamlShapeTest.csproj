@@ -17,19 +17,60 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>YamlShapeTest</AssemblyName>
-    <NoWarn>$(NoWarn);CS8632;CS1591</NoWarn>
+    <!-- ★ CS0649（字段从未被赋值）在本夹具里是 link 的必然产物，不是产品里的死字段：
+         <c>ConfigApplyPolicy.ReconnectMayHaveStarted</c> 的<b>写方</b>在 SubscriptionManager
+         （带 WinRT，link 不进来），夹具只读它 ⇒ 编译器只看见"没人写"。
+         产品工程那边照常报，所以这条压制只作用于夹具。 -->
+    <NoWarn>$(NoWarn);CS8632;CS1591;CS0649</NoWarn>
   </PropertyGroup>
     <ItemGroup>
         <Compile Include="..\..\ClashUWP\Vpn\KernelConfig.cs" Link="KernelConfig.cs" />
         <Compile Include="..\..\ClashUWP\Vpn\AppSplit.cs" Link="AppSplit.cs" />
         <Compile Include="..\..\ClashUWP\Vpn\DnsConfig.cs" Link="DnsConfig.cs" />
         <Compile Include="..\..\ClashUWP\Vpn\LocalSettings.cs" Link="LocalSettings.cs" />
+        <Compile Include="..\..\ClashUWP\Vpn\SessionWatchdogPolicy.cs" Link="SessionWatchdogPolicy.cs" />
+        <!-- ★【1.0.119 · G6 P3】绑定网卡体检的判据（纯数据进、结论出）：
+             NetworkFollow 自己碰 WinRT 事件与桥，link 不动，所以判据单独成一份 AdapterHealth.cs。 -->
+        <Compile Include="..\..\ClashUWP\Vpn\AdapterHealth.cs" Link="AdapterHealth.cs" />
+        <!-- ★【1.0.119 · G7】路由表四桶的分配判据。BuildRoutes 自己造的是 VpnRouteAssignment
+             （平台对象，离线拿不到），但"哪些 CIDR 进哪个桶、什么被剔掉"整段是纯计算，
+             搬进 RouteInclusion.cs 才能钉：v6 排除路由缺失、v6 段塞进 v4 桶这两条
+             都只在 ipv6≥1 时才咬人，而这台机器没有 v6 网络，装机永远读不回来。 -->
+        <Compile Include="..\..\ClashUWP\Vpn\RouteInclusion.cs" Link="RouteInclusion.cs" />
         <!-- ★【1.0.93 · Docs/48 §四】设置解析收成一份实现后，LocalSettings.cs 直接引用 SettingsParse，
              这个 link 必须跟着补上 —— 否则夹具编译不过（补它的这一刻正是它咬过一次的样子）。 -->
         <Compile Include="..\..\ClashUWP\Vpn\SettingsParse.cs" Link="SettingsParse.cs" />
         <Compile Include="..\..\ClashUWP\Vpn\VpnPluginConfig.cs" Link="VpnPluginConfig.cs" />
         <Compile Include="..\..\ClashUWP\Backend\SubscriptionShape.cs" Link="SubscriptionShape.cs" />
         <Compile Include="..\..\ClashUWP\Backend\SelectionStore.cs" Link="SelectionStore.cs" />
+        <!-- ★【1.0.119 · 台账回放判据】SelectionReplayPolicy 要吃 KernelView.Group/Member 与
+             SelectionStore.EncodeLine 这两份现成的口径，所以它自己必须进夹具（产品与测试
+             逐字同一份）；它只依赖 KernelView/MihomoController 的<b>类型</b>，不做 IO、不碰网络。 -->
+        <Compile Include="..\..\ClashUWP\Backend\SelectionReplayPolicy.cs" Link="SelectionReplayPolicy.cs" />
+        <!-- ★【1.0.119 · 实时流量】"累计字节 → 速率"的差分判据：计数器被清零/内核重启时
+             绝不能取绝对值（会把一次重启读成一次突发），首个样本与间隔非正也不能报 0。
+             这三条都是装机上会把"绿"读反的形状，而 KernelView.LoadAsync 要联网、夹具进不去，
+             所以判据单独成一份 TrafficRate.cs（纯函数，产品与测试逐字同一份）。 -->
+        <Compile Include="..\..\ClashUWP\Backend\TrafficRate.cs" Link="TrafficRate.cs" />
+        <!-- ★【1.0.119 · 代理页排序】"按延迟排"最容易犯的错是把未测的 -1 排到最前，
+             以及把组/内置策略混进真节点的延迟序列（1.0.84 修过的那一类读反）。
+             这两条只在装机"看着挺对"的时候才暴露，所以分档判据必须离线钉死。 -->
+        <Compile Include="..\..\ClashUWP\Backend\NodeSort.cs" Link="NodeSort.cs" />
+        <!-- ★【1.0.119 · 订阅定时自动更新】"这一次该不该动手"的判据。会话中不动手、
+             认不出的档位一律当关、失败必须退避 —— 三条都是"装机看不出、出事才知道"的形状。 -->
+        <Compile Include="..\..\ClashUWP\Backend\SubscriptionAutoPolicy.cs" Link="SubscriptionAutoPolicy.cs" />
+        <!-- ★【1.0.122 · 通知点击落点】clashuwp://open 与 clashuwp://disconnect?n= 这两条
+             动作的识别判据。它是"点击通知唤起的是不是前台"的唯一可离线证据：
+             分流若写错，通知点击会被 TryParse 当成"不认识的协议"整条吞掉，
+             而装机上只会看到"点了没反应"，看不出是路由没分还是窗口没起。 -->
+        <Compile Include="..\..\ClashUWP\Backend\SubscriptionProtocol.cs" Link="SubscriptionProtocol.cs" />
+        <!-- ★【1.0.123 · 更新生效阶梯】"这一版正文落盘之后怎么真的生效"的判据。
+             这一条<b>必须</b>离线钉：它的输出决定要不要动整机网络（自动断开重拨一次），
+             而"该动的支没动、不该动的支动了"在装机上都只表现为一句话文案，
+             要复现"会话活着而内核不可达"得先把隧道搞成半死状态 —— 那是不能拿用户的网络试的形状。
+             SessionPresence.cs 单独成文件就是为了这里：读它的实现（VpnProfileSetup）带 WinRT，link 不动。 -->
+        <Compile Include="..\..\ClashUWP\Backend\SessionPresence.cs" Link="SessionPresence.cs" />
+        <Compile Include="..\..\ClashUWP\Backend\ConfigApplyPolicy.cs" Link="ConfigApplyPolicy.cs" />
         <!-- ★【1.0.91】MihomoController.DiagnoseKernelAsync 读内核配置路径要用 LocalStatePaths，
              这个类只依赖 Windows.Storage.ApplicationData，link 得动；
              DebugCommandLoop 依赖命令分发/RollingLog/VPN 会话整条链，link 不动，所以路径算法
@@ -38,5 +79,9 @@
         <Compile Include="..\..\ClashUWP\Backend\Mihomo\MihomoController.cs" Link="MihomoController.cs" />
         <Compile Include="..\..\ClashUWP\Backend\Mihomo\KernelView.cs" Link="KernelView.cs" />
         <Compile Include="..\..\ClashUWP\Backend\Mihomo\SubscriptionView.cs" Link="SubscriptionView.cs" />
+        <!-- ★【1.0.118 · 配置视图】ConfigNodeView 复用 SubscriptionView 的段/列判据并产出
+             KernelView.Group/Member 同一套模型；它的行式解析（flow/块/注释/引号）必须与
+             产品逐字同一份进夹具，否则"测试自己抄一份"重演。 -->
+        <Compile Include="..\..\ClashUWP\Backend\Mihomo\ConfigNodeView.cs" Link="ConfigNodeView.cs" />
     </ItemGroup>
 </Project>

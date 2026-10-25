@@ -59,6 +59,25 @@ namespace ClashUWP.Backend
 
             // ★ 门控的探测：先读 settings.txt（异步，渲染线程一秒都不许等），再决定跑不跑。
             _ = MaybeRunProbesAsync();
+
+            // ★【1.0.119】订阅自动更新环：判据默认「关」，所以武装它是无害的 ——
+            //   真正决定它跑不跑的是 subAutoHours，不是这段装配顺序。
+            //   与探测分开的理由：探测撞的是 VPN 会话（要门控），自动更新撞的是 HTTP +
+            //   无会话时的写 profile，两者的风险面不是一条。
+            _ = ArmAutoUpdaterAsync();
+        }
+
+        /// <summary>
+        /// 读完设置再武装自动更新环。★ 顺序是必须的：环第一拍就要读
+        /// <see cref="AppSettings.SubAutoHours"/>，而那份现值只有 LoadAsync 填得进。
+        /// 读设置失败照样武装 —— 那时现值是那对默认（0=关），环只会一直 Skip 并写明理由，
+        /// 不会因为一次 IO 失败就把界面承诺的那行小字变成永远不动的黑洞。
+        /// </summary>
+        private static async Task ArmAutoUpdaterAsync()
+        {
+            try { await AppSettings.LoadAsync(); }
+            catch (Exception ex) { RollingLog.Error("sub-auto", "读设置失败（按默认=关武装）", ex); }
+            SubscriptionAutoUpdater.StartOnce();
         }
 
         /// <summary>

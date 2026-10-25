@@ -45,13 +45,17 @@ namespace ClashUWP.Backend
             finally { FlowGate.Release(); }
         }
 
-        /// <summary>连接。targetSubId 空 = 基础 profile；非空 = 订阅 profile。</summary>
+        /// <summary>连接。panelMultiEntry=0 时一律走基础 profile（面板可见的那条）；
+        /// =1 时按 targetSubId 走订阅 profile。</summary>
         internal static async Task<string> ConnectAsync(string? targetSubId = null)
         {
-            string label = $"connect:{targetSubId ?? "(base)"}";
+            // ★ 归一规则只写在 VpnSession.EffectiveSubId 一份；这里读它只是为了让闸门标签
+            //   说真话（标签写 subId、实际连基础条目，排查时就得到两条对不上的记录）。
+            string? effective = VpnSession.EffectiveSubId(targetSubId);
+            string label = $"connect:{effective ?? "(base)"}";
             if (!await AcquireAsync(label))
                 return $"ProfileGate=忙（{label} 本轮跳过）";
-            try { return await VpnSession.ConnectAsync(targetSubId); }
+            try { return await VpnSession.ConnectAsync(effective); }
             finally { FlowGate.Release(); }
         }
 
@@ -97,8 +101,16 @@ namespace ClashUWP.Backend
         internal static Task<SubscriptionManager.ActiveInfo> GetActiveSubscriptionAsync()
             => SubscriptionManager.GetActiveAsync();
 
-        /// <summary>订阅 id → 显示名（纯格式化，无副作用）。</summary>
-        internal static string DisplayName(SubscriptionManager.Profile? p,
+        /// <summary>
+        /// 订阅 id → 显示名（纯格式化，无副作用）。
+        /// ★ 形参<b>不可空</b>（1.0.123 把这里的 <c>Profile?</c> 收成 <c>Profile</c>）：
+        ///   被转发的 <see cref="SubscriptionManager.DisplayName"/> 整段直接解引用，没有 null 分支；
+        ///   声明成可空等于向每个 UI 调用方广播"这里可能拿到 null"，而实际四个调用点
+        ///   没有一条能传出 null（两处 <c>foreach</c> 内、一处在三元里已判过、
+        ///   <c>MainComponent.SubLabel</c> 那个 <c>p != null</c> 是 <c>FirstOrDefault</c> 自己要求的）。
+        ///   "找不到就原样回 id"这件事归调用方定，不在格式化函数里塞一个空分支。
+        /// </summary>
+        internal static string DisplayName(SubscriptionManager.Profile p,
             System.Collections.Generic.List<SubscriptionManager.Profile> profiles)
             => SubscriptionManager.DisplayName(p, profiles);
 
@@ -137,6 +149,19 @@ namespace ClashUWP.Backend
             if (!await AcquireAsync("reload"))
                 return new SubscriptionManager.Result(false, "ProfileGate=忙（reload 本轮跳过）");
             try { return await SubscriptionManager.ReloadActiveConfigAsync(); }
+            finally { FlowGate.Release(); }
+        }
+
+        /// <summary>
+        /// ★【1.0.119】设置订阅自动更新的间隔（小时，0=关）。
+        /// 占闸：它改的是执行环每一拍都要读的现值，和"正在拉订阅"并发会让
+        /// 那一拍用旧档位判、新档位记，界面上的"下次"就对不上。
+        /// </summary>
+        internal static async Task SetSubscriptionAutoHoursAsync(int hours)
+        {
+            if (!await AcquireAsync("sub-auto-hours"))
+                throw new InvalidOperationException("ProfileGate=忙（改档位本轮放弃）");
+            try { await SubscriptionManager.SetAutoUpdateHoursAsync(hours); }
             finally { FlowGate.Release(); }
         }
 

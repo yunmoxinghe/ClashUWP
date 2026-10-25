@@ -92,6 +92,57 @@ namespace ClashUWP.Backend
             return Result.Fail($"不认识的协议: {scheme}://");
         }
 
+        // ── 自有协议的「动作」那一支（★【1.0.122】状态通知的点击落点）──────────
+
+        /// <summary>
+        /// 一条自有协议动作：<param name="Name">Name</param> 只可能是
+        /// <c>open</c> / <c>disconnect</c>，<c>Nonce</c> 是 <c>?n=</c> 后面那串（缺失为空）。
+        /// </summary>
+        internal readonly record struct AppAction(string Name, string Nonce)
+        {
+            internal bool IsDisconnect => Name == "disconnect";
+        }
+
+        /// <summary>
+        /// ★【1.0.122】认自己的<b>动作</b>协议：<c>clashuwp://open</c>、
+        ///   <c>clashuwp://disconnect?n=&lt;nonce&gt;</c>。不是动作就返回 null
+        ///   （交回 <see cref="TryParse"/> 走订阅导入那一条）。
+        ///
+        /// 【为什么通知的点击要绕成协议激活】通知是由<b>插件宿主进程</b>发的，
+        ///   于是 Windows 把这条通知登记在无头入口的 AUMID 上
+        ///   （<c>…!VpnHost</c>，本机 wpndatabase.db 实证，见 Docs/63 §一），
+        ///   而 <c>activationType</c> 缺省的 <c>foreground</c> 官方语义是
+        ///   "<i>Your foreground app is launched</i>" —— 那个"你的前台应用"就是通知所属的
+        ///   入口，也就是 <c>VpnHost</c>：点一下唤起的是没有 UI 的宿主，不是主窗口。
+        ///   同一张表里 <c>Protocol</c> 的语义是 "<i>Launch a different app using protocol
+        ///   activation</i>" —— 它按 <b>URI 归属</b>路由，而 <c>clashuwp</c> 只注册在
+        ///   带 UI 的 <c>&lt;Application Id="App"&gt;</c> 上，所以这条路一定回到前台。
+        ///
+        /// 【★ 为什么 disconnect 要带 nonce】协议是<b>外部可触发</b>的（本文件顶部那条
+        ///   安全边界）：任何网页一个链接就能把本进程唤起。"打开主窗口"被白嫖只是弹个窗，
+        ///   但"断开 VPN"是动网络状态，按既有纪律<b>不许</b>由外部输入直接触发。
+        ///   nonce 由插件在发通知时写进 <c>LocalState\toast-nonce.txt</c>（只有本包读得到），
+        ///   网页里那个链接猜不到它 ⇒ 猜不到就不动手。
+        /// </summary>
+        internal static AppAction? TryParseAppAction(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            if (!Uri.TryCreate(raw.Trim(), UriKind.Absolute, out Uri? uri)) return null;
+            if (uri.Scheme != "clashuwp") return null;
+
+            // 带 url / u 参数的是"导入订阅"，不是动作 —— 别在这里把它截走。
+            if ((ReadQuery(uri, "url") ?? "").Length > 0 ||
+                (ReadQuery(uri, "u") ?? "").Length > 0)
+                return null;
+
+            string name = (uri.Host ?? "").ToLowerInvariant();
+            // ★ 只认这两个词：clashuwp://subscribe / import / fetch 那些留给 TryParse，
+            //   认错了会把导入截成"未知动作"。
+            if (name is not ("open" or "disconnect")) return null;
+
+            return new AppAction(name, ReadQuery(uri, "n") ?? "");
+        }
+
         // ── 实现细节 ──────────────────────────────────────────────────────
 
         /// <summary>

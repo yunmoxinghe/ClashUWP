@@ -101,13 +101,8 @@ namespace ClashUWP.Backend.Mihomo
                 string text = await LocalState.ReadTextAsync(file);
                 var basic = await file.GetBasicPropertiesAsync();
                 long size = (long)basic.Size;
-                DateTime mtime = DateTime.Now;   // BasicProperties 没有时间戳，用当前时间兜底
-                try
-                {
-                    // ★ 文件时间戳只能从文件系统那侧拿；UWP 拿不到就用"读取时刻"。
-                    mtime = DateTime.Now;
-                }
-                catch { }
+                // ★ 文件时间戳只能从文件系统那侧拿；UWP 拿不到就用"读取时刻"。
+                DateTime mtime = DateTime.Now;
 
                 return Parse(text, size, mtime);
             }
@@ -369,8 +364,12 @@ namespace ClashUWP.Backend.Mihomo
         }
 
         // ── 行式 YAML 的两个小工具（与 KernelConfig 同款思路：只认顶层键）──
+        // ★【1.0.118】这四个从 private 提到 internal：ConfigNodeView（内核未运行时的
+        //   "配置视图"）与 Parse 走的是同一套"顶层键 / 段尾 / 列表项列 / 行首空白"判据，
+        //   复制一份就是第三套口径（KernelConfig 里还有一套自己的）——缩进判据漂一条，
+        //   两处数出来的节点就不一致，这类"同一份文件两种说法"正是本仓反复点名要防的。
 
-        private static int FindTopLevel(string[] lines, string key)
+        internal static int FindTopLevel(string[] lines, string key)
         {
             for (int i = 0; i < lines.Length; i++)
             {
@@ -394,7 +393,7 @@ namespace ClashUWP.Backend.Mihomo
         ///   于是这种写法的订阅<b>整段一个节点也数不出来</b>（离线夹具实测 node=0）。
         ///   与 <c>KernelConfig.EndOfBlock</c> 同一判据（那条早就排除了 <c>-</c> 行）。
         /// </summary>
-        private static int FindNextTopLevel(string[] lines, int start)
+        internal static int FindNextTopLevel(string[] lines, int start)
         {
             for (int i = start + 1; i < lines.Length; i++)
             {
@@ -413,7 +412,7 @@ namespace ClashUWP.Backend.Mihomo
         ///   "任何 - 开头的行"会把节点内部的子列表（<c>client-ips</c> / <c>mux</c> /
         ///   组的 <c>use</c>、<c>proxies</c> 成员）误数成条目。找不到就返回 -1（空段）。
         /// </summary>
-        private static int FirstItemColumn(string[] lines, int from, int to)
+        internal static int FirstItemColumn(string[] lines, int from, int to)
         {
             for (int i = from; i < to; i++)
             {
@@ -426,7 +425,7 @@ namespace ClashUWP.Backend.Mihomo
         }
 
         /// <summary>行首空白宽度（空格与制表符都算；YAML 不允许制表符缩进，但订阅里见过，按宽度兜住）。</summary>
-        private static int LeadingSpaces(string line)
+        internal static int LeadingSpaces(string line)
         {
             int n = 0;
             while (n < line.Length && (line[n] == ' ' || line[n] == '\t')) n++;

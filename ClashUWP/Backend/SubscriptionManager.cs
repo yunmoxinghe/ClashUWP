@@ -492,8 +492,15 @@ namespace ClashUWP.Backend
         /// <summary>
         /// 【UX 对齐 Verge】切/更新订阅后，生成内核实际读取的那份配置并热重载，
         /// 让新订阅<b>原地生效、不必断重连</b>。
-        /// ★ 内核未连接时只保证文件就位（下次 Connect 自动加载），返回明确的"未连接"提示，
-        ///   不会把"没热重载"伪装成失败。
+        /// ★ 内核未连接<b>且台上没有会话</b>时才只保证文件就位（下次 Connect 自动加载），
+        ///   返回明确的"未连接"提示，不会把"没热重载"伪装成失败。
+        /// ★【1.0.123 · 更新生效阶梯】这一支现在按<b>连接状态</b>自己走完 Verge 的
+        ///   <c>reload_or_restart</c>：原地重载发不出去或核心随后失联，而<b>平台侧会话确实活着</b>
+        ///   ⇒ 自动断开重拨一次（我们的数据面是插件宿主进程内的 DLL，前台唯一等价的"restart core"
+        ///   就是把这条会话拆掉再拨一次，新宿主在 Connect 里读 <c>config.yaml</c> /
+        ///   <c>subscriptions/{subId}.yaml</c>）。读不出会话状态、台上没有会话、切订阅正在进行
+        ///   这三条一律<b>不动隧道</b>；核心明确拒收也<b>不重拨</b>。逐条口径与 Verge 源码证据
+        ///   在 <see cref="ConfigApplyPolicy"/>，细则 Docs/64。
         /// ★ 改写逻辑的单一实现在 <c>Vpn\KernelConfig</c>（无状态纯函数，插件侧同一个入口），
         ///   本类只经 <see cref="SubscriptionReload"/> 拿路径 → PUT /configs，不重复实现 transform。
         /// </summary>
@@ -501,6 +508,7 @@ namespace ClashUWP.Backend
         {
             try
             {
+                ConfigApplyPolicy.ReconnectMayHaveStarted = false;
                 string? path = SubscriptionReload.RegenerateEffectiveFile();
                 if (string.IsNullOrEmpty(path))
                     // ★【1.0.75】null 有两种成因，都得说给用户听：
@@ -512,29 +520,136 @@ namespace ClashUWP.Backend
                         "没有可重载的生效配置：config.yaml 不存在，或它不含任何可用出站" +
                         "（空壳不热重载，内核保持原有配置；理由见 日志 → config）");
 
-                // 先探内核是否在跑：在跑才热重载，否则只保证文件就位（下次连接生效）。
-                if (!await IsKernelUpAsync())
-                    return new Result(true, "新订阅已落盘（内核未连接，下次连接自动加载）");
-
-                string reload = await MihomoController.RunReloadAsync(path);
+                // ── ① 原地那一支：内核可达才发重载，发完还要回读核心活着 ──
                 // ★【1.0.81 · M8/Q12】不再把"落盘即成功"伪装成成功：RunReloadAsync 已把
                 //   内核对非法配置的拒收（非 2xx + 原因）拼进文本，这里据前缀判真值；内核拒绝
                 //   ⇒ 整体失败，用户立刻知道"新订阅没真正生效"，而不是看到"已拉取/已切"假成功。
-                if (!MihomoController.IsReloadSuccess(reload))
-                    return new Result(false, "热重载被核心拒绝（新配置可能非法）: " + reload);
+                var stage = ConfigApplyPolicy.ApplyStage.Landed;
+                string detail = "";
+                if (await IsKernelUpAsync())
+                {
+                    string reload = await MihomoController.RunReloadAsync(path);
+                    if (!MihomoController.IsReloadSuccess(reload))
+                        stage = ConfigApplyPolicy.ApplyStage.Refused;
+                    // ★【M8 · 核心接受度判据】HTTP 2xx 只代表"收到并解析"，核心随后仍存活才代表
+                    //   "真接受了这份配置"。重载成功后再次探活：无应答 ⇒ 很可能非法配置把核心搞崩。
+                    else if (!await IsKernelUpAsync())
+                        stage = ConfigApplyPolicy.ApplyStage.SilentAfterAccept;
+                    else
+                        stage = ConfigApplyPolicy.ApplyStage.Accepted;
+                    detail = reload;
+                }
 
-                // ★【M8 · 核心接受度判据】HTTP 2xx 只代表"收到并解析"，核心随后仍存活才代表
-                //   "真接受了这份配置"。重载成功后再次探活：无应答 ⇒ 很可能非法配置把核心搞崩。
-                if (!await IsKernelUpAsync())
-                    return new Result(false,
-                        "已发重载但核心随后无应答：很可能新配置非法导致核心崩溃，" +
-                        "请查 logs/app.log（config 频道）确认原因");
+                // ── ② 只在"原地没成"的支上读会话状态 ──
+                // ★ 顺序是有意的：Accepted 这一支每次更新都走，多读一遍 profile 清单
+                //   换一个可能的 ProfileStoreBusyException/中毒读数不值当（1.0.122 把
+                //   "到点判据"从状态读数上摘下来是同一理由）。只有可能要动隧道的支才读。
+                bool needPresence = stage == ConfigApplyPolicy.ApplyStage.Landed ||
+                                    stage == ConfigApplyPolicy.ApplyStage.SilentAfterAccept;
+                var presence = needPresence
+                    ? await VpnProfileSetup.ReadSessionPresenceAsync()
+                    : SessionPresence.NotAsked;
 
-                return new Result(true, "已热重载内核: " + reload + "　（核心已接受并在线）");
+                var plan = ConfigApplyPolicy.Decide(stage, presence, ProfileGate.SwitchInProgress);
+                RollingLog.Info("sub-apply",
+                    $"生效阶梯 stage={stage} presence={presence} " +
+                    $"切订阅中={(ProfileGate.SwitchInProgress ? "是" : "否")} " +
+                    $"action={plan.Action} ok={plan.Ok}：{plan.Why}");
+
+                if (plan.Action == ConfigApplyPolicy.NextAction.ReconnectOnce)
+                    return await AutoReconnectForApplyAsync(plan.Why);
+
+                string head = stage switch
+                {
+                    ConfigApplyPolicy.ApplyStage.Accepted =>
+                        "已热重载内核: " + detail + "　（核心已接受并在线）",
+                    ConfigApplyPolicy.ApplyStage.Refused =>
+                        "热重载被核心拒绝（新配置可能非法）: " + detail + "　" + plan.Why,
+                    _ when plan.Ok && stage == ConfigApplyPolicy.ApplyStage.Landed =>
+                        "新订阅已落盘（内核未连接，下次连接自动加载）",
+                    _ => plan.Why,
+                };
+                return new Result(plan.Ok, head);
             }
             catch (Exception ex)
             {
-                return new Result(false, $"热重载失败: {ex.GetType().Name}: {ex.Message}");
+                // ★【1.0.123】异常可能从"原地重载"里冒出来，也可能从自动重拨那一级里冒出来，
+                //   后者必须把"隧道这一刻可能已经不在了"的出口写进回话，不能只留一句"热重载失败"。
+                string exit = ConfigApplyPolicy.ReconnectMayHaveStarted
+                    ? "（若隧道已断开，点「连接 VPN」重拨即可加载新配置）" : "";
+                return new Result(false,
+                    $"热重载失败: {ex.GetType().Name}: {ex.Message}{exit}");
+            }
+        }
+
+        /// <summary>
+        /// ★【1.0.123 · 生效阶梯的最后一级】把当前这条会话拆掉再拨一次，让新宿主按刚落盘的
+        /// 配置起数据面 —— 这是 Verge <c>restart_core_during_config_update</c> 在我们这套
+        /// 架构下的等价物（我们的"内核"是插件宿主进程里的 <c>clash_bridge.dll</c>，
+        /// 前台没有重启它的动词，拆会话重拨是唯一能换来一个全新数据面的动作）。
+        ///
+        /// 【只由 <see cref="ConfigApplyPolicy"/> 判出 ReconnectOnce 时调用】
+        ///   进这一支的前提是"平台侧会话确实活着 + 数据面不认这份配置"，也就是这一刻
+        ///   用户的流量本来就不通；不会在健康隧道上凭空来这一下。
+        ///
+        /// 【为什么走 VpnSession 而不是自己调平台 API】那两个方法带着本项目的既有纪律：
+        ///   connect 必武装健康哨兵、disconnect 必解除（<see cref="VpnSession.ConnectAsync"/> 的
+        ///   类注释），"没拨出去"还要按有无既有哨兵分别处置。绕过它们就等于新开一条没有兜底的拨号路。
+        ///
+        /// 【一轮更新只拨这一次】环的节拍由 <see cref="SubscriptionAutoPolicy"/> 管：
+        ///   重拨后内核仍不应答就判失败，失败进退避（6h 起翻倍），不会变成重拨环 ——
+        ///   本项目在"自动重拨"上有 828 无限重拨的账（memory「Redial 828 loop」），
+        ///   所以这里刻意没有"再试一次"的循环，只有一次加一个有界的等待。
+        /// </summary>
+        private static async Task<Result> AutoReconnectForApplyAsync(string why)
+        {
+            var (activeId, _) = await GetActiveAsync();
+            RollingLog.Warn("sub-apply", "自动重拨一次（生效阶梯最后一级）：" + why);
+
+            string down = "未开始";
+            string dial;
+            try
+            {
+                // ★ 从这里开始"隧道可能被动过了"，外层 catch 的回话口径要跟着变。
+                ConfigApplyPolicy.ReconnectMayHaveStarted = true;
+                down = await VpnSession.DisconnectAsync();
+                // 空 activeId 传给 ConnectAsync 就是连基础 profile（读 config.yaml），
+                // PanelMultiEntry=0 时它自己也会把 subId 归零，口径与用户点「连接 VPN」一致。
+                dial = await VpnSession.ConnectAsync(activeId.Length > 0 ? activeId : null);
+            }
+            catch (Exception ex)
+            {
+                // ★ 会话已经在上面拆掉了，异常却从断开/拨号里冒出去 ⇒ 用户手上是"没隧道"的状态。
+                //   回话必须把出口指出来，口径同 ActivateAsync 的 catch（:316）。
+                string line = $"自动重拨未完成：断开={down}；{ex.GetType().Name}: {ex.Message}" +
+                              "（隧道若已断开，点「连接 VPN」重拨即可加载新配置）";
+                RollingLog.Error("sub-apply", line, ex);
+                return new Result(false, line, activeId);
+            }
+
+            // 平台回"已连接"时插件宿主才刚拉起，数据面还要绑网卡、起 9090；
+            // 有界轮询（每 2 秒探一次，最多 16 秒）——超时不重试，只如实报。
+            bool up = await WaitKernelUpAsync(TimeSpan.FromSeconds(16));
+            bool dialed = !VpnProfileSetup.IsNoDialResult(dial);
+            bool ok = up && dialed;
+            string msg = $"自动重拨一次：断开={down}；拨号={dial}；" +
+                         (up ? "内核已应答 ⇒ 新配置已生效"
+                             : "内核在 16 秒内仍无应答 ⇒ 未能确认生效，看 日志 → plugin") +
+                         $"　（判据：{why}）";
+            if (ok) RollingLog.Info("sub-apply", msg);
+            else RollingLog.Warn("sub-apply", msg);
+            return new Result(ok, msg, activeId);
+        }
+
+        /// <summary>有界等待内核 REST 应答（每 2 秒一次，用掉预算就回 false，不无限等）。</summary>
+        private static async Task<bool> WaitKernelUpAsync(TimeSpan budget)
+        {
+            DateTime until = DateTime.UtcNow + budget;
+            while (true)
+            {
+                if (await IsKernelUpAsync()) return true;
+                if (DateTime.UtcNow >= until) return false;
+                await Task.Delay(2000);
             }
         }
 
@@ -705,6 +820,26 @@ namespace ClashUWP.Backend
         private static Task SetUrlAsync(string id, string url) => AppendSettingAsync($"{UrlKey}:{id}", url);
         private static Task SetActiveAsync(string id) => AppendSettingAsync(ActiveKey, id);
         private static Task ClearUrlAsync(string id) => Task.CompletedTask;   // URL 留着无害，删文件即可
+
+        /// <summary>★【1.0.119】自动更新间隔的 settings.txt 键（小时，0=关）。</summary>
+        internal const string AutoHoursKey = "subAutoHours";
+
+        /// <summary>
+        /// ★【1.0.119 · 订阅定时自动更新】写档位的<b>唯一入口</b>，并当场把内存值一起改掉。
+        ///
+        /// 【为什么必须同步改 <c>AppSettings.SubAutoHours</c>】那一支是执行环每 5 分钟读的现值，
+        ///   而 <c>AppSettings.LoadAsync()</c> 只在启动装配时跑一次。只落盘不改内存的话，
+        ///   用户点了「每 6 小时」会看到按钮亮起来、但<b>本次进程根本不会跑</b>，
+        ///   要重启应用才生效 —— 界面已经承诺了，后台却没认。
+        /// 【为什么归一成档位再写】写进去的必须是白名单里的值：否则下一次启动
+        ///   <c>NormalizeHours</c> 把它判成 0（关），用户看到的按钮亮着、实际是关的。
+        /// </summary>
+        internal static async Task SetAutoUpdateHoursAsync(int hours)
+        {
+            int normalized = SubscriptionAutoPolicy.NormalizeHours(hours.ToString());
+            await AppendSettingAsync(AutoHoursKey, normalized.ToString());
+            AppSettings.SubAutoHours = normalized;
+        }
 
         /// <summary>读某份 profile 的 URL（settings.txt 的 <c>subUrl:{id}</c> 行）。</summary>
         private static async Task<string> GetUrlAsync(string id)

@@ -17,9 +17,13 @@ namespace ClashUWP.Backend
     /// 本轮不擅自改。</para>
     ///
     /// <para><b>方案</b>（不改 home、不碰包结构、不动内核 ABI）：客户端在
-    /// <c>LocalState\selection.txt</c> 记下「每个可切换组上次选了哪个节点」，
-    /// 内核每次（重新）起来、第一次可被轮询探到时，对 REST 控制器回放
-    /// <c>PUT /proxies/{组}</c>（见 <see cref="MihomoController.ReplaySelectionsAsync"/>）。</para>
+    /// <c>LocalState\selection.txt</c> 记下「每个可切换组上次选了哪个节点」，UI 轮询每轮拿
+    /// 内核现值跟这本账比，<b>有漂移就对 REST 控制器回放</b> <c>PUT /proxies/{组}</c>
+    /// （见 <see cref="MihomoController.ReplaySelectionsAsync"/> 与判据
+    /// <see cref="SelectionReplayPolicy"/>）。
+    /// ★【1.0.119】从前这里写的是"内核第一次可被轮询探到时回放一次"，那个边沿实现是坏的
+    /// （一只 bool 闩在读账之前就置位，复位又只挂在轮询的 catch 上，而内核不可达并不抛）——
+    /// 判据换成漂移后，"内核起来之后才写进台账的那条"也放得到。</para>
     ///
     /// <para><b>存储格式</b>：每行 <c>UrlEncode(组名)=UrlEncode(节点名)</c>。
     /// 用 UrlEncode 是为了让组名 / 节点名里的 <c>=</c>、空格、中文、emoji 不破坏
@@ -27,11 +31,19 @@ namespace ClashUWP.Backend
     ///
     /// <para>★ 只记<b>手动组</b>（Selector / relay）的选择：url-test / fallback / load-balance
     /// 由内核自管，记了也没用（下一轮测速/故障转移就改回赢家），回放时还会主动跳过它们。</para>
+    ///
+    /// <para>★【1.0.119】读写两头都<b>出声</b>（原先是两处裸 <c>catch { }</c>）：这本账是
+    /// "已记为预设，下次内核可达回放生效"这句话的唯一凭据，写失败却静默就等于骗人。
+    /// 读侧挂在 3 秒轮询上，所以只在错误形态<b>变化</b>时记一行，热路径禁刷屏；
+    /// "文件不存在"是首次使用的正常路径，不报错。</para>
     /// </summary>
     internal static class SelectionStore
     {
         private const string FileName = "selection.txt";
         private static readonly object _lock = new();
+
+        /// <summary>上一次<b>读</b>台账时的错误形态（空 = 没有未处理的读错误）；用来给 3 秒轮询去重。</summary>
+        private static string _lastReadError = "";
 
         /// <summary>把 (组, 节点) 编码成一行（UrlEncode 两端）。纯函数，可离线单测。</summary>
         internal static string EncodeLine(string group, string node)
@@ -56,7 +68,14 @@ namespace ClashUWP.Backend
             return (g, n);
         }
 
-        /// <summary>读出全部已记选择（组名 → 节点名）。无文件 / 读不到 = 空字典，属正常路径。</summary>
+        /// <summary>
+        /// 读出全部已记选择（组名 → 节点名）。无文件 / 读不到 = 空字典，属正常路径。
+        /// ★【1.0.119】"读不到"原先是裸 <c>catch { }</c>：真出错（占用、ACL、损坏）和
+        ///   "还没有这个文件"长得一样，于是界面写着"已记为预设"、内核那边永远等不到回放，
+        ///   日志里查不到痕迹。现在文件不存在仍算正常（不报错），其余错误出声。
+        /// ★ 这个方法挂在 <b>3 秒轮询</b>上（<c>ReplaySelectionsAsync</c> 每轮读一次台账），
+        ///   所以只在错误形态<b>变化</b>时记一行；读成功把基线清掉，下一轮发作还能再记一次。
+        /// </summary>
         internal static Dictionary<string, string> LoadAll()
         {
             var map = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -71,10 +90,21 @@ namespace ClashUWP.Backend
                     if (g != null && n != null)
                         map[g] = n;   // 同组后者覆盖前者（文件本身是按 key 排序重写的，正常不会重复）
                 }
+                _lastReadError = "";
             }
-            catch
+            catch (Exception ex)
             {
-                // 没有文件 / 读不到 → 空。这是正常路径，不是错误。
+                // E_FILE_NOT_FOUND（0x80070002）：还没有这本账，首次使用的正常路径。
+                if (ex.HResult != unchecked((int)0x80070002))
+                {
+                    string kind = OneLine($"{ex.GetType().Name}: {ex.Message}");
+                    if (kind != _lastReadError)
+                    {
+                        _lastReadError = kind;
+                        ClashUWP.Vpn.RollingLog.Warn("selection-store",
+                            $"读 {FileName} 失败（台账按空处理，预设不会回放）：{kind}");
+                    }
+                }
             }
             return map;
         }
@@ -118,10 +148,18 @@ namespace ClashUWP.Backend
                     .AsTask().GetAwaiter().GetResult();
                 FileIO.WriteTextAsync(file, sb.ToString()).AsTask().GetAwaiter().GetResult();
             }
-            catch
+            catch (Exception ex)
             {
-                // 写入失败不应影响本次选择本身（UI 切节点已成功，只是下次重启记不住）。
+                // 写入失败不影响本次选择本身（UI 切节点已经成功），但<b>必须出声</b>：
+                // 这本账是"下次内核可达回放生效"的唯一凭据，写不进去就等于那句承诺落空。
+                // 这条挂在用户动作（点选 / 记预设）上，不是 3 秒轮询，所以不刷屏，直接记。
+                ClashUWP.Vpn.RollingLog.Warn("selection-store",
+                    $"写 {FileName} 失败（本次选择不会在重启后回放）：{OneLine(ex.Message)}");
             }
         }
+
+        /// <summary>压成一行并去掉控制字符：滚动日志的行格式是看门狗的机器契约，禁内嵌换行。</summary>
+        private static string OneLine(string s) =>
+            s.Replace('\r', ' ').Replace('\n', ' ').Replace('\t', ' ');
     }
 }

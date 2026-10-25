@@ -27,9 +27,18 @@ namespace ClashUWP.Backend
         internal static Task<string> RecreateAsync() => VpnProfileSetup.RecreateProfileAsync();
 
         /// <summary>
+        /// 这次连接<b>实际</b>会用到哪个订阅 profile：互斥形状（<c>panelMultiEntry=0</c>）下
+        /// 面板里只有基础条目，连隐藏的订阅 profile 会让隧道在跑而面板永远 Disconnected，
+        /// 所以订阅 id 一律归零 —— 基础 profile 读的就是当前生效那份 <c>config.yaml</c>，效果等价。
+        /// ★ 这条规则只写这一份：<see cref="ProfileGate"/> 的闸门标签也来读它，
+        ///   两处各写一遍迟早一处改了另一处没改（标签与真实形状不一致就等于判据说谎）。
+        /// </summary>
+        internal static string? EffectiveSubId(string? subId) => AppSettings.PanelMultiEntry ? subId : null;
+
+        /// <summary>
         /// 连接主 profile（全路由）。
-        /// ★ 先武装健康哨兵再连接：即使连接卡死/异常，哨兵的硬上限到点也必然断开，
-        ///   网络绝不会被长期占死。
+        /// ★ 先武装健康哨兵再连接：拨号悬挂会由非终态出口断开；已 Connected 的健康会话
+        ///   不再因固定时长被强拆。
         /// ★【1.0.62】<paramref name="subId"/> 非空时连<b>该订阅专属</b>的系统 profile ——
         ///   与用户在快速设置里点那条订阅走的是<b>完全同一条</b>平台路径
         ///   （ConnectProfileAsync → 平台 → IVpnPlugIn.Connect），差别只是发起者是我们。
@@ -39,6 +48,11 @@ namespace ClashUWP.Backend
         /// </summary>
         internal static async Task<string> ConnectAsync(string? subId = null)
         {
+            // ★【1.0.117】panelMultiEntry=0 时一律连基础 profile（面板可见的那条）。
+            //   切换三步式的"再重连"也走这里，必须遵循同一条规则，
+            //   否则隧道连在隐藏条目上、面板永远 Disconnected。
+            subId = EffectiveSubId(subId);
+
             // ★【1.0.88】先记"本来有没有哨兵"：Arm() 是"顶掉上一个再武装"，
             //   所以后面那句"没发起拨号就解除"如果不分情况地执行，
             //   会把<b>上一次连接留下的黑洞保护</b>一起摘掉 —— 黑洞保护不能因为多点一下按钮而消失。
@@ -115,9 +129,9 @@ namespace ClashUWP.Backend
         ///   这些会话的观察者（<see cref="StatusAsync"/> 的注释），让它顺手把保护补上。
         ///
         /// 【为什么安全】判据是只读的状态文本；<see cref="HealthMonitor.AdoptArm"/> 认领模式
-        ///   没有硬上限（不会强拆健康隧道），收尾全靠判据（探针 / 重拨保险丝 / 物理兜底 /
+        ///   认领模式不拆健康隧道，收尾全靠判据（探针 / 重拨保险丝 / 物理兜底 /
         ///   会话消失出口）。已有哨兵时是空操作 —— Arm 语义是"顶掉再武装"，
-        ///   重复认领不该把既有的 1800 s 保险丝顶成无上限的认领哨兵。
+        ///   重复认领不应重置既有保护的观测基线。
         /// </summary>
         internal static void AdoptLiveSessionIfUnprotected()
         {
