@@ -1783,6 +1783,26 @@ internal static class Program
         Check("1.0.129 档 2: 订阅 dns.ipv6 false 也抬成 true（AAAA 回假 v6 的前提）",
               subArm2.Contains("    ipv6: true") && !subArm2.Contains("ipv6: false"), subArm2);
 
+        // ★ 档 2 的 v6 池必须与 include 路由 / tun.inet6-address 同源。订阅自带不同的池时，
+        //   原先原样保留 ⇒ 假 v6 不落在任何进隧道的 include 里（档 2 的"全链路"断在 DNS）。
+        const string SubPool6 = "mode: rule\ndns:\n    enable: true\n    enhanced-mode: fake-ip\n" +
+                                "    fake-ip-range6: fd99:1::/64\n";
+        string poolArm2 = KernelConfig.Transform(SubPool6, null, null, 2, Pool6, out _, out string poolNote2);
+        Check("1.0.129 档 2: 订阅的 fake-ip-range6 与生效池不同 ⇒ 改成生效池并出声（否则假 v6 不进隧道）",
+              poolArm2.Contains("fake-ip-range6: " + Pool6) && !poolArm2.Contains("fd99:1::") &&
+              poolNote2.Contains("覆盖订阅"), poolArm2 + " || " + poolNote2);
+
+        string poolArm2Same = KernelConfig.Transform(
+            SubPool6.Replace("fd99:1::/64", "fdfe:dcba:9876::0/64"), null, null, 2, Pool6,
+            out _, out string poolNote2b);
+        Check("1.0.129 档 2: 订阅池与生效池同一网络号（写法不同）⇒ 不改也不出声",
+              poolArm2Same.Contains("fake-ip-range6: fdfe:dcba:9876::0/64") &&
+              !poolNote2b.Contains("覆盖订阅"), poolArm2Same + " || " + poolNote2b);
+
+        string poolArm1 = KernelConfig.Transform(SubPool6, null, null, 1, Pool6, out _, out _);
+        Check("1.0.129 档 1: 订阅的 fake-ip-range6 一个字节都不碰（顶层 false 解析时清空，改原文无收益）",
+              poolArm1.Contains("fake-ip-range6: fd99:1::/64"), poolArm1);
+
         // ★ 同批顺带修掉的日志噪声（Docs/67 §十二.4）：`routes` 行原先把 `剔除=` 印两遍。
         //   调用方那处已删，这里钉住 Describe() 自己是唯一的出处。
         RouteInclusion.Plan withDrop = RouteInclusion.Build(new RouteInclusion.Input(

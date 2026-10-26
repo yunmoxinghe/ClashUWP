@@ -118,12 +118,14 @@ namespace ClashUWP.Vpn
                 //   <c>v6栈=</c> 只反映<b>档位意图</b>，不是实测值；别拿它当"本机没有 v6"的证据。
                 if (ipv6Arm >= 1)
                     EnsureTopLevelIpv6(lines, ipv6Arm >= 2);
-                EnsureDnsBlock(lines, ipv6Arm, ipv6FakeRange);
+                string poolNote = EnsureDnsBlock(lines, ipv6Arm, ipv6FakeRange);
                 EnsureTunBlock(lines, ipv6Arm, ipv6FakeRange);
                 // ★【1.0.40 · DNS 可配】覆盖必须叠在 EnsureDnsBlock 之后：
                 //   后者为了数据面会强制 enhanced-mode=fake-ip 并补默认池，
                 //   用户在这份文件里写的值应当<b>覆盖</b>那些默认，而不是被它们覆盖。
                 ApplyDnsOverrides(lines, dns, ipv6Arm, ipv6FakeRange, out dnsNote);
+                if (poolNote.Length > 0)
+                    dnsNote = poolNote + "；" + dnsNote;
                 LockUrlTestTolerance(lines);
                 InjectAppSplitRules(lines, split, out splitNote);
 
@@ -166,12 +168,14 @@ namespace ClashUWP.Vpn
         /// <summary>
         /// <c>dns:</c> 块：enhanced-mode 强制 fake-ip，缺 fake-ip-range / fake-ip-filter 就补。
         /// 没有 dns 块时（订阅只写代理不写 DNS 的情况）追加一个最小可用块。
+        /// 返回值：需要让用户看见的改写说明（空串 = 没有），由 <see cref="Transform"/> 并进 dnsNote。
         /// </summary>
-        private static void EnsureDnsBlock(List<string> lines, int ipv6Arm, string ipv6FakeRange)
+        private static string EnsureDnsBlock(List<string> lines, int ipv6Arm, string ipv6FakeRange)
         {
+            string note = "";
             int start = FindTopLevelKey(lines, "dns");
             if (start >= 0 && IsInlineBlock(lines, start))
-                return;   // 见 IsInlineBlock：行内流式写法别改，一改就把 YAML 改坏
+                return "";   // 见 IsInlineBlock：行内流式写法别改，一改就把 YAML 改坏
             if (start < 0)
             {
                 // 顶层没有 dns：插到文件末尾。注意前面必须已有换行收尾。
@@ -193,7 +197,7 @@ namespace ClashUWP.Vpn
                 lines.Add($"    fake-ip-filter: {FakeIpFilter}");
                 lines.Add("    nameserver: ['https://doh.pub/dns-query', 'https://dns.alidns.com/dns-query']");
                 lines.Add("    fallback: ['https://223.5.5.5/dns-query', 'https://223.6.6.6/dns-query']");
-                return;
+                return "";
             }
 
             int end = EndOfBlock(lines, start);
@@ -211,7 +215,7 @@ namespace ClashUWP.Vpn
                 // 同 tun 的 dns-hijack：值为空说明它是"块序列/块映射的父键"，
                 // 整行替换会留下孤儿行把 YAML 改坏（run 25 的内核启动失败就是这么来的）。
                 if (ValueOf(lines[enhanced]).Length == 0)
-                    return;
+                    return "";
                 lines[enhanced] = KeyLine(lines[enhanced], "enhanced-mode", "fake-ip");
             }
 
@@ -246,15 +250,37 @@ namespace ClashUWP.Vpn
                 }
                 // 值为空 ⇒ 是块形状，别整行替换（同上面 enhanced-mode 的理由）。
 
-                if (ipv6Arm >= 2 &&
-                    FindKeyInRange(lines, start + 1, end, "fake-ip-range6") < 0)
+                // ★【1.0.129】档 2 的 v6 池必须与 include 路由、<c>tun.inet6-address</c> 同源：
+                //   后两者都由调用方传来的 <paramref name="ipv6FakeRange"/> 推出，DNS 池若沿用它
+                //   就多出第二个来源。订阅写一个不同的池（甚至非 ULA，比如 Verge 模板的
+                //   <c>2001:2::/64</c>）时，解析出的假 v6 落不进隧道路由 —— 档 2 的"全链路"
+                //   会断在 DNS 上，而配置看起来一切正常。
+                //   ⇒ 档 2 一律由插件统一下发；换池只走 settings.txt <c>ipv6FakeRange</c>
+                //     或 dns-config.txt <c>fake-ip-range6</c>（后者已折进 ipv6FakeRange）。
+                //   档 1 不动它：顶层 false 会让 parseIPV6 在解析时清空，改原文没有收益。
+                if (ipv6Arm >= 2)
                 {
-                    int at = FindKeyInRange(lines, start + 1, end, "fake-ip-range");
-                    if (at < 0) at = enhanced;
-                    lines.Insert(at + 1, keyIndent + $"fake-ip-range6: {ipv6FakeRange}");
-                    end++;
+                    int r6 = FindKeyInRange(lines, start + 1, end, "fake-ip-range6");
+                    if (r6 < 0)
+                    {
+                        int at = FindKeyInRange(lines, start + 1, end, "fake-ip-range");
+                        if (at < 0) at = enhanced;
+                        lines.Insert(at + 1, keyIndent + $"fake-ip-range6: {ipv6FakeRange}");
+                        end++;
+                    }
+                    else if (ValueOf(lines[r6]).Length == 0)
+                    {
+                        note = "fake-ip-range6(块写法，未替换；池可能与路由不一致)";
+                    }
+                    else if (!SameV6Pool(ValueOf(lines[r6]), ipv6FakeRange))
+                    {
+                        string cur = ValueOf(lines[r6]);
+                        lines[r6] = KeyLine(lines[r6], "fake-ip-range6", ipv6FakeRange);
+                        note = $"档2 覆盖订阅 fake-ip-range6={cur}→{ipv6FakeRange}";
+                    }
                 }
             }
+            return note;
         }
 
         /// <summary>
@@ -551,6 +577,15 @@ namespace ClashUWP.Vpn
             }
             return $"{new System.Net.IPAddress(bytes)}/126";
         }
+
+        /// <summary>
+        /// 订阅里的 <c>fake-ip-range6</c> 是否就是生效池（按归一形比较，避免
+        /// <c>fd66:6:6600::0/64</c> 与 <c>fd66:6:6600::/64</c> 被当成不同值）。
+        /// 归一失败（非 ULA / 畸形）一律判"不同"—— 那种值不能当路由与内核地址的来源。
+        /// </summary>
+        private static bool SameV6Pool(string subscriptionValue, string effectivePool) =>
+            LocalSettings.TryNormalizeV6Prefix(subscriptionValue, out string normalized) &&
+            string.Equals(normalized, effectivePool, StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
         /// ★【1.0.48】把 <c>proxy-groups</c> 里 <b>url-test</b> 组的 <c>tolerance</c> 提到极大值
