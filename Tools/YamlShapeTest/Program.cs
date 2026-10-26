@@ -1782,6 +1782,28 @@ internal static class Program
         string subArm2 = KernelConfig.Transform(SubDns, null, null, 2, Pool6, out _, out _);
         Check("1.0.129 档 2: 订阅 dns.ipv6 false 也抬成 true（AAAA 回假 v6 的前提）",
               subArm2.Contains("    ipv6: true") && !subArm2.Contains("ipv6: false"), subArm2);
+
+        // ★ 同批顺带修掉的日志噪声（Docs/67 §十二.4）：`routes` 行原先把 `剔除=` 印两遍。
+        //   调用方那处已删，这里钉住 Describe() 自己是唯一的出处。
+        RouteInclusion.Plan withDrop = RouteInclusion.Build(new RouteInclusion.Input(
+            new List<string> { "1.2.3.4/33" }, new List<string>(), false, 0, Pool6,
+            new List<string>(), new List<string>(), false));
+        RouteInclusion.Plan noDrop = RouteInclusion.Build(new RouteInclusion.Input(
+            new List<string> { "0.0.0.0/0" }, new List<string>(), false, 0, Pool6,
+            new List<string>(), new List<string>(), false));
+        Check("1.0.129 routes 判据行的 剔除= 只印一次（Dropped>0 一个、Dropped=0 不出现）",
+              withDrop.Dropped.Count > 0 && Occurrences(withDrop.Describe(), "剔除=") == 1 &&
+              Occurrences(noDrop.Describe(), "剔除=") == 0,
+              withDrop.Describe() + " || " + noDrop.Describe());
+    }
+
+    private static int Occurrences(string s, string needle)
+    {
+        int n = 0;
+        for (int i = s.IndexOf(needle, StringComparison.Ordinal); i >= 0;
+             i = s.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+            n++;
+        return n;
     }
 
     /// <summary>

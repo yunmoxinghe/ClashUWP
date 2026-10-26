@@ -23,11 +23,12 @@
 3. 订正**三处错误归因**：原文写 `SKIP_SYSTEM_IPV6_CHECK`「与 Clash Verge 同口径」——
    **Verge 从不设这个变量**（它是 mihomo 的逃生口，Verge 靠宿主真有 v6）。
    涉及 `MainComponent.cs` 的设置页文案、`ClashVpnPlugin.cs` 注释、Docs/67 两处。
-4. 新增离线判据 6 条（`Ipv6VergeAlignShapes129`），把三档"该写哪些 v6 键"逐字钉住。
+4. 新增离线判据 7 条（`Ipv6VergeAlignShapes129`），把三档"该写哪些 v6 键"逐字钉住；
+   第 7 条顺带修掉 Docs/67 §十二.4 记的日志噪声（`routes` 行把 `剔除=` 印两遍，现只印一次）。
 5. **仍未验**：v6 流量级（本机没有 v6 网络）；降档后环境变量复位的装机实物；
    档 0 在"真有全局 v6 的宿主"上的内核栈形态（本机造不出）。
 
-**验证**：`Tools\run-offline-tests.cmd` → **463 PASS / 0 FAIL**；主工程 Debug / Release
+**验证**：`Tools\run-offline-tests.cmd` → **464 PASS / 0 FAIL**；主工程 Debug / Release
 （x64）各编一遍 → **0 警告 0 错误**。
 
 ---
@@ -117,6 +118,8 @@
 | 5 | `Docs/22` | §3 表档 1 的"顶层不动"改为"顶层 false（1.0.126 起）"；表后补"档 0 的不改≠关 v6"；§4.6 补 1.0.129 环境变量复位 | 旧结论订正 |
 | 6 | `Docs/67` | §十一 表格第 2 行、§十二.5 表格里的"Verge 同口径"订正 | 同上 |
 | 7 | `Docs/68`（本文） | 建档 | — |
+| 8 | `ClashUWP/Vpn/ClashVpnPlugin.cs` | `routes` 判据行去掉追加的 `剔除={count}`，只留 `Plan.Describe()` 里的那一个 | Docs/67 §十二.4 记的噪声：`剔除=3 剔除=3` |
+| 9 | `Docs/67` | §十二.4 那句"纯属噪声"后补"1.0.129 已修" | 噪声有主 |
 
 新夹具 6 条：
 

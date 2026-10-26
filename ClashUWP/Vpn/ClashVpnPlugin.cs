@@ -3413,9 +3413,10 @@ namespace ClashUWP.Vpn
             // 被剔掉的项必须出声：这些是"我看了但没照做"的决定，装完机只靠快照反推最费时间。
             foreach (string d in plan.Dropped)
                 RollingLog.Warn("routes", d);
+            // ★【1.0.129】`剔除=` 只在 Describe() 里印一次：这里原先是 `{_routePlanNote}` 再加
+            //   `剔除={count}`，Dropped>0 时会印成 "剔除=3 剔除=3"（同一个字段两遍）。
             RollingLog.Info("routes",
-                $"arm={LocalSettings.Ipv6} nodeExcl开关={(LocalSettings.NodeExclusions ? 1 : 0)} {_routePlanNote} " +
-                $"剔除={plan.Dropped.Count}");
+                $"arm={LocalSettings.Ipv6} nodeExcl开关={(LocalSettings.NodeExclusions ? 1 : 0)} {_routePlanNote}");
 
             // 防自环的第二道防线仍在桥侧（dialer.DefaultInterface → Windows IP_UNICAST_IF
             //   强制绑定物理网卡，等价于用户方案的「StreamSocket 绑网卡」）。
