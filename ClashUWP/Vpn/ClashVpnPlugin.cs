@@ -2334,6 +2334,37 @@ namespace ClashUWP.Vpn
                 s_pumpCts = null;
                 try { old?.Cancel(); } catch { }
 
+                // ★【1.0.129 · 对照 Verge 源码】SKIP_SYSTEM_IPV6_CHECK 是 mihomo 自己的
+                //   逃生口（<c>config/utils.go</c> 的 <c>verifyIP6</c> 先读它、命中即返回 true），
+                //   Clash Verge 从不设它 —— Verge 的 tun 模板连 <c>inet6-address</c> 都不写，
+                //   在无全局 v6 的机器上就靠 <c>parseIPV6</c> 把 v6 半边清空（Docs/68 §三）。
+                //   我们不同：隧道侧的 v6 地址与路由由平台下发，本机没有 v6 也要让内核侧
+                //   立得住，所以只在档 2 主动设它。
+                //   ★ 必须每轮都写回显式值，而不是"档 2 且首次全量启动前设一次"：这个变量是
+                //     进程级的，常驻桥降档时并不重建（Stop → Start 只发生在升到档 2），
+                //     上一轮留下的 "1" 会让档 0 在无 v6 机器上继续保留默认/订阅的
+                //     <c>inet6-address</c> 与 <c>fake-ip-range6</c> —— 档 0 就不再是
+                //     "订阅原文该有的样子"。Verge 不设它是它不需要造 v6；我们设了就必须自己收回。
+                string wantSkip = LocalSettings.Ipv6 >= 2 ? "1" : "0";
+                try
+                {
+                    string? curSkip = Environment.GetEnvironmentVariable("SKIP_SYSTEM_IPV6_CHECK");
+                    if (!string.Equals(curSkip, wantSkip, StringComparison.Ordinal))
+                    {
+                        Environment.SetEnvironmentVariable("SKIP_SYSTEM_IPV6_CHECK", wantSkip);
+                        RollingLog.Info("bridge-start", wantSkip == "1"
+                            ? "arm=2 设 SKIP_SYSTEM_IPV6_CHECK=1（mihomo 官方逃生口；Verge 不设它）"
+                            : $"arm={LocalSettings.Ipv6} 显式写回 SKIP_SYSTEM_IPV6_CHECK=0" +
+                              $"（原值 {curSkip ?? "(未设)"}），保持 mihomo 原生校验");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // 设不上不致命：没有 inet6-address 时内核只是不跑 v6，
+                    // 隧道侧的地址与路由仍在 —— 会体现在快照的 _ipv6Diag 里。
+                    RollingLog.Warn("bridge-start", "写 SKIP_SYSTEM_IPV6_CHECK 失败: " + ex.Message);
+                }
+
                 // ★【1.0.70 · G7】常驻栈的地址族是 Start 时定死的，热重载改不了
                 //   （理由见 <see cref="s_bridgeKernelV6"/>）。目标档 2 而常驻栈没有 v6
                 //   时先 Stop 再全量 Start —— 这是 <c>residentBridge=0</c> 每次断开都在走
@@ -2377,29 +2408,6 @@ namespace ClashUWP.Vpn
                         $"本进程首次启动桥 mtu={_config.Mtu} drained={drained} " +
                         $"mmdbDir={(mmdbDir.Length == 0 ? "(空!)" : mmdbDir)}");
                     var sw = System.Diagnostics.Stopwatch.StartNew();
-                    // ★【1.0.70 · G7 · arm 2】必须在 P/Invoke 之前设：mihomo 的
-                    //   <c>config.Parse</c> 里 <c>parseIPV6(rawCfg)</c>（config.go:716）会调
-                    //   <c>verifyIP6()</c>（config/utils.go:205）—— 本机没有全局 IPv6 地址，
-                    //   校验失败就会把 <c>tun.inet6-address</c> 与 <c>dns.fake-ip-range6</c>
-                    //   静默清空（config.go:1679-1682），arm 2 的内核半边等于没写。
-                    //   官方留了环境变量 <c>SKIP_SYSTEM_IPV6_CHECK=1</c> 作为这个校验的
-                    //   逃生口（utils.go 先读它、命中即直接返回 true），口径与 Clash Verge
-                    //   在无 v6 机器上开 v6 一致。只影响本次进程解析，不改注册表/系统设置。
-                    if (LocalSettings.Ipv6 >= 2)
-                    {
-                        try
-                        {
-                            Environment.SetEnvironmentVariable("SKIP_SYSTEM_IPV6_CHECK", "1");
-                            RollingLog.Info("bridge-start",
-                                "arm=2 已设 SKIP_SYSTEM_IPV6_CHECK=1（本机无全局 v6，跳过 mihomo 的系统校验）");
-                        }
-                        catch (Exception ex)
-                        {
-                            // 设不上不致命：没有 inet6-address 时内核只是不跑 v6，
-                            // 隧道侧的地址与路由仍在 —— 会体现在快照的 _ipv6Diag 里。
-                            RollingLog.Warn("bridge-start", "设置 SKIP_SYSTEM_IPV6_CHECK 失败: " + ex.Message);
-                        }
-                    }
                     var startTask = Task.Run(() => MihomoBridge.Start(config, (int)_config.Mtu, mmdbDir));
                     calledStart = true;
                     if (!startTask.Wait(TimeSpan.FromSeconds(20)))

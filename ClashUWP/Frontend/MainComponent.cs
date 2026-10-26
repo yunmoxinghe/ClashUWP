@@ -1005,7 +1005,8 @@ namespace ClashUWP.Frontend
                     TextBlock("★ 装机实测状态（【1.0.127】更新）：0 档每天都在跑；1 档已经跑过一次被批准的" +
                               "拨号窗口并拿到全部形状 —— 隧道 ULA 地址、2000::/3 进隧道、三条 v6 节点的 /128 " +
                               "宿主路由落在物理 WLAN、隧道内连通无回归。2 档没跑过：内核的系统 v6 校验由本进程内的 " +
-                              "SKIP_SYSTEM_IPV6_CHECK 绕过（1.0.70 起，与 Clash Verge 同口径），所以配置形状立得起来，" +
+                              "SKIP_SYSTEM_IPV6_CHECK 绕过（1.0.70 起；这是 mihomo 自己的逃生口，Clash Verge 不设它），" +
+                              "所以配置形状立得起来，" +
                               "但「v6 流量真出得去」要这条网络本身有全局 IPv6 —— 上面那一行读数说的就是这件事。")
                         .Foreground(Theme.SecondaryText),
                     TextBlock("档位写在 settings.txt 的 ipv6 键里（0/1/2），插件每次连接现读；" +

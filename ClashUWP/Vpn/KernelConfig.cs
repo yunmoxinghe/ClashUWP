@@ -108,8 +108,14 @@ namespace ClashUWP.Vpn
                 // ★【1.0.126】档 1 也写（写 false），不再"不碰订阅原文"：
                 //   不碰的后果是同一个档 1 在不同机场下内核 v6 能力不同（订阅写 true 就是 true），
                 //   而且档 2 用过再降回 1 时磁盘上留着上一轮写的 true。
-                //   档 1 的语义本来就是"堵泄漏、内核不转发 v6"（桥侧 gvisor 栈在 arm<2
-                //   也没注册 v6，快照里 `v6栈=off`），写 false 只是让这个档与订阅无关。
+                //   档 1 的语义本来就是"堵泄漏、内核不转发 v6"（顶层 false 让 <c>parseIPV6</c>
+                //   把 <c>inet6-address</c>/<c>fake-ip-range6</c> 清空，桥侧 gvisor 栈因此没有 v6），
+                //   写 false 只是让这个档与订阅无关。
+                // ★【1.0.129 · 对照 Verge 源码】档 0 的"不写"不等于"关"：mihomo 的顶层
+                //   <c>ipv6</c> 默认是 <b>true</b>（<c>DefaultRawConfig</c>），且
+                //   <c>RawTun.Inet6Address</c> 默认 <c>fdfe:dcba:9876::1/126</c> —— 所以在
+                //   有全局 v6 的宿主上，档 0 的内核栈本来就可能带 v6 地址。快照里的
+                //   <c>v6栈=</c> 只反映<b>档位意图</b>，不是实测值；别拿它当"本机没有 v6"的证据。
                 if (ipv6Arm >= 1)
                     EnsureTopLevelIpv6(lines, ipv6Arm >= 2);
                 EnsureDnsBlock(lines, ipv6Arm, ipv6FakeRange);
@@ -174,7 +180,11 @@ namespace ClashUWP.Vpn
                 lines.Add("dns:");
                 lines.Add("    enable: true");
                 // 档 2 要 AAAA 回假 IP；档 1 明确不答 AAAA（泄漏封堵的一半）。
-                lines.Add(ipv6Arm >= 2 ? "    ipv6: true" : "    ipv6: false");
+                // 档 0 不写：mihomo 的 <c>dns.ipv6</c> 默认就是 false（Meta config.go
+                // 的 <c>DefaultRawConfig</c>），写出来等于把"档 0 一个字节都不碰"的契约
+                // 破在新建块里（对照 Verge 源码时发现的）。
+                if (ipv6Arm >= 1)
+                    lines.Add(ipv6Arm >= 2 ? "    ipv6: true" : "    ipv6: false");
                 lines.Add("    default-nameserver: [223.5.5.5, 119.29.29.29]");
                 lines.Add("    enhanced-mode: fake-ip");
                 lines.Add($"    fake-ip-range: {FakeIpRange}");

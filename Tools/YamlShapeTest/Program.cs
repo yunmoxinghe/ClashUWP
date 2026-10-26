@@ -125,6 +125,9 @@ internal static class Program
         //   而 AppContainer 里能不能枚举到地址至今没有实物，Unknown 是会真出现的档。
         Ipv6FaceLineShapes128();
 
+        // ★【1.0.129】三档写出来的 v6 键与 mihomo 自己的默认值对齐（对照 Verge 源码那批）。
+        Ipv6VergeAlignShapes129();
+
         Console.WriteLine(_fail == 0 ? "ALL OFFLINE TESTS PASSED" : _fail + " FAIL");
         return _fail == 0 ? 0 : 1;
     }
@@ -1732,6 +1735,53 @@ internal static class Program
         Check("1.0.126 顶层 ipv6: 只动顶层那一行，dns 块里的同名 ipv6 字段各归各的（不重复、不误伤）",
               TopIpv6Lines(Arm1True).Count == 1 &&
               Arm1True.Contains("    ipv6: false"), string.Join(" | ", TopIpv6Lines(Arm1True)));
+    }
+
+    /// <summary>
+    /// ★【1.0.129 · 对照 Clash Verge / mihomo 源码】三档写出来的 v6 键与上游默认值对齐。
+    ///
+    /// 读源码才发现的三件事，都只能离线钉：
+    ///   ① mihomo 的顶层 <c>ipv6</c> 默认是 <b>true</b>、<c>dns.ipv6</c> 默认是 false、
+    ///      <c>tun.inet6-address</c> 默认 <c>fdfe:dcba:9876::1/126</c> —— 所以档 0
+    ///      "不写"不等于"关 v6"，它就是上游默认形态；
+    ///   ② 档 0 以前在<b>新建</b> dns 块时也写一行 <c>ipv6: false</c> —— 值与上游默认相同
+    ///      （行为无差），但破了"档 0 一个字节都不碰 v6 键"的契约，本批删掉；
+    ///   ③ 档 1/2 的 dns.ipv6 必须跟着档位走（Verge 的 <c>use_tun</c> 就是这么把
+    ///      dns.ipv6 绑到顶层 ipv6 上的），订阅原文不许决定它。
+    /// </summary>
+    private static void Ipv6VergeAlignShapes129()
+    {
+        const string Pool6 = "fdfe:dcba:9876::/64";
+        const string Bare = "mode: rule\nproxy-groups:\n  - name: A\n    type: select\n    proxies:\n      - DIRECT\n";
+
+        string arm0 = KernelConfig.Transform(Bare, null, null, 0, Pool6, out _, out _);
+        Check("1.0.129 档 0: 新建的 dns/tun 块里一个 v6 键都不写（上游默认顶层 true / dns.ipv6 false）",
+              !arm0.Split('\n').Any(l => l.Contains("ipv6", StringComparison.OrdinalIgnoreCase)),
+              string.Join(" | ", arm0.Split('\n')
+                  .Where(l => l.Contains("ipv6", StringComparison.OrdinalIgnoreCase))));
+
+        string arm1 = KernelConfig.Transform(Bare, null, null, 1, Pool6, out _, out _);
+        Check("1.0.129 档 1: 顶层 false + dns.ipv6 false，且不写池/内核 v6 地址（清空交给 parseIPV6）",
+              TopIpv6Value(arm1) == "false" && arm1.Contains("    ipv6: false") &&
+              !arm1.Contains("fake-ip-range6") && !arm1.Contains("inet6-address"),
+              arm1);
+
+        string arm2 = KernelConfig.Transform(Bare, null, null, 2, Pool6, out _, out _);
+        Check("1.0.129 档 2: 顶层 true + dns.ipv6 true + 池 + 内核地址（池网络号+1、/126，同上游默认形态）",
+              TopIpv6Value(arm2) == "true" && arm2.Contains("    ipv6: true") &&
+              arm2.Contains("fake-ip-range6: " + Pool6) &&
+              arm2.Contains("inet6-address: [fdfe:dcba:9876::1/126]"),
+              arm2);
+
+        const string SubDns = "mode: rule\nipv6: true\ndns:\n    enable: true\n" +
+                              "    enhanced-mode: fake-ip\n    ipv6: false\n";
+        string subArm1 = KernelConfig.Transform(SubDns, null, null, 1, Pool6, out _, out _);
+        Check("1.0.129 档 1: 订阅 dns 块写了 ipv6: true 也压回 false（与顶层 false 同一个闸）",
+              subArm1.Contains("    ipv6: false") && !subArm1.Contains("ipv6: true"), subArm1);
+
+        string subArm2 = KernelConfig.Transform(SubDns, null, null, 2, Pool6, out _, out _);
+        Check("1.0.129 档 2: 订阅 dns.ipv6 false 也抬成 true（AAAA 回假 v6 的前提）",
+              subArm2.Contains("    ipv6: true") && !subArm2.Contains("ipv6: false"), subArm2);
     }
 
     /// <summary>
