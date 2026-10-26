@@ -401,6 +401,23 @@ namespace ClashUWP.Vpn
             _ => "本机 v6 地址读不到 ⇒ 泄漏面未知（不据此判断安全）",
         };
 
+        /// <summary>
+        /// 界面用的<b>一行</b>本机 v6 面貌读数（设置页「IPv6 通道」那一节）。
+        /// ★【1.0.128】和 <see cref="LeakNote"/> 分开的理由：那条是 arm=0 的<b>后果播报</b>
+        ///   （只在 arm=0 有话，arm≥1 回空串），这条是<b>与档位无关的输入读数</b> ——
+        ///   用户站在设置页上要判的是"我这条网络抬档到底有没有收益"，
+        ///   那句话在<b>三档下都要能读</b>，不然档 1/2 就看不见自己堵住的是不是真存在的面。
+        /// ★ 三档文案都必须自带"这一档意味着什么"，<c>Unknown</c> 尤其不许写成"没有 v6"：
+        ///   AppContainer 里能不能枚举到地址至今没有实物（1.0.119 写下这条时就没验过），
+        ///   读不到只说明我们不知道。
+        /// </summary>
+        internal static string FaceLine(V6Face face, string detail) => face switch
+        {
+            V6Face.Global => "本机有全局 IPv6 ⇒ 泄漏面存在，0 档下这些流量整条绕过隧道｜" + detail,
+            V6Face.None => "本机无全局 IPv6 ⇒ 当前网络没有 v6 泄漏面，抬档在这条网络上不改变任何东西｜" + detail,
+            _ => "本机 v6 地址读不到 ⇒ 泄漏面未知，这不等于安全｜" + detail,
+        };
+
         private static string One(string s)
         {
             s = s.Replace('\r', ' ').Replace('\n', ' ');

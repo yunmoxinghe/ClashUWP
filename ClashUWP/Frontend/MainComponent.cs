@@ -994,14 +994,19 @@ namespace ClashUWP.Frontend
                 Section("IPv6 通道",
                     Ipv6Picker(ipv6Arm, setIpv6Arm),
                     TextBlock(Ipv6ArmNote(ipv6Arm)).Foreground(Theme.SecondaryText),
+                    // ★【1.0.128】抬档与否的判据以前只在插件连接时算一次、只进那份会被覆盖的
+                    //   快照，界面上永远读不到。这一行是现读：三档都与档位无关。
+                    TextBlock(Ipv6FaceLineText())
+                        .Foreground(Theme.SecondaryText),
                     TextBlock("★ 生效时机：断开再连一次。隧道的 v6 地址和 2000::/3 这类路由是" +
                               "连接时一次性交给平台的，内核桥的地址族也是启动时定死的；" +
                               "点「订阅 → 重新加载配置」只会换内核配置那一半（要不要写顶层 ipv6）。")
                         .Foreground(Theme.SecondaryText),
-                    TextBlock("★ 0 档是唯一被装机验证过的形态；1 档至今没跑过拨号窗口，" +
-                              "2 档在本机（没有全局 IPv6）连内核侧的形状都造不出来 —— " +
-                              "mihomo 在识别不到全局 v6 时会把 tun 的 inet6-address 与假 IP v6 池整个清空。" +
-                              "抬档前请先看清这两句。")
+                    TextBlock("★ 装机实测状态（【1.0.127】更新）：0 档每天都在跑；1 档已经跑过一次被批准的" +
+                              "拨号窗口并拿到全部形状 —— 隧道 ULA 地址、2000::/3 进隧道、三条 v6 节点的 /128 " +
+                              "宿主路由落在物理 WLAN、隧道内连通无回归。2 档没跑过：内核的系统 v6 校验由本进程内的 " +
+                              "SKIP_SYSTEM_IPV6_CHECK 绕过（1.0.70 起，与 Clash Verge 同口径），所以配置形状立得起来，" +
+                              "但「v6 流量真出得去」要这条网络本身有全局 IPv6 —— 上面那一行读数说的就是这件事。")
                         .Foreground(Theme.SecondaryText),
                     TextBlock("档位写在 settings.txt 的 ipv6 键里（0/1/2），插件每次连接现读；" +
                               "改档不会自动拆你的隧道。")
@@ -1165,16 +1170,47 @@ namespace ClashUWP.Frontend
         {
             1 => "档 1（堵泄漏）：隧道拿一个 ULA 的 v6 地址，并下发 2000::/3 —— 应用真去连 v6 地址时" +
                  "包会进隧道；内核不解析 AAAA，普通应用拿不到 v6 记录，因此不会优先 v6。" +
-                 "代价：IPv6 节点的外层连接要靠 /128 宿主路由兜住（这一版才真正产出候选），" +
-                 "且这一档还没跑过拨号实测。",
+                 "代价：IPv6 节点的外层连接要靠 /128 宿主路由兜住（候选与读侧自愈到 1.0.127 才齐）。" +
+                 "★【1.0.127 订正】原文那句「这一档还没跑过拨号实测」已经不成立：" +
+                 "装机跑过一遍且形状与连通都拿到了实物（Docs/67 §十一.4）。",
             2 => "档 2（全链路）：在 1 之上再开内核侧 IPv6（顶层 ipv6: true + 假 IP 的 v6 池），" +
-                 "v6 域名也走代理与规则。代价：能不能真出 v6 取决于节点与订阅；" +
-                 "而本机没有全局 IPv6 时 mihomo 会把隧道 v6 地址与 v6 假 IP 池整个清空 —— " +
-                 "在这种网络上这一档和 1 档在内核里长不出区别，形状验不了。",
+                 "v6 域名也走代理与规则。代价：能不能真出 v6 取决于这条网络有没有全局 IPv6 与节点本身；" +
+                 "★【1.0.128 订正】原文那句「本机没有全局 v6 ⇒ mihomo 会把隧道 v6 地址与 v6 假 IP 池整个清空、" +
+                 "形状验不了」只对 1.0.70 之前成立 —— 本进程启动桥时会设 SKIP_SYSTEM_IPV6_CHECK=1 绕过那道校验，" +
+                 "所以配置形状立得起来；这一档缺的是一次被批准的拨号窗口，不是网络。",
             _ => "档 0（不动）：IPv6 完全不进隧道，内核配置里 v6 相关的键按订阅原文。" +
-                 "代价：在有全局 IPv6 的网络上，v6 出站绕过代理与规则（已知泄漏）。" +
-                 "好处：这是默认档，也是唯一被装机验证过的形态。",
+                 "代价：在有全局 IPv6 的网络上，v6 出站绕过代理与规则（已知泄漏）—— " +
+                 "上面「本机 v6 面貌」那一行就是告诉你这条网络到底有没有这一半。" +
+                 "好处：不碰隧道本体，是默认档。",
         };
+
+        /// <summary>
+        /// 本机 v6 面貌的一行读数（★【1.0.128】新增，抬档决策的前提）。
+        /// 【为什么要现读】这条判断以前只有插件在 <c>Connect</c> 里算一次，而且只写进
+        ///   <c>dataface-plugin.txt</c> 的 <c>Ipv6=</c> 一列 —— 那份快照<b>只有一个槽、
+        ///   每次会话结束整个覆盖</b>，所以"上一次 arm=0 时到底读到了什么"根本回溯不了，
+        ///   装机日志里 <c>未下发</c> 出现 0 次就是这个。用户站在设置页上判"抬档在这条
+        ///   网络上有没有收益"，靠的必须是当下这一次枚举。
+        /// 【为什么要缓存】<c>Render()</c> 会随状态刷新反复走，而枚举网卡是系统调用；
+        ///   面貌不会在一分钟内变（变的那一秒正是要重连的时候），所以 60 s 取一次，
+        ///   既不当热路径、也不会每次刷新换一行字让人以为是抖动。
+        /// 【失败形态】<c>Unknown</c> 原样播报"读不到"，绝不当成"没有 v6" ——
+        ///   AppContainer 里能不能枚举到地址至今没有实物（口径同 <see cref="RouteInclusion"/>）。
+        /// </summary>
+        private static string Ipv6FaceLineText()
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (now - _ipv6FaceAt > TimeSpan.FromSeconds(60))
+            {
+                _ipv6FaceText = RouteInclusion.FaceLine(
+                    NetworkFollow.InspectLocalV6Face(out string detail), detail);
+                _ipv6FaceAt = now;
+            }
+            return "本机 v6 面貌：" + _ipv6FaceText;
+        }
+
+        private static string _ipv6FaceText = "（还没读）";
+        private static DateTimeOffset _ipv6FaceAt = DateTimeOffset.MinValue;
 
         /// <summary>
         /// 改 IPv6 档位：落盘 + 改两份现值 + 改按钮，三步<b>必须都成</b>

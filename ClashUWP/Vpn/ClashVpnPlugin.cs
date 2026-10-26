@@ -820,11 +820,18 @@ namespace ClashUWP.Vpn
                     //   只如实播报，不偷偷抬档（抬档要拨号验证，见 LocalSettings.Ipv6 的口径）。
                     RouteInclusion.V6Face face = NetworkFollow.InspectLocalV6Face(out string v6detail);
                     _ipv6Diag = $"arm=0 未下发｜{RouteInclusion.LeakNote(0, face)}｜{v6detail}";
+                    // ★★【1.0.128 订正】以前只有 Global 一档出声，于是"None 还是 Unknown"在
+                    //   日志里读不出来：这条读数只进快照 Ipv6= 一列，而快照只有一个槽、
+                    //   每次会话结束整个覆盖 ⇒ 装机至今无法回溯"AppContainer 里到底枚举得到地址吗"。
+                    //   三档一律落一行（Global 用 Warn，其余 Info），热路径不碰这里。
+                    string faceLine = $"泄漏面读数 face={face} arm=0｜{v6detail}";
                     if (face == RouteInclusion.V6Face.Global)
                     {
-                        RollingLog.Warn("ipv6", $"泄漏面存在：{v6detail}；ipv6=0 ⇒ v6 出站不进隧道（要堵 settings.txt ipv6=1）");
+                        RollingLog.Warn("ipv6", faceLine);
                         LogSession($"evt=v6leak face=global detail={v6detail}");
                     }
+                    else
+                        RollingLog.Info("ipv6", faceLine);
                 }
 
                 // ★★ 先遣项目实测出的两条硬约束，两条都压在旧实现身上（docs/76）：

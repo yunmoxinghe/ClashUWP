@@ -120,6 +120,11 @@ internal static class Program
         //   要么就要等 6 小时，都不能当单变量。
         LedgerRepairShapes127();
 
+        // ★【1.0.128】界面上那行"本机 v6 面貌"读数的文案。它是纯函数，必须钉：
+        //   Unknown（读不到）一旦被写成"没有 v6"，就等于在界面上把未知报成安全 ——
+        //   而 AppContainer 里能不能枚举到地址至今没有实物，Unknown 是会真出现的档。
+        Ipv6FaceLineShapes128();
+
         Console.WriteLine(_fail == 0 ? "ALL OFFLINE TESTS PASSED" : _fail + " FAIL");
         return _fail == 0 ? 0 : 1;
     }
@@ -1804,6 +1809,51 @@ internal static class Program
               arm0.Ipv6Excludes.Count == 0 &&
               arm0.Dropped.Any(d => d.Contains("节点排除 v6 且 arm=0") &&
                                     d.Contains("2604:a00:101:2b:25::1/128")), arm0.Describe());
+    }
+
+    /// <summary>
+    /// 【1.0.128】界面「本机 v6 面貌」那一行的文案。
+    /// 钉它的理由只有一条：<b>Unknown 不许被说成"没有 v6"</b> —— 读数分三档，
+    /// 而"读不到"在界面上如果长得和"确实没有"一样，用户就会把未知当安全，
+    /// 抬档决策于是建立在一句假话上（AppContainer 里能不能枚举地址至今零实物，
+    /// Unknown 不是理论档：装机日志里 arm=0 那行读数出现 0 次，正是没实物）。
+    /// </summary>
+    private static void Ipv6FaceLineShapes128()
+    {
+        const RouteInclusion.V6Face G = RouteInclusion.V6Face.Global;
+        const RouteInclusion.V6Face N = RouteInclusion.V6Face.None;
+        const RouteInclusion.V6Face U = RouteInclusion.V6Face.Unknown;
+
+        string lineG = RouteInclusion.FaceLine(G, "有全局 v6 2604::1");
+        Check("1.0.128 读数: 有全局 v6 ⇒ 明说泄漏面存在，且把实物地址带上",
+              lineG.Contains("泄漏面存在") && lineG.Contains("2604::1"), lineG);
+
+        string lineN = RouteInclusion.FaceLine(N, "读到 3 个 v6 地址，全部非全局");
+        Check("1.0.128 读数: 无全局 v6 ⇒ 明说这条网络上抬档不改变任何东西",
+              lineN.Contains("没有 v6 泄漏面") && lineN.Contains("不改变任何东西"), lineN);
+
+        string lineU = RouteInclusion.FaceLine(U, "采集失败=UnauthorizedAccessException");
+        Check("1.0.128 读数: 读不到 ⇒ 只说未知，并明写「不等于安全」",
+              lineU.Contains("读不到") && lineU.Contains("不等于安全"), lineU);
+
+        // 这一条是本节的全部理由：Unknown 与 None 的文案必须一眼可分。
+        Check("1.0.128 读数: 「读不到」绝不写成「没有」（两档文案互斥）",
+              !lineU.Contains("没有 v6 泄漏面") && !lineN.Contains("读不到"),
+              lineU + " ‖ " + lineN);
+
+        // 读数与档位无关：LeakNote 在 arm≥1 回空串（那是 arm=0 的后果播报），
+        // 而界面上这一行三档都得在 —— 否则档 1/2 看不见自己堵的面到底存不存在。
+        Check("1.0.128 读数: FaceLine 三档都有话（对比 LeakNote 只在 arm=0 说话）",
+              lineG.Length > 0 && lineN.Length > 0 && lineU.Length > 0 &&
+              RouteInclusion.LeakNote(1, G).Length == 0 &&
+              RouteInclusion.LeakNote(0, G).Contains("泄漏"),
+              RouteInclusion.LeakNote(1, G) + "‖" + RouteInclusion.LeakNote(0, G));
+
+        // detail 原样透传：界面那行是唯一能看出"采集到底返回了什么"的地方，
+        // 掐短或改写会让 Unknown 与 None 又长得一样。
+        Check("1.0.128 读数: detail 逐字进末尾（不截断、不改写）",
+              RouteInclusion.FaceLine(N, "读到 0 个 v6 地址，全部非全局")
+                  .EndsWith("读到 0 个 v6 地址，全部非全局"));
     }
 
     /// <summary>
