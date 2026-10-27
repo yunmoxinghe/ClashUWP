@@ -24,6 +24,7 @@ internal static class Program
         PoolMath();
         V6Normalize();
         TemplateRoundTrip();
+        Ipv6ArmFallback();
 
         Console.WriteLine(_fail == 0 ? "ALL PASS" : _fail + " FAIL");
         return _fail == 0 ? 0 : 1;
@@ -128,7 +129,11 @@ internal static class Program
 
     private static void Expect(string name, string key, string value, bool pass)
     {
-        string error = DnsConfig.Validate(key, value);
+        // ★【1.0.131】本 csproj 的 Nullable 从 disable 改成 enable（与产品工程逐字同一上下文，
+        //   被测的 DnsConfig.cs 里那些 `string?` 注释这才不是"无上下文的注释"）。
+        //   这一行的类型跟着收紧：Validate 的契约就是"没问题返回 null"，
+        //   写成 string 在新上下文里是 CS8600，而不是"少个 null 分支"。
+        string? error = DnsConfig.Validate(key, value);
         Check(name, (error == null) == pass, error == null ? "" : "reason=" + error);
     }
 
@@ -210,6 +215,49 @@ internal static class Program
               DnsConfig.ToInlineList("a, b") == "['a', 'b']", DnsConfig.ToInlineList("a, b"));
         Check("listkey: 分类", DnsConfig.IsListKey("nameserver") &&
               DnsConfig.IsListKey("nrpt-dns") && !DnsConfig.IsListKey("fake-ip-range"));
+    }
+
+    /// <summary>
+    /// ★【1.0.132】IPv6 档位的回落真值表（Docs/71）。
+    /// 触发它的是 10-28 01:42 的装机实物：<c>settings.txt</c> 里没有 <c>ipv6</c> 键时，
+    /// 隧道按 2 跑而前台读成 0 —— 因为"回落成哪一档"在两个读者手里各写了一遍。
+    /// 现在键名、区间、缺省档、认不出的回落全部住进 <see cref="LocalSettings.ParseIpv6Arm"/>，
+    /// 口径对照 Clash Verge：缺键 = 没人表过态 = 取权威默认（模板 <c>ipv6: true</c> 那一步），
+    /// 不是另写一个保守数。
+    /// </summary>
+    private static void Ipv6ArmFallback()
+    {
+        int Arm(string text) => LocalSettings.ParseIpv6Arm(SettingsParse.Parse(text));
+
+        // ① 缺键 = 权威默认档；这一条就是装机上分叉的那一格
+        Check("1.0.132 缺 ipv6 键 → 默认档 2（不再回落 0）",
+              Arm("subName=x\n") == LocalSettings.Ipv6ArmDefault && Arm("") == 2,
+              "缺键读到 " + Arm("subName=x\n"));
+        Check("1.0.132 默认档只有一个定义处（字段初值 == 常量）",
+              LocalSettings.Ipv6 == LocalSettings.Ipv6ArmDefault,
+              "Ipv6=" + LocalSettings.Ipv6 + " Ipv6ArmDefault=" + LocalSettings.Ipv6ArmDefault);
+
+        // ② 用户主动选的三档必须原样读回 —— 回落改成 2 不能把显式的 0 吃掉
+        Check("1.0.132 显式 0/1/2 原样（主动回档仍然有效）",
+              Arm("ipv6=0\n") == 0 && Arm("ipv6=1\n") == 1 && Arm("ipv6=2\n") == 2,
+              $"0->{Arm("ipv6=0\n")} 1->{Arm("ipv6=1\n")} 2->{Arm("ipv6=2\n")}");
+        Check("1.0.132 同键多行仍是最后一行胜出（追加语义不变）",
+              Arm("ipv6=1\nipv6=0\n") == 0 && Arm("ipv6=0\nipv6=2\n") == 2,
+              "末行 " + Arm("ipv6=1\nipv6=0\n") + "/" + Arm("ipv6=0\nipv6=2\n"));
+
+        // ③ 键在但值不可用 = 同样当"没人表过态"，并且不得压成 0（0 是已实测会旁路隧道那一档）
+        Check("1.0.132 越界值 → 默认档 2（不是 0）",
+              Arm("ipv6=3\n") == 2 && Arm("ipv6=-1\n") == 2,
+              "3->" + Arm("ipv6=3\n") + " -1->" + Arm("ipv6=-1\n"));
+        Check("1.0.132 认不出/空值 → 默认档 2（不是 0）",
+              Arm("ipv6=abc\n") == 2 && Arm("ipv6=\n") == 2,
+              "abc->" + Arm("ipv6=abc\n") + " 空->" + Arm("ipv6=\n"));
+
+        // ④ 写侧归一与读侧同一个回落（写得进去 3、读回来 2 这种形状不再出现）
+        Check("1.0.132 键名与区间只有 LocalSettings 一处定义",
+              LocalSettings.Ipv6Key == "ipv6" &&
+              LocalSettings.Ipv6ArmMin == 0 && LocalSettings.Ipv6ArmMax == 2,
+              $"key={LocalSettings.Ipv6Key} 区间={LocalSettings.Ipv6ArmMin}..{LocalSettings.Ipv6ArmMax}");
     }
 
     private static string Join(DnsConfig cfg) => string.Join(" / ", cfg.Rejected);

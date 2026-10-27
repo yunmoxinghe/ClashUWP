@@ -442,8 +442,13 @@ namespace ClashUWP.Backend.Mihomo
                 {
                     string lvlPatch = await PatchConfigsAsync(http, "{\"log-level\":\"debug\"}");
                     levelUp = lvlPatch.StartsWith("2");
+                    // ★【1.0.130】这句从"结束后恢复 X"改成"结果见 mihomo-logs"：
+                    //   恢复在 finally 里，本句在返回文本算好<b>之前</b>就印了，
+                    //   所以它从来只是"打算恢复"，不是"恢复成功"。1.0.129 实测一次
+                    //   恢复没落地而这里毫无提示 ⇒ 口径改成把查证责任指给滚动日志。
                     sb.Append($"\n(原等级={(levelHint.Length == 0 ? "(读不到)" : levelHint)}，" +
-                              $"抬 debug={lvlPatch}，结束后恢复 {restoreLevel})");
+                              $"抬 debug={lvlPatch}，抓完会恢复 {restoreLevel} —— " +
+                              $"成没成看 plugin.log 的 mihomo-logs，或再跑一次 status)");
                 }
                 else
                 {
@@ -505,7 +510,20 @@ namespace ClashUWP.Backend.Mihomo
             {
                 if (levelUp)
                 {
-                    try { await PatchConfigsAsync(http, $"{{\"log-level\":\"{restoreLevel}\"}}"); }
+                    // ★【1.0.130】只 catch 异常不够：PatchConfigsAsync 对非 2xx 是<b>返回字符串</b>
+                    //   而不是抛（"响应状态异常: …"/状态码文本），return 值被丢掉就等于
+                    //   "恢复失败也当成功"。1.0.129 装机实测踩过一次：logs 那句
+                    //   「结束后恢复 info」印了，随后 status 仍读回 log-level=debug，
+                    //   而 plugin.log 里一行 mihomo-logs 都没有 —— 查不到就得靠猜。
+                    //   debug 级长期在线会自己刷出大量事件，下一次看日志的人必须能
+                    //   在滚动日志里看到"是谁把等级留在 debug 的"。
+                    try
+                    {
+                        string restore = await PatchConfigsAsync(http, $"{{\"log-level\":\"{restoreLevel}\"}}");
+                        if (!restore.StartsWith("2"))
+                            ClashUWP.Vpn.RollingLog.Warn("mihomo-logs",
+                                $"log-level 未能恢复 {restoreLevel}：PATCH 回「{restore}」，内核当前仍是 debug");
+                    }
                     catch (Exception ex)
                     {
                         // 恢复不了就留着 debug —— 但要在日志里留一句：

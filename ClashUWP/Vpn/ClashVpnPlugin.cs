@@ -787,7 +787,7 @@ namespace ClashUWP.Vpn
 
                 var ipv4 = new List<HostName> { new(_config.ClientIpV4) };
 
-                // ★【1.0.70 · G7】IPv6 三档（默认 0 = 与 1.0.69 逐字一致）。
+                // ★【1.0.70 · G7】IPv6 三档（★【1.0.130】起默认 2 = 全链路；默认 0 只到 1.0.129）。
                 //   0 = 不下发 v6 地址、不下发 v6 路由、内核配置一个字节都不改；
                 //   1 = 防泄漏：给 L3 接口一个 ULA 地址 + 下发 2000::/3（全局单播的
                 //       "IPv6 版默认路由"），同时内核 dns.ipv6=false —— 应用拿不到 AAAA，

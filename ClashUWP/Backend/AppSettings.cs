@@ -90,13 +90,20 @@ namespace ClashUWP.Backend
         /// 【为什么前台要再读一遍】这一档以前<b>只能手改 <c>settings.txt</c></b>，界面上
         ///   连"现在是哪一档"都画不出来。加了按钮就必须现读：按钮亮在错误的档位上
         ///   比不亮更糟（口径同 <see cref="SubAutoHours"/>）。
-        /// 【为什么这不叫两套真值表】夹紧用的是<b>同一个</b> <see cref="SettingsParse.Int"/>
-        ///   调用（0..2），插件侧照常在自己每次 Connect 时 <c>Load()</c> 现读 ——
-        ///   那份才是隧道真正用的读数；前台这份只决定界面画哪一枚亮。
+        /// 【为什么这不叫两套真值表】★【1.0.132 订正】原文那句"夹紧用的是<b>同一个</b>
+        ///   <see cref="SettingsParse.Int"/> 调用（0..2）"是错的形状：调用同一个函数，
+        ///   <b>回落值却是各写各的</b> —— 这里写死 <c>0</c>，插件侧传的是字段初值 <c>Ipv6</c>。
+        ///   1.0.130 把默认档抬到 2 时只抬了插件侧那一处，于是 10-28 01:42 装机实物：
+        ///   <c>settings.txt</c> 无 <c>ipv6</c> 键 ⇒ 隧道 <c>session … ipv6=2</c>、
+        ///   前台 <c>appsettings … ipv6=0</c>、按钮亮在「0 不动」（Docs/71）。
+        ///   ⇒ 现在两个读者都只经 <see cref="ClashUWP.Vpn.LocalSettings.ParseIpv6Arm"/>，
+        ///     回落值与键名同样只有那一个定义处；"读出来是同一档"这才成立。
+        ///   插件侧照常在自己每次 Connect 时 <c>Load()</c> 现读 —— 那份才是隧道真正用的读数；
+        ///   前台这份决定界面画哪一枚亮，两边同函数 ⇒ 不可能分叉。
         ///   改档位走 <c>ProfileGate.SetIpv6ArmAsync</c>，它把两边一起改掉，
         ///   避免出现"按钮亮了、热重载仍按旧档改写内核配置"。
         /// </summary>
-        internal static int Ipv6Arm = 0;
+        internal static int Ipv6Arm = LocalSettings.Ipv6ArmDefault;
 
         /// <summary>读到的是默认值还是 settings.txt —— 进日志用，免得又出现"以为切了其实没切"。</summary>
         internal static string Source = "默认值";
@@ -123,7 +130,7 @@ namespace ClashUWP.Backend
             bool autoProbe = false;
             bool panelMultiEntry = false;
             int subAutoHours = 0;
-            int ipv6Arm = 0;
+            int ipv6Arm = LocalSettings.Ipv6ArmDefault;
             string source = "默认值";
             bool warnPanel = false;
 
@@ -134,7 +141,9 @@ namespace ClashUWP.Backend
                 if (file == null)
                 {
                     // 没文件是"全新装包后什么都没配"的正常状态，不打警告。
-                    Apply(false, false, 0, 0, "默认值");
+                    // ★【1.0.132】档位这一格不能填 0：0 是"已知会旁路隧道"的那一档，
+                    //   而"什么都没配"按官方口径是没人表过态 = 取权威默认（Docs/71）。
+                    Apply(false, false, 0, LocalSettings.Ipv6ArmDefault, "默认值");
                     Log();
                     return;
                 }
@@ -150,10 +159,10 @@ namespace ClashUWP.Backend
                 //   "6 小时还是 7 小时"这种业务档位不是它的职责。
                 subAutoHours = SubscriptionAutoPolicy.NormalizeHours(
                     SettingsParse.String(map, "subAutoHours", ""));
-                // ★【1.0.126】与插件侧逐字同一个夹紧调用（上下界也同一个常量），
-                //   认不出的一律 0=不动 v6。
-                ipv6Arm = SettingsParse.Int(map, Ipv6Key, 0,
-                                            LocalSettings.Ipv6ArmMin, LocalSettings.Ipv6ArmMax);
+                // ★【1.0.126】界面出口一加就有第三个读者；★【1.0.132】三处回落收成一处：
+                //   档位的键名、合法区间、缺省档、认不出时回落成哪一档全在
+                //   <see cref="ClashUWP.Vpn.LocalSettings.ParseIpv6Arm"/> 里（对照官方的理由见那里）。
+                ipv6Arm = LocalSettings.ParseIpv6Arm(map);
                 source = "settings.txt";
                 warnPanel = panelMultiEntry;
             }
@@ -181,16 +190,25 @@ namespace ClashUWP.Backend
         /// <summary>
         /// ★【1.0.126】IPv6 档位在这份文件里的键。与插件侧 <c>LocalSettings.Load()</c> 读的
         /// 名字必须<b>逐字相同</b> —— 改一边等于把另一边的把手删掉（写侧与读侧同名是这个把手的契约）。
+        /// ★【1.0.132】这个"必须逐字相同"以前靠注释维系（注释不能编译，分叉不会报警），
+        /// 现在键名只有 <see cref="LocalSettings.Ipv6Key"/> 一个定义处，这里是别名。
         /// </summary>
-        internal const string Ipv6Key = "ipv6";
+        internal const string Ipv6Key = LocalSettings.Ipv6Key;
 
         /// <summary>
-        /// 界面传进来的档位归一：<b>区间外一律当 0（不动 v6）</b>，与读侧同一个回落纪律。
-        /// 上下界用 <see cref="LocalSettings.Ipv6ArmMin"/> / <see cref="LocalSettings.Ipv6ArmMax"/>：
-        /// 写和读若各持一份区间，就会出现"写得进去、读回来是另一档"。
+        /// 界面传进来的档位归一：★【1.0.132】区间外一律当<b>权威默认档</b>，与读侧
+        ///   <see cref="LocalSettings.ParseIpv6Arm"/> 同一个回落口径。
+        /// 【为什么不再是 0】原文那句"区间外一律当 0（不动 v6）"和读侧并不是同一个纪律 ——
+        ///   插件侧越界回落的是字段初值（1.0.130 起 = 2），前台越界回落 0；
+        ///   而 0 现在是"已实测会旁路隧道"的那一档（Docs/70 §三），
+        ///   把一个用不了的输入压成 0 等于压成已知泄漏档。
+        /// 上下界与默认值都只在 <see cref="LocalSettings"/> 定义，这里不再持有第二份实参
+        ///   （口径同 <see cref="SettingsParse"/> 存在的理由）。
         /// </summary>
         internal static int NormalizeIpv6Arm(int arm) =>
-            arm >= LocalSettings.Ipv6ArmMin && arm <= LocalSettings.Ipv6ArmMax ? arm : 0;
+            arm >= LocalSettings.Ipv6ArmMin && arm <= LocalSettings.Ipv6ArmMax
+                ? arm
+                : LocalSettings.Ipv6ArmDefault;
 
         /// <summary>
         /// ★【1.0.126 · IPv6 界面出口】改档位的<b>唯一写入口</b>：落盘，并把<b>两份</b>现值一起改掉。

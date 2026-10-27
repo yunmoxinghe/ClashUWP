@@ -4,11 +4,13 @@
     ★ 不是产品工程、不在解决方案里：dotnet run 即可。
       直接编译组件的 DnsConfig.cs / LocalSettings.cs / VpnPluginConfig.cs，
       被测代码与产品逐字同一份；WinRT 存储调用只用编译桩（测试从不调用 Load）。
+    ★【1.0.131】Nullable 由 disable 改成 enable：产品工程是 enable，两边上下文不一致时，
+      源文件里的可空注释全成了 CS8632（17 条）。跟着产品走才是"逐字同一份"的本意。
   -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <Nullable>disable</Nullable>
+    <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>DnsConfigTest</AssemblyName>
   </PropertyGroup>

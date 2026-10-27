@@ -448,7 +448,7 @@ namespace ClashUWP.Vpn
         internal static int NetFollow = 1;
 
         /// <summary>
-        /// ★【1.0.39 · G7】IPv6 形态。默认 <b>0 = 逐字旧行为</b>（v6 完全不碰）。
+        /// ★【1.0.39 · G7】IPv6 形态。★【1.0.130 起默认 2 = 全链路】；0 = 逐字旧行为（v6 完全不碰）。
         ///
         /// 【旧行为是什么】<c>assignedClientIPv6list</c> 传 <c>null</c>、只下发 v4 路由、
         ///   内核 <c>ipv6</c>/<c>dns.ipv6</c> 由订阅原文决定。后果（Docs/05 §5 自己列为未收口）：
@@ -469,40 +469,131 @@ namespace ClashUWP.Vpn
         ///       <c>dns.fake-ip-range6</c>（AAAA 回假 IP），并把假 IP v6 池本身
         ///       也 include 进隧道。
         ///
-        /// ★【为什么默认 0，而且 2 也不给默认】
-        ///   ① 这台机器<b>没有全局 IPv6</b>（memory「Local network baseline」），
-        ///      两档都无法在本轮验证；而这一档<b>碰隧道本体</b>（改 Start 的地址与路由表），
-        ///      代价直接落在"整机能不能上网"上。
-        ///   ② 我们的桥与先遣项目不同：<c>sing-tun</c> 的 gvisor 栈注册了 IPv6，
-        ///      所以 2 档<b>有得做</b>；但"内核有没有 v6 出口"取决于节点与订阅，
-        ///      实测之前不承诺。
-        ///   ⇒ 默认停在 0，把 1/2 做成可单变量切换的臂，判据写进 Docs/22。
-        ///
         /// ★【1.0.119 · 两件事同时改了】
         ///   ① <b>档 1/2 现在自带 v6 节点的宿主路由排除</b>（<c>/128</c> 进
         ///      <c>Ipv6ExclusionRoutes</c>，判据见 <see cref="RouteInclusion"/>）。
         ///      以前只往 v4 桶下发排除，而档 1 的 <c>2000::/3</c> 恰好覆盖 v6 节点地址
         ///      ⇒ 订阅里有 v6 节点时，拨它的外层包会被自家隧道抓回去。
-        ///      ⇒ 这条不是"新增功能"，是<b>把档 1/2 从"抬上去会踩新坑"改成"形状自洽"</b>；
-        ///        两档仍未实机验证，默认仍是 0。
+        ///      这条在 1.0.130 从"形状自洽"升格成"默认档的主干"：2 档要拨 v6 字面量节点，
+        ///      靠的就是这条排除没被 <c>2000::/3</c> 抓回去（1.0.130 一手：
+        ///      <c>Find-NetRoute 2602:f9f3:0:2::470 → WLAN ifi=22</c>，不是隧道）。
         ///   ② 档 0 的快照不再只写"未下发"：会同时报本机<b>有没有</b>全局 v6 地址，
         ///      有就明说"v6 出站绕过隧道"（<see cref="RouteInclusion.LeakNote"/>）。
         ///      读不到地址（AppContainer 里能不能枚举未实测）单独一档，不冒充"没有 v6"。
+        ///
+        /// ★【1.0.130 · 默认抬到 2】上面那两条"为什么不默认 1/2"的理由已被实机推翻，
+        ///   逐条对照（一手数据在 Docs/69）：
+        ///   ① "这台机器没有全局 IPv6" —— 不成立。缺的那一环是路由器后台的「IPv6功能」开关，
+        ///      开开之后本机有 GUA（RA + DHCPv6）、<c>::/0</c> 默认路由、真 v6 DNS（Docs/68 §十二.4）。
+        ///   ② "无法验证" —— 不成立。2 档流量层已拿到实物：<c>curl -6</c> 经假 IP v6 池
+        ///      （<c>fdfe:dcba:9876::*</c>）进隧道、源地址 <c>fd66:6:6600::2</c>，
+        ///      api/gstatic/cloudflare 四个站点两族同码（200/204），
+        ///      且 4 个 <c>ipv6-高速-*</c> 字面量节点第一次被桥内核经物理 WLAN 用真 v6 拨通
+        ///      （德州 414 ms；<c>api6.ipify.org</c> 回填 <c>2602:f9f3:0:2::470</c> = 节点自己的 v6 出口）。
+        ///   ⇒ 停在 0 不再等于"保守"，它等于把 Docs/05 §5 那条已知泄漏默认打开给用户。
+        ///      1.0.130 的这一半也有实物了（同一个窗口里对照出来的，Docs/70 §三）：档 0 拨号中，
+        ///      <c>Find-NetRoute</c> 对三个全局 v6 目的地位一律选 <c>WLAN ifi=22</c>，
+        ///      <c>ping -6</c> 到 <c>2400:3200::1</c> / <c>2606:4700:4700::1111</c> 各 3/3，
+        ///      内核活动连接里没有它们 —— 字面量 v6 确实整条绕过隧道。
+        ///      同日还钉出一条限定：档 0 下 Windows 解析器对 AAAA <b>全空应答</b>（连 <c>-Server</c>
+        ///      指名公网 DNS 也一样），而 <c>nslookup</c> 绕开解析器就能拿到真记录 ⇒
+        ///      那是 NRPT 根规则 + 订阅自带 <c>dns.ipv6: false</c> 的产物，不是 0 档给的保证。
+        ///
+        /// 【为什么不是 1】1 档只堵泄漏、不给 v6 能力，代价是订阅里的 v6 字面量节点
+        ///   在桥内直接不可拨（本档实测 503，官方 clean-room 给出的原文是
+        ///   <c>dns resolve failed: ip version error</c>，Docs/68 §十二.3）。
+        ///   2 档没有这条代价，多出来的风险只有"节点没有 v6 出口时那一族连接会失败"——
+        ///   而 2 档 A/AAAA 两份假 IP 都答，应用仍有 v4 那条腿可走（Happy Eyeballs）。
+        /// 【仍要留 0/1】网络侧没有 v6、或节点池整体不支持 v6 出口时，0 是"逐字订阅原文"，
+        ///   1 是"宁可没有 v6 也不泄漏"；两档在界面上都点得到，改档不需要重装包。
+        ///
+        /// ★【1.0.132 · 默认值只有一个定义处】这一档的<b>缺省</b>历史上被两个读者各写一遍：
+        ///   插件侧回落用字段初值（<c>Ipv6</c>），前台 <c>AppSettings</c> 回落写死 <c>0</c>。
+        ///   1.0.130 把初值抬到 2 时只抬了一处，于是 10-28 01:42 的装机实物是：
+        ///   <c>settings.txt</c> 一条 <c>ipv6=</c> 都没有 ⇒ 隧道 <c>session … ipv6=2</c>、
+        ///   而前台同一时刻 <c>appsettings … ipv6=0</c>、按钮亮在「0 不动」。细则见 Docs/71。
+        ///   ⇒ 现在默认值住在这里（<see cref="Ipv6ArmDefault"/>），两个读者都只经
+        ///     <see cref="ParseIpv6Arm"/> 拿档位；"回落成哪一档"不再是调用点写得出来的。
         /// </summary>
-        internal static int Ipv6 = 0;
+        internal static int Ipv6 = Ipv6ArmDefault;
 
         /// <summary>
-        /// ★【1.0.126 · IPv6 界面出口】档位合法区间的<b>唯一定义处</b>。
+        /// ★【1.0.132】档位默认值的<b>唯一定义处</b>（1.0.130 起 = 2 = 全链路）。
         ///
-        /// 【为什么抽出来】这个区间原本只存在于两处调用的实参里（插件侧 <c>Load()</c> 的
+        /// 【对照官方为什么是"单一来源 + 缺键取权威值"】Clash Verge 的 <c>ipv6</c> 有三个动作，
+        ///   全部落在同一份权威值上（main @ <c>4337bd85</c>，2026-10-09）：
+        ///   ① 权威默认写在模板里一处：<c>config/clash.rs:78</c> <c>map.insert("ipv6", true)</c>；
+        ///   ② <b>缺键 = 没人表过态 = 用模板值补</b>，不是另写一个回落数：
+        ///      <c>config/clash.rs:18-52</c> 的 <c>IClashTemp::new()</c> 读不到那个键就
+        ///      <c>if !map.contains_key(&amp;key) { map.insert(key, value) }</c>，
+        ///      整份文件读失败则 <c>Self::template()</c> 整套回权威值；
+        ///   ③ 应用自己的表态是 <c>Option&lt;bool&gt;</c>（<c>config/clash.rs:376-380</c> 的
+        ///      <c>IClash.ipv6</c>）—— <c>None</c> 与 <c>Some(false)</c> 是两种状态，
+        ///      "没读出来"不会被压成"用户选了关"；
+        ///   ④ 权威值对所有改写<b>每轮钉回去</b>：<c>enhance/mod.rs:326</c> 把 <c>ipv6</c>
+        ///      列进 <c>CONTROL_PLANE_KEYS</c>，<c>:331</c> 的 <c>AuthoritativeFields</c> 在派生后
+        ///      <c>capture</c>（<c>:339</c>，快照在 <c>:445</c> <c>snapshot_control_plane</c>）、
+        ///      在每次 override 之后 <c>enforce</c>（<c>:348</c>/<c>:457</c> <c>config.extend(snapshot)</c>）；
+        ///      被外来写入挪走的键由 <c>overridden()</c>（<c>:379</c>）列出来，界面上看得见 ——
+        ///      官方给的形状是"一份权威 + 每轮钉回 + 挪走就出声"。
+        /// 【落到我们这边】④ 的结构改动（把"谁拥有 ipv6"变成 capture/enforce）不在本批范围；
+        ///   本批做的是①②③这三条的最小等价实现：<b>默认值一处定义、缺键取默认、
+        ///   键在但值不可用同样取默认并出声</b>，两个读者共用同一个函数。
+        ///   "键不可用不当 0 处理"这一步同时改掉一个旧口径：以前前台把认不出的值压成 0
+        ///   （= 主动回到"什么都不改"），插件侧却把它压成字段初值 —— 两种压法都不是官方口径，
+        ///   官方是"当没人表过态"，所以我们回落<b>默认档</b>并把原话留在日志里
+        ///   （与本文件 <c>ipv6ClientAddress</c>/<c>ipv6FakeRange</c> 既有的形状闸门同口径）。
+        /// </summary>
+        internal const int Ipv6ArmDefault = 2;
+
+        /// <summary>
+        /// ★【1.0.132】<c>settings.txt</c> 里档位键名的<b>唯一定义处</b>。
+        /// 以前键名有两份（插件侧写死 <c>"ipv6"</c>、前台 <c>AppSettings.Ipv6Key</c> 一份），
+        /// 靠注释维系"两边必须逐字相同" —— 而注释不能编译，分叉不会报警
+        /// （同一形状 1.0.93 治过 <c>SettingsParse</c>、1.0.126 治过区间常量）。
+        /// </summary>
+        internal const string Ipv6Key = "ipv6";
+
+        /// <summary>
+        /// 档位合法区间的下界（含）。
+        /// ★【1.0.126 · IPv6 界面出口】这个区间原本只存在于两处调用的实参里（插件侧 <c>Load()</c> 的
         ///   <c>SettingsParse.Int(map, "ipv6", …, 0, 2)</c>）。界面出口一加就有第三处 ——
         ///   写档位前要归一，而归一时的上下界若和读的时候不同，就会造出
         ///   「写进去 3、读回来 0」这种"按钮点了没反应"。区间本身是这套把手的契约，
         ///   不该靠三处实参逐字相同维系（口径同 <see cref="SettingsParse"/> 存在的理由）。
+        /// ★【1.0.132】区间与默认值现在一起收进 <see cref="ParseIpv6Arm"/>，
+        ///   调用点连实参都不必再写。
         /// </summary>
         internal const int Ipv6ArmMin = 0;
         /// <summary>档位上界（含）。见 <see cref="Ipv6ArmMin"/>。</summary>
         internal const int Ipv6ArmMax = 2;
+
+        /// <summary>
+        /// ★【1.0.132】读档位的<b>唯一口径</b>：插件侧 <c>Load()</c> 与前台 <c>AppSettings.LoadAsync()</c>
+        /// 都只经这里，"缺键回落成什么、认不出回落成什么"由这一处决定（对照官方见
+        /// <see cref="Ipv6ArmDefault"/>）。
+        ///
+        /// 【三种输入，两种结果】
+        ///   ① 没有 <c>ipv6</c> 键 ⇒ <see cref="Ipv6ArmDefault"/>（没人表过态 = 权威默认，
+        ///      = Verge 的 <c>IClash.ipv6: None</c> 交给模板那一步）；
+        ///   ② 键在、值落在 <c>0..2</c> ⇒ 原样；
+        ///   ③ 键在、值认不出或越界 ⇒ 同样按"没人表过态"回落 <see cref="Ipv6ArmDefault"/>，
+        ///      但<b>必须出声</b>：这一档决定隧道要不要下发 v6 路由与内核配置里改不改 v6 键，
+        ///      悄悄按另一档跑正是本批要治的形状。日志里带原话，取证能分清"谁写的、写的什么"。
+        /// 【为什么不回落 0】0 在 1.0.129 之前是默认档，"回落 0"看着像保守；抬到 2 之后
+        ///   0 变成"已实测会旁路隧道"的那一档（Docs/70 §三），把一个认不出的值压成 0
+        ///   等于压成已知泄漏档 —— 与"没人表过态"这个事实也不符。
+        /// </summary>
+        internal static int ParseIpv6Arm(Dictionary<string, string> map)
+        {
+            if (!map.TryGetValue(Ipv6Key, out string? raw))
+                return Ipv6ArmDefault;
+            if (int.TryParse(raw, out int arm) && arm >= Ipv6ArmMin && arm <= Ipv6ArmMax)
+                return arm;
+            RollingLog.Warn("settings",
+                $"ipv6 值不在 {Ipv6ArmMin}..{Ipv6ArmMax}，回落默认档 {Ipv6ArmDefault}：「{raw}」");
+            return Ipv6ArmDefault;
+        }
 
         /// <summary>
         /// 档 2 的 fake-ip v6 池（写进 <c>dns.fake-ip-range6</c>，同时作为 include 路由）。
@@ -570,7 +661,11 @@ namespace ClashUWP.Vpn
             // ★ 默认 0 = 不清（理由见字段注释：两个未验前提）。字段初始值与这里必须一致。
             SessionReset = 0;
             NetFollow = 1;
-            Ipv6 = 0;
+            // ★【1.0.130】默认档 = 2（全链路）。★【1.0.132】这里不再写数字：
+            //   "字段初始值与这里必须一致"以前靠注释维系，而 1.0.130 抬档时前台那份回落没跟着抬
+            //   （Docs/71）—— 一致性的正确形状是两边引用<b>同一个定义</b>，不是两处抄同一个数。
+            //   否则 settings.txt 缺失/解析失败时会掉到另一条地址族路径上（同上方 EncapReturn 那条纪律）。
+            Ipv6 = Ipv6ArmDefault;
             Ipv6FakeRange = DefaultIpv6FakeRange;
             Ipv6ClientAddress = "";
             DnsConfigEnabled = true;
@@ -602,7 +697,7 @@ namespace ClashUWP.Vpn
                 FailFast = SettingsParse.Bool(map, "failFast", FailFast);
                 SessionReset = SettingsParse.Int(map, "sessionReset", SessionReset, 0, 2);
                 NetFollow = SettingsParse.Int(map, "netFollow", NetFollow, 0, 2);
-                Ipv6 = SettingsParse.Int(map, "ipv6", Ipv6, Ipv6ArmMin, Ipv6ArmMax);
+                Ipv6 = ParseIpv6Arm(map);
                 Ipv6FakeRange = SettingsParse.String(map, "ipv6FakeRange", Ipv6FakeRange);
                 Ipv6ClientAddress = SettingsParse.String(map, "ipv6ClientAddress", Ipv6ClientAddress);
                 DnsConfigEnabled = SettingsParse.Bool(map, "dnsConfig", DnsConfigEnabled);
